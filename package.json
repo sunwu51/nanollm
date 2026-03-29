@@ -1,6 +1,6 @@
 {
   "name": "nanollm",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Express server that proxies llm request",
   "main": "./dist/server.js",
   "bin": {

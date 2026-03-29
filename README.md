@@ -14,6 +14,7 @@ Example:
 ```yaml
 server:
   port: 3000 # default 3000
+  ttfb_timeout: 5000 # optional, upstream first-byte timeout in ms
 
 models:
   - name: gpt-5.4
@@ -22,12 +23,6 @@ models:
     base_url: https://example.com/v1
     api_key: YOUR_KEY1
     model: openai/gpt-5.4
-    headers:
-      user-agent: nanollm
-    body:
-      temperature: 1
-      store: false
-      text: '{"verbosity":"high"}'
       
   - name: glm5.1
     # chat/completions规范
@@ -35,7 +30,14 @@ models:
     base_url: https://example.com/v1
     api_key: YOUR_KEY2
     model: glm5.1
-
+    ttfb_timeout: 3000 # optional, overrides server.ttfb_timeout
+    headers:
+      user-agent: nanollm
+    body:
+      temperature: 1
+      store: false
+      text: '{"verbosity":"high"}'
+  
   - name: claude-sonnet-4-6
     # messages规范
     provider: anthropic

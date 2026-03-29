@@ -119,18 +119,40 @@ function getForwardHeaders(config: ModelConfig, options?: UpstreamRequestOptions
 async function upstreamFetch(config: ModelConfig, body: string, stream: boolean, options?: UpstreamRequestOptions): Promise<Response> {
   const url = getUpstreamURL(config);
   const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-  
+  const timeoutMs = config.ttfb_timeout;
+  const abortController = timeoutMs !== undefined ? new AbortController() : undefined;
+  let timeoutHandle: NodeJS.Timeout | undefined;
+
   const fetchOptions: RequestInit = {
     method: "POST",
     headers: getForwardHeaders(config, options),
     body,
+    ...(abortController ? { signal: abortController.signal } : {}),
   };
 
   if (proxyUrl) {
     fetchOptions.dispatcher = new ProxyAgent(proxyUrl);
   }
 
-  const res = await undiciFetch(url, fetchOptions);
+  if (abortController && timeoutMs !== undefined) {
+    timeoutHandle = setTimeout(() => {
+      abortController.abort(new Error(`Upstream TTFB timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+  }
+
+  let res: Response;
+  try {
+    res = await undiciFetch(url, fetchOptions);
+  } catch (error) {
+    if (abortController?.signal.aborted && error === abortController.signal.reason) {
+      const err = new Error(`Upstream TTFB timeout after ${timeoutMs}ms`) as Error & { cause?: unknown };
+      err.cause = error;
+      throw err;
+    }
+    throw error;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
 
   if (!res.ok) {
     const text = await res.text();
@@ -159,11 +181,11 @@ export async function passthroughStreamRequest(
   config: ModelConfig,
   rawBody: Record<string, unknown>,
   options?: UpstreamRequestOptions,
-): Promise<ReadableStream<Uint8Array>> {
+): Promise<{ body: ReadableStream<Uint8Array>; headers: Headers }> {
   const body = applyModelBodyOverrides(config, { ...rawBody, model: config.model, stream: true });
   const res = await upstreamFetch(config, JSON.stringify(body), true, options);
   if (!res.body) throw new Error("Upstream returned no streaming body");
-  return res.body;
+  return { body: res.body, headers: res.headers };
 }
 
 // ─── Forward with conversion (different format) ────────────────────────────

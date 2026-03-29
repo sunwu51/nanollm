@@ -8,12 +8,14 @@ export interface ModelConfig {
   base_url: string;
   api_key: string;
   model: string;
+  ttfb_timeout?: number;
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
 }
 
 export interface ServerConfig {
   port: number;
+  ttfb_timeout?: number;
   models: ModelConfig[];
   fallback: Record<string, string[]>;
 }
@@ -46,7 +48,17 @@ function parseJSONLikeValue(value: unknown): unknown {
   }
 }
 
-function normalizeModelConfig(model: ModelConfig): ModelConfig {
+function normalizeTimeout(value: unknown, fieldName: string): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+
+  const timeout = Number(value);
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new Error(`'${fieldName}' must be a positive number`);
+  }
+  return timeout;
+}
+
+function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): ModelConfig {
   const headers =
     model.headers && typeof model.headers === "object"
       ? Object.fromEntries(Object.entries(model.headers).map(([key, value]) => [key, String(value)]))
@@ -55,9 +67,11 @@ function normalizeModelConfig(model: ModelConfig): ModelConfig {
     model.body && typeof model.body === "object"
       ? Object.fromEntries(Object.entries(model.body).map(([key, value]) => [key, parseJSONLikeValue(value)]))
       : undefined;
+  const ttfb_timeout = normalizeTimeout(model.ttfb_timeout, `models.${model.name || "<unknown>"}.ttfb_timeout`) ?? defaultTTFBTimeout;
 
   return {
     ...model,
+    ...(ttfb_timeout !== undefined ? { ttfb_timeout } : {}),
     ...(headers ? { headers } : {}),
     ...(body ? { body } : {}),
   };
@@ -66,12 +80,13 @@ function normalizeModelConfig(model: ModelConfig): ModelConfig {
 export function loadConfig(path: string): ServerConfig {
   const raw = readFileSync(path, "utf-8");
   const parsed = resolveDeep(parseYAML(raw)) as {
-    server?: { port?: number };
+    server?: { port?: number; ttfb_timeout?: number };
     models?: ModelConfig[];
     fallback?: Record<string, string[]>;
   };
 
-  const models = (parsed.models ?? []).map(normalizeModelConfig);
+  const defaultTTFBTimeout = normalizeTimeout(parsed.server?.ttfb_timeout, "server.ttfb_timeout");
+  const models = (parsed.models ?? []).map((model) => normalizeModelConfig(model, defaultTTFBTimeout));
   const fallback = parsed.fallback ?? {};
   for (const m of models) {
     if (!m.name) throw new Error("Model config missing 'name'");
@@ -86,6 +101,7 @@ export function loadConfig(path: string): ServerConfig {
 
   return {
     port: Number(process.env.PORT) || (parsed.server?.port ?? 3000),
+    ...(defaultTTFBTimeout !== undefined ? { ttfb_timeout: defaultTTFBTimeout } : {}),
     models,
     fallback,
   };

@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import { dirname, join } from "node:path";
 
 import {
   anthropicMessageRequestToChatParams,
@@ -12,6 +16,8 @@ import {
   responsesRequestToChatParams,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
+import { loadConfig } from "../src/config.js";
+import { passthroughRequest, passthroughStreamRequest } from "../src/proxy.js";
 
 function run(name: string, fn: () => void) {
   try {
@@ -27,6 +33,48 @@ function runThrows(name: string, fn: () => void, expectedMessage: string) {
   run(name, () => {
     assert.throws(fn, new RegExp(expectedMessage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
+}
+
+async function runAsync(name: string, fn: () => Promise<void>) {
+  try {
+    await fn();
+    console.log(`PASS ${name}`);
+  } catch (error) {
+    console.error(`FAIL ${name}`);
+    throw error;
+  }
+}
+
+async function withHTTPServer(
+  handler: http.RequestListener,
+  fn: (baseURL: string) => Promise<void>,
+) {
+  const server = http.createServer(handler);
+  await new Promise<void>((resolve, reject) => {
+    server.listen(0, "127.0.0.1", () => resolve());
+    server.once("error", reject);
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("Failed to resolve test server address");
+  }
+
+  try {
+    await fn(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+}
+
+function writeTempConfig(yaml: string): string {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-test-"));
+  const file = join(dir, "config.yaml");
+  writeFileSync(file, yaml);
+  return file;
 }
 
 run("chat tool result becomes anthropic tool_result block", () => {
@@ -440,7 +488,7 @@ run("anthropic response thinking block is preserved in responses response", () =
   assert.equal((responses.output[1] as any).type, "message");
 });
 
-run("anthropic thinking budget does not leak into chat reasoning_effort", () => {
+run("anthropic thinking budget 4000 maps to chat medium reasoning_effort", () => {
   const chat = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
     max_tokens: 12000,
@@ -448,10 +496,10 @@ run("anthropic thinking budget does not leak into chat reasoning_effort", () => 
     messages: [{ role: "user", content: "hi" }],
   } as any);
 
-  assert.equal(chat.reasoning_effort, undefined);
+  assert.equal(chat.reasoning_effort, "medium");
 });
 
-run("anthropic thinking budget does not leak into responses reasoning.effort", () => {
+run("anthropic thinking budget 4000 maps to responses medium reasoning.effort", () => {
   const responses = anthropicMessageRequestToResponsesRequest({
     model: "claude-sonnet-4-5",
     max_tokens: 12000,
@@ -459,22 +507,143 @@ run("anthropic thinking budget does not leak into responses reasoning.effort", (
     messages: [{ role: "user", content: "hi" }],
   } as any);
 
-  assert.equal((responses as any).reasoning, undefined);
+  assert.deepEqual((responses as any).reasoning, { effort: "medium" });
 });
 
-runThrows("chat medium reasoning fails when anthropic max_tokens default is too small", () => {
-  chatParamsToAnthropicMessageRequest({
+run("chat medium reasoning is capped by anthropic default max_tokens", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
     model: "gpt-4o-mini",
     reasoning_effort: "medium",
     messages: [{ role: "user", content: "hi" }],
   });
-}, "Anthropic thinking budget must be less than max_tokens");
 
-runThrows("chat high reasoning fails when explicit anthropic max_tokens is too small", () => {
-  chatParamsToAnthropicMessageRequest({
+  assert.equal(anthropic.max_tokens, 10240);
+  assert.deepEqual((anthropic as any).thinking, { type: "enabled", budget_tokens: 5000 });
+});
+
+run("chat high reasoning is capped by explicit anthropic max_tokens", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
     model: "gpt-4o-mini",
     reasoning_effort: "high",
     max_completion_tokens: 5000,
     messages: [{ role: "user", content: "hi" }],
   });
-}, "Anthropic thinking budget must be less than max_tokens");
+
+  assert.equal(anthropic.max_tokens, 5000);
+  assert.deepEqual((anthropic as any).thinking, { type: "enabled", budget_tokens: 4999 });
+});
+
+run("config applies server-level ttfb_timeout and model override", () => {
+  const configPath = writeTempConfig(`
+server:
+  port: 3000
+  ttfb_timeout: 1500
+
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+  - name: beta
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-beta
+    ttfb_timeout: 2500
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.equal(config.ttfb_timeout, 1500);
+    assert.equal(config.models[0].ttfb_timeout, 1500);
+    assert.equal(config.models[1].ttfb_timeout, 2500);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+runThrows("config rejects invalid ttfb_timeout values", () => {
+  const configPath = writeTempConfig(`
+server:
+  ttfb_timeout: 0
+
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+`);
+
+  try {
+    loadConfig(configPath);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+}, "'server.ttfb_timeout' must be a positive number");
+
+await runAsync("upstream request fails when first byte exceeds ttfb_timeout", async () => {
+  await withHTTPServer(async (_req, res) => {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+  }, async (baseURL) => {
+    await assert.rejects(
+      passthroughRequest({
+        name: "alpha",
+        provider: "openai-chat",
+        base_url: baseURL,
+        api_key: "test-key",
+        model: "upstream-alpha",
+        ttfb_timeout: 30,
+      }, {
+        model: "alpha",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+      /Upstream TTFB timeout after 30ms/,
+    );
+  });
+});
+
+await runAsync("stream request only enforces ttfb_timeout until response starts", async () => {
+  await withHTTPServer(async (_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write("data: first\n\n");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    res.end("data: done\n\n");
+  }, async (baseURL) => {
+    const startedAt = Date.now();
+    const result = await passthroughStreamRequest({
+      name: "alpha",
+      provider: "openai-chat",
+      base_url: baseURL,
+      api_key: "test-key",
+      model: "upstream-alpha",
+      ttfb_timeout: 30,
+    }, {
+      model: "alpha",
+      messages: [{ role: "user", content: "hello" }],
+      stream: true,
+    });
+
+    assert.ok(Date.now() - startedAt < 70);
+    assert.ok(result.body);
+    const reader = result.body.getReader();
+    const chunks: string[] = [];
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(decoder.decode(value, { stream: true }));
+      }
+      const tail = decoder.decode();
+      if (tail) chunks.push(tail);
+    } finally {
+      reader.releaseLock();
+    }
+
+    assert.equal(chunks.join(""), "data: first\n\ndata: done\n\n");
+  });
+});
