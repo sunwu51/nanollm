@@ -165,8 +165,8 @@ async function executeModelRequest(
 
   if (sameFormat) {
     if (stream) {
-      const body = await passthroughStreamRequest(modelConfig, rawBody, upstreamOptions);
-      return { kind: "stream" as const, body, upstreamFormat: modelConfig.provider };
+      const { body, headers } = await passthroughStreamRequest(modelConfig, rawBody, upstreamOptions);
+      return { kind: "stream" as const, body, headers, upstreamFormat: modelConfig.provider };
     }
 
     const json = await passthroughRequest(modelConfig, rawBody, upstreamOptions);
@@ -184,6 +184,25 @@ async function executeModelRequest(
 
   const normalizedResponse = await forwardRequest(modelConfig, normalized, upstreamOptions);
   return { kind: "json" as const, json: denormalize(normalizedResponse) };
+}
+
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "content-length",
+]);
+
+function applyUpstreamResponseHeaders(res: express.Response, headers: Headers) {
+  for (const [key, value] of headers.entries()) {
+    if (HOP_BY_HOP_HEADERS.has(key.toLowerCase())) continue;
+    res.setHeader(key, value);
+  }
 }
 
 // ─── Route Factory ──────────────────────────────────────────────────────────
@@ -229,8 +248,12 @@ function createRoute(incomingFormat: StreamFormat) {
             if (result.kind === "stream") {
               const { body, upstreamFormat } = result;
 
-              res.setHeader("Content-Type", "text/event-stream");
-              res.setHeader("Cache-Control", "no-cache");
+              if (upstreamFormat === incomingFormat && "headers" in result) {
+                applyUpstreamResponseHeaders(res, result.headers);
+              }
+
+              res.setHeader("Content-Type", res.getHeader("Content-Type") ?? "text/event-stream");
+              res.setHeader("Cache-Control", res.getHeader("Cache-Control") ?? "no-cache");
               res.setHeader("Connection", "keep-alive");
               res.setHeader("X-Accel-Buffering", "no");
               res.flushHeaders();
