@@ -496,8 +496,9 @@ function normalizeAnthropicToolChoice(choice: ToolChoice): NormalizedToolChoice 
 function denormalizeOpenAIChatMessage(message: NormalizedMessage): OpenAIChatRequest["messages"] {
   switch (message.role) {
     case "system":
+      return [{ role: "system", content: collapseText(requireTextOnly(message.parts, "Chat system message")) }];
     case "developer":
-      return [{ role: message.role, content: collapseText(requireTextOnly(message.parts, `Chat ${message.role} message`)) }];
+      return [{ role: "system", content: collapseText(requireTextOnly(message.parts, "Chat developer message")) }];
     case "user":
       return [{ role: "user", content: denormalizeOpenAIChatUserParts(message.parts) }];
     case "assistant":
@@ -534,50 +535,68 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage): any[] {
   switch (message.role) {
     case "system":
     case "developer":
-    case "user":
-    case "assistant":
+    case "user": {
+      const contentParts = message.parts
+        .filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking")
+        .map((part) => {
+          if (part.type === "text") return { type: "input_text", text: part.text };
+          if (part.type === "refusal") return { type: "refusal", refusal: part.text };
+          if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
+          if (part.type === "input_audio") return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
+          if (part.type === "document_url") return { type: "input_file", file_url: part.url, filename: part.title ?? undefined };
+          return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
+        });
+      
+      return contentParts.length > 0 ? [{ type: "message", role: message.role, content: contentParts }] : [];
+    }
+    case "assistant": {
+      const reasoningItems = message.parts
+        .filter((part) => part.type === "thinking" || part.type === "redacted_thinking")
+        .map((part, index) =>
+          part.type === "thinking"
+            ? {
+                id: `reasoning_${index}`,
+                type: "reasoning",
+                summary: [{ type: "summary_text", text: part.thinking }],
+                content: [{ type: "reasoning_text", text: part.thinking }],
+                encrypted_content: part.signature || null,
+                status: "completed",
+              }
+            : {
+                id: `reasoning_${index}`,
+                type: "reasoning",
+                summary: [],
+                content: [],
+                encrypted_content: part.data,
+                status: "completed",
+              },
+        );
+      
+      const contentParts = message.parts
+        .filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking")
+        .map((part) => {
+          if (part.type === "text") return { type: "output_text", text: part.text, annotations: [] };
+          if (part.type === "refusal") return { type: "refusal", refusal: part.text };
+          if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
+          if (part.type === "input_audio") return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
+          if (part.type === "document_url") return { type: "input_file", file_url: part.url, filename: part.title ?? undefined };
+          return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
+        });
+      
+      const toolCallItems = message.toolCalls?.map((toolCall) =>
+        toolCall.kind === "function"
+          ? { type: "function_call", call_id: toolCall.id, name: toolCall.name, arguments: toolCall.payload }
+          : { type: "custom_tool_call", call_id: toolCall.id, name: toolCall.name, input: toolCall.payload }
+      ) ?? [];
+      
       return [
-        ...(
-          message.role === "assistant"
-            ? message.parts
-                .filter((part) => part.type === "thinking" || part.type === "redacted_thinking")
-                .map((part, index) =>
-                  part.type === "thinking"
-                    ? {
-                        id: `reasoning_${index}`,
-                        type: "reasoning",
-                        summary: [{ type: "summary_text", text: part.thinking }],
-                        content: [{ type: "reasoning_text", text: part.thinking }],
-                        encrypted_content: part.signature || null,
-                        status: "completed",
-                      }
-                    : {
-                        id: `reasoning_${index}`,
-                        type: "reasoning",
-                        summary: [],
-                        content: [],
-                        encrypted_content: part.data,
-                        status: "completed",
-                      },
-                )
-            : []
-        ),
-        {
-          type: "message",
-          role: message.role,
-          content: message.parts
-            .filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking")
-            .map((part) => {
-              if (part.type === "text") return message.role === "assistant" ? { type: "output_text", text: part.text, annotations: [] } : { type: "input_text", text: part.text };
-              if (part.type === "refusal") return { type: "refusal", refusal: part.text };
-              if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
-              if (part.type === "input_audio") return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
-              if (part.type === "document_url") return { type: "input_file", file_url: part.url, filename: part.title ?? undefined };
-              return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
-            }),
-        },
-        ...(message.toolCalls?.map((toolCall) => toolCall.kind === "function" ? { type: "function_call", call_id: toolCall.id, name: toolCall.name, arguments: toolCall.payload } : { type: "custom_tool_call", call_id: toolCall.id, name: toolCall.name, input: toolCall.payload }) ?? []),
+        ...reasoningItems,
+        // Include message item if content is not empty OR if there are tool calls.
+        // Some Responses API implementations require an assistant message before function_call items.
+        ...(contentParts.length > 0 || toolCallItems.length > 0 ? [{ type: "message", role: "assistant", content: contentParts }] : []),
+        ...toolCallItems,
       ];
+    }
     case "tool":
       return [{ type: "function_call_output", call_id: message.toolCallId ?? "", output: collapseText(requireTextOnly(message.parts, "Responses tool result")) }];
     case "function":

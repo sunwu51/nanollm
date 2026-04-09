@@ -9,6 +9,7 @@ import {
   anthropicMessageRequestToResponsesRequest,
   anthropicMessageToChatCompletion,
   anthropicMessageToResponsesResponse,
+  createSSEConverter,
   chatCompletionToAnthropicMessage,
   chatParamsToAnthropicMessageRequest,
   chatParamsToResponsesRequest,
@@ -75,6 +76,24 @@ function writeTempConfig(yaml: string): string {
   const file = join(dir, "config.yaml");
   writeFileSync(file, yaml);
   return file;
+}
+
+function parseSSEObjects(chunks: string[]): Array<{ event?: string; data: any }> {
+  const text = chunks.join("");
+  return text
+    .split(/\r?\n\r?\n/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .filter((block) => block !== "data: [DONE]")
+    .map((block) => {
+      let event: string | undefined;
+      const dataLines: string[] = [];
+      for (const line of block.split(/\r?\n/)) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+      return { event, data: JSON.parse(dataLines.join("\n")) };
+    });
 }
 
 run("chat tool result becomes anthropic tool_result block", () => {
@@ -149,6 +168,31 @@ run("string content survives chat to responses to chat", () => {
   const chat = responsesRequestToChatParams(responses);
   assert.equal(chat.messages[0].role, "user");
   assert.equal(chat.messages[0].content, "hello");
+});
+
+run("responses instructions developer role becomes chat system role", () => {
+  const chat = responsesRequestToChatParams({
+    model: "gpt-5",
+    instructions: "be terse",
+    input: "hello",
+  } as any);
+
+  assert.equal(chat.messages[0].role, "system");
+  assert.equal(chat.messages[0].content, "be terse");
+});
+
+run("responses developer input message becomes chat system role", () => {
+  const chat = responsesRequestToChatParams({
+    model: "gpt-5",
+    input: [
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "legacy provider compatible" }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+    ],
+  } as any);
+
+  assert.equal(chat.messages[0].role, "system");
+  assert.equal(chat.messages[0].content, "legacy provider compatible");
+  assert.equal(chat.messages[1].role, "user");
 });
 
 run("unsupported request fields are ignored instead of failing", () => {
@@ -270,6 +314,201 @@ run("responses response with tool call becomes chat completion tool_calls", () =
   } as any);
 
   assert.equal(result.choices[0].message.tool_calls?.[0].type, "function");
+});
+
+run("chat stream tool call with stop finish_reason becomes responses tool_calls completion", () => {
+  const converter = createSSEConverter("openai-chat", "openai-responses");
+  const chunks = [
+    ...converter.push(
+      [
+        {
+          id: "resp_stream_1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        },
+        {
+          id: "resp_stream_1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { reasoning_content: "Need to run a command first." }, finish_reason: null }],
+        },
+        {
+          id: "resp_stream_1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { content: "先直接运行 `whoami`。" }, finish_reason: null }],
+        },
+        {
+          id: "resp_stream_1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_stream_1",
+                    type: "function",
+                    function: { name: "bash", arguments: '{"command":"whoami"}' },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: "resp_stream_1",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { content: "" }, finish_reason: "stop" }],
+        },
+      ]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(""),
+    ),
+    ...converter.flush(),
+  ];
+
+  const events = parseSSEObjects(chunks);
+  const reasoningDelta = events.find((event) => event.event === "response.reasoning_summary_text.delta");
+  const completed = events.find((event) => event.event === "response.completed");
+
+  assert.ok(reasoningDelta);
+  assert.equal(reasoningDelta?.data.delta, "Need to run a command first.");
+  assert.ok(completed);
+  assert.equal(completed?.data.response.status, "completed");
+  assert.equal(completed?.data.response.output[0].type, "reasoning");
+  assert.equal(completed?.data.response.output[1].type, "message");
+  assert.equal(completed?.data.response.output[2].type, "function_call");
+  assert.equal(completed?.data.response.output[2].call_id, "call_stream_1");
+});
+
+run("chat stream carries usage from separate tail chunk after finish_reason", () => {
+  const converter = createSSEConverter("openai-chat", "openai-responses");
+  const chunks = [
+    ...converter.push(
+      [
+        {
+          id: "resp_stream_usage_tail",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        },
+        {
+          id: "resp_stream_usage_tail",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_stream_usage_tail",
+                    type: "function",
+                    function: { name: "bash", arguments: "{\"command\":\"whoami\"}" },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+        {
+          id: "resp_stream_usage_tail",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [],
+          usage: { prompt_tokens: 543, completion_tokens: 57, total_tokens: 600 },
+        },
+      ]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(""),
+    ),
+    ...converter.flush(),
+  ];
+
+  const events = parseSSEObjects(chunks);
+  const completed = events.find((event) => event.event === "response.completed");
+
+  assert.ok(completed);
+  assert.deepEqual(completed?.data.response.usage, {
+    input_tokens: 543,
+    output_tokens: 57,
+    total_tokens: 600,
+  });
+  assert.equal(completed?.data.response.output[0].type, "function_call");
+});
+
+run("chat stream usage-only tail infers tool_calls when supplier omits finish_reason", () => {
+  const converter = createSSEConverter("openai-chat", "openai-responses");
+  const chunks = [
+    ...converter.push(
+      [
+        {
+          id: "resp_stream_2",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        },
+        {
+          id: "resp_stream_2",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_stream_2",
+                    type: "function",
+                    function: { name: "glob", arguments: "{\"pattern\":\"src/**/*\"}" },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: "resp_stream_2",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        },
+      ]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(""),
+    ),
+    ...converter.flush(),
+  ];
+
+  const events = parseSSEObjects(chunks);
+  const completed = events.find((event) => event.event === "response.completed");
+
+  assert.ok(completed);
+  assert.equal(completed?.data.response.status, "completed");
+  assert.equal(completed?.data.response.output[0].type, "function_call");
+  assert.equal(completed?.data.response.output[0].call_id, "call_stream_2");
 });
 
 run("anthropic response with tool_use becomes chat completion tool_calls", () => {

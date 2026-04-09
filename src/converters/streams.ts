@@ -79,6 +79,7 @@ export function formatDone(): string {
 
 interface StreamParser {
   parse(event: unknown): NormalizedStreamEvent[];
+  finish(): NormalizedStreamEvent[];
 }
 
 interface StreamEmitter {
@@ -93,10 +94,39 @@ export class OpenAIChatStreamParser implements StreamParser {
   private ended = false;
   private textBlockIndex: number | null = null;
   private refusalBlockIndex: number | null = null;
+  private thinkingBlockIndex: number | null = null;
   private toolCallMap = new Map<number, number>();
   private openContentBlocks = new Set<number>();
   private closedToolCalls = new Set<number>();
   private nextIndex = 0;
+  private pendingFinishReason: string | null = null;
+
+  private closeOpenBlocks(out: NormalizedStreamEvent[]) {
+    for (const idx of this.openContentBlocks) {
+      out.push({ type: "content_done", index: idx });
+    }
+    this.openContentBlocks.clear();
+    for (const [, idx] of this.toolCallMap) {
+      if (!this.closedToolCalls.has(idx)) {
+        out.push({ type: "tool_done", index: idx });
+        this.closedToolCalls.add(idx);
+      }
+    }
+  }
+
+  private emitEnd(out: NormalizedStreamEvent[], usage?: Record<string, unknown> | undefined) {
+    if (this.ended) return;
+    out.push({
+      type: "end",
+      finishReason:
+        this.pendingFinishReason === "stop" && this.toolCallMap.size > 0
+          ? "tool_calls"
+          : this.pendingFinishReason ?? (this.toolCallMap.size > 0 ? "tool_calls" : "stop"),
+      usage: normalizeUsage(usage),
+    });
+    this.ended = true;
+    this.pendingFinishReason = null;
+  }
 
   parse(chunk: ChatCompletionChunk): NormalizedStreamEvent[] {
     const out: NormalizedStreamEvent[] = [];
@@ -109,8 +139,8 @@ export class OpenAIChatStreamParser implements StreamParser {
     const choice = chunk.choices?.[0];
     if (!choice) {
       if (chunk.usage && !this.ended) {
-        out.push({ type: "end", finishReason: "stop", usage: normalizeUsage(chunk.usage as Record<string, unknown>) });
-        this.ended = true;
+        this.closeOpenBlocks(out);
+        this.emitEnd(out, chunk.usage as Record<string, unknown>);
       }
       return out;
     }
@@ -135,6 +165,15 @@ export class OpenAIChatStreamParser implements StreamParser {
       out.push({ type: "content_delta", index: this.refusalBlockIndex, delta: delta.refusal });
     }
 
+    if ((delta as any)?.reasoning_content != null && (delta as any).reasoning_content !== "") {
+      if (this.thinkingBlockIndex == null) {
+        this.thinkingBlockIndex = this.nextIndex++;
+        this.openContentBlocks.add(this.thinkingBlockIndex);
+        out.push({ type: "content_start", index: this.thinkingBlockIndex, contentType: "thinking" });
+      }
+      out.push({ type: "content_delta", index: this.thinkingBlockIndex, delta: (delta as any).reasoning_content });
+    }
+
     if (delta?.tool_calls) {
       for (const tc of delta.tool_calls) {
         if (!this.toolCallMap.has(tc.index)) {
@@ -156,23 +195,22 @@ export class OpenAIChatStreamParser implements StreamParser {
     }
 
     if (finish_reason != null && !this.ended) {
-      for (const idx of this.openContentBlocks) {
-        out.push({ type: "content_done", index: idx });
+      this.pendingFinishReason = finish_reason;
+      this.closeOpenBlocks(out);
+      if (chunk.usage) {
+        this.emitEnd(out, chunk.usage as Record<string, unknown>);
       }
-      for (const [, idx] of this.toolCallMap) {
-        if (!this.closedToolCalls.has(idx)) {
-          out.push({ type: "tool_done", index: idx });
-          this.closedToolCalls.add(idx);
-        }
-      }
-      out.push({
-        type: "end",
-        finishReason: finish_reason,
-        usage: normalizeUsage(chunk.usage as Record<string, unknown> | undefined),
-      });
-      this.ended = true;
     }
 
+    return out;
+  }
+
+  finish(): NormalizedStreamEvent[] {
+    const out: NormalizedStreamEvent[] = [];
+    if (!this.ended && (this.pendingFinishReason != null || this.openContentBlocks.size > 0 || this.toolCallMap.size > 0)) {
+      this.closeOpenBlocks(out);
+      this.emitEnd(out);
+    }
     return out;
   }
 }
@@ -183,6 +221,7 @@ export class ResponsesStreamParser implements StreamParser {
   private blockMapping = new Map<string, number>();
   private blockTypes = new Map<string, "text" | "refusal" | "thinking">();
   private nextIndex = 0;
+  private seenToolCall = false;
 
   parse(event: ResponseStreamEvent): NormalizedStreamEvent[] {
     const out: NormalizedStreamEvent[] = [];
@@ -200,6 +239,7 @@ export class ResponsesStreamParser implements StreamParser {
       case "response.output_item.added": {
         const item = event.item;
         if (item.type === "function_call") {
+          this.seenToolCall = true;
           const idx = this.nextIndex++;
           const key = `tool_${event.output_index}`;
           this.blockMapping.set(key, idx);
@@ -304,7 +344,10 @@ export class ResponsesStreamParser implements StreamParser {
 
       case "response.completed": {
         const r = event.response;
-        const hasToolCalls = r.output?.some((item: any) => item.type === "function_call" || item.type === "custom_tool_call");
+        // Some providers return an empty output array in response.completed even when
+        // tool calls were streamed earlier via response.output_item.added events.
+        // Fall back to seenToolCall to avoid incorrectly emitting finishReason "stop".
+        const hasToolCalls = this.seenToolCall || r.output?.some((item: any) => item.type === "function_call" || item.type === "custom_tool_call");
         const finishReason = r.status === "incomplete" ? "length" : hasToolCalls ? "tool_calls" : "stop";
         out.push({ type: "end", finishReason, usage: normalizeUsage(r.usage as Record<string, unknown> | undefined) });
         break;
@@ -317,6 +360,10 @@ export class ResponsesStreamParser implements StreamParser {
     }
 
     return out;
+  }
+
+  finish(): NormalizedStreamEvent[] {
+    return [];
   }
 }
 
@@ -393,6 +440,10 @@ export class AnthropicStreamParser implements StreamParser {
     }
 
     return out;
+  }
+
+  finish(): NormalizedStreamEvent[] {
+    return [];
   }
 }
 
@@ -492,7 +543,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
   private itemIds = new Map<number, string>();
   // Accumulate completed content parts and output items for done/completed events
   private messageContentParts: Record<string, unknown>[] = [];
-  private completedOutputItems: Record<string, unknown>[] = [];
+  private completedOutputItems = new Map<number, Record<string, unknown>>();
   private outputText = "";
 
   private nextSeq() {
@@ -512,7 +563,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
       created_at: this.createdAt,
       status,
       model: this.model,
-      output: this.completedOutputItems,
+      output: [...this.completedOutputItems.entries()].sort((a, b) => a[0] - b[0]).map(([, item]) => item),
       output_text: this.outputText,
       ...(usage ? { usage: denormalizeUsageToOpenAIResponses(usage) } : {}),
     };
@@ -600,7 +651,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
           out.push({ type: "response.content_part.done", item_id: itemId, output_index: mapping.outputIndex, content_index: mapping.contentIndex, part, sequence_number: this.nextSeq() });
         } else if (ct === "thinking") {
           const reasoningItem = { id: itemId, type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: acc }] };
-          this.completedOutputItems.push(reasoningItem);
+          this.completedOutputItems.set(mapping.outputIndex, reasoningItem);
           out.push({ type: "response.reasoning_summary_text.done", item_id: itemId, output_index: mapping.outputIndex, summary_index: mapping.summaryIndex ?? 0, text: acc, sequence_number: this.nextSeq() });
           out.push({ type: "response.reasoning_summary_part.done", item_id: itemId, output_index: mapping.outputIndex, summary_index: mapping.summaryIndex ?? 0, part: { type: "summary_text", text: acc }, sequence_number: this.nextSeq() });
           out.push({ type: "response.output_item.done", output_index: mapping.outputIndex, item: reasoningItem, sequence_number: this.nextSeq() });
@@ -643,7 +694,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         if (!itemId) break;
         const info = this.toolCallInfo.get(event.index);
         const fcItem = { id: itemId, type: "function_call", status: "completed", call_id: info?.id ?? "", name: info?.name ?? "", arguments: acc };
-        this.completedOutputItems.push(fcItem);
+        this.completedOutputItems.set(mapping.outputIndex, fcItem);
         out.push({ type: "response.function_call_arguments.done", item_id: itemId, output_index: mapping.outputIndex, name: info?.name ?? "", arguments: acc, sequence_number: this.nextSeq() });
         out.push({ type: "response.output_item.done", output_index: mapping.outputIndex, item: fcItem, sequence_number: this.nextSeq() });
         break;
@@ -654,7 +705,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
           const itemId = this.itemIds.get(this.messageOutputIndex);
           if (itemId) {
             const msgItem = { id: itemId, type: "message", role: "assistant", status: "completed", content: this.messageContentParts };
-            this.completedOutputItems.push(msgItem);
+            this.completedOutputItems.set(this.messageOutputIndex, msgItem);
             out.push({ type: "response.output_item.done", output_index: this.messageOutputIndex, item: msgItem, sequence_number: this.nextSeq() });
           }
         }
@@ -855,7 +906,12 @@ export class StreamConverter {
   }
 
   flush(): unknown[] {
-    return this.emitter.finish();
+    const output: unknown[] = [];
+    for (const ne of this.parser.finish()) {
+      output.push(...this.emitter.emit(ne));
+    }
+    output.push(...this.emitter.finish());
+    return output;
   }
 }
 
