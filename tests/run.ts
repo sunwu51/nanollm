@@ -159,6 +159,31 @@ run("responses tool output becomes anthropic tool_result block", () => {
   assert.equal((result.messages[0].content as Array<{ type: string }>)[0].type, "tool_result");
 });
 
+run("responses image tool output becomes anthropic image tool_result block", () => {
+  const result = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    input: [{ type: "function_call_output", call_id: "call_img", output: [{ type: "input_image", image_url: "https://example.com/tool.png" }] }],
+  } as any);
+
+  const toolResult = (result.messages[0].content as Array<{ type: string; content: Array<{ type: string; source?: { url?: string } }> }>)[0];
+  assert.equal(toolResult.type, "tool_result");
+  assert.equal(toolResult.content[0].type, "image");
+  assert.equal(toolResult.content[0].source?.url, "https://example.com/tool.png");
+});
+
+run("responses file tool output becomes anthropic document tool_result block", () => {
+  const result = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    input: [{ type: "function_call_output", call_id: "call_file", output: [{ type: "input_file", file_url: "https://example.com/tool.pdf", filename: "tool.pdf" }] }],
+  } as any);
+
+  const toolResult = (result.messages[0].content as Array<{ type: string; content: Array<{ type: string; title?: string; source?: { url?: string } }> }>)[0];
+  assert.equal(toolResult.type, "tool_result");
+  assert.equal(toolResult.content[0].type, "document");
+  assert.equal(toolResult.content[0].title, "tool.pdf");
+  assert.equal(toolResult.content[0].source?.url, "https://example.com/tool.pdf");
+});
+
 run("string content survives chat to responses to chat", () => {
   const responses = chatParamsToResponsesRequest({
     model: "gpt-4o-mini",
@@ -266,6 +291,23 @@ run("object content survives anthropic to responses conversion for images", () =
   const first = (responses.input as Array<{ content: Array<{ type: string; image_url?: string }> }>)[0];
   assert.equal(first.content[0].type, "input_image");
   assert.equal(first.content[0].image_url, "https://example.com/a.png");
+});
+
+run("anthropic document user content degrades to chat text instead of failing", () => {
+  const chat = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content: [{ type: "document", title: "report.pdf", source: { type: "url", url: "https://example.com/report.pdf" } }],
+      },
+    ],
+  });
+
+  assert.equal(chat.messages[0].role, "user");
+  assert.match(String(chat.messages[0].content), /report\.pdf/);
+  assert.match(String(chat.messages[0].content), /https:\/\/example\.com\/report\.pdf/);
 });
 
 run("chat completion response with tool_calls becomes anthropic tool_use response", () => {
@@ -558,6 +600,36 @@ run("anthropic tool_result block array becomes chat tool text", () => {
   assert.equal((result.messages[0] as { content: string }).content, "Sunny\n25C");
 });
 
+run("anthropic image tool_result becomes chat user multimodal fallback", () => {
+  const result = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_img", caller: { type: "direct" }, name: "view_image", input: { path: "/tmp/a.png" } }],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_img",
+            content: [{ type: "image", source: { type: "url", url: "https://example.com/tool.png" } }],
+          },
+        ],
+      },
+    ],
+  });
+
+  const fallback = result.messages[1] as { role: string; content: Array<{ type: string; text?: string; image_url?: { url?: string } }> };
+  assert.equal(fallback.role, "user");
+  assert.equal(fallback.content[0].type, "text");
+  assert.match(fallback.content[0].text ?? "", /Tool result for call_img/);
+  assert.equal(fallback.content[1].type, "image_url");
+  assert.equal(fallback.content[1].image_url?.url, "https://example.com/tool.png");
+});
+
 run("chat tool result round-trip through anthropic preserves tool id", () => {
   const anthropic = chatParamsToAnthropicMessageRequest({
     model: "gpt-4o-mini",
@@ -594,6 +666,55 @@ run("responses function call output round-trip through anthropic preserves call 
 
   const responses = anthropicMessageRequestToResponsesRequest(anthropic);
   assert.equal((responses.input as Array<{ call_id: string }>)[0].call_id, "resp_call");
+});
+
+run("anthropic image tool_result becomes responses image tool output", () => {
+  const responses = anthropicMessageRequestToResponsesRequest({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "img_resp",
+            content: [{ type: "image", source: { type: "url", url: "https://example.com/from-anthropic.png" } }],
+          },
+        ],
+      },
+    ],
+  });
+
+  const output = (responses.input as Array<{ type: string; output: Array<{ type: string; image_url?: string }> }>)[0];
+  assert.equal(output.type, "function_call_output");
+  assert.equal(output.output[0].type, "input_image");
+  assert.equal(output.output[0].image_url, "https://example.com/from-anthropic.png");
+});
+
+run("anthropic document tool_result becomes responses file tool output", () => {
+  const responses = anthropicMessageRequestToResponsesRequest({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "file_resp",
+            content: [{ type: "document", title: "report.pdf", source: { type: "url", url: "https://example.com/report.pdf" } }],
+          },
+        ],
+      },
+    ],
+  });
+
+  const output = (responses.input as Array<{ type: string; output: Array<{ type: string; file_url?: string; filename?: string }> }>)[0];
+  assert.equal(output.type, "function_call_output");
+  assert.equal(output.output[0].type, "input_file");
+  assert.equal(output.output[0].file_url, "https://example.com/report.pdf");
+  assert.equal(output.output[0].filename, "report.pdf");
 });
 
 run("chat parallel_tool_calls false survives anthropic conversion without explicit tool_choice", () => {
