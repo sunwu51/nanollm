@@ -17,7 +17,14 @@ server:
   ttfb_timeout: 5000 # optional, upstream first-byte timeout in ms
 
 models:
-  - name: gpt-5.4
+  - name: gpt-5.4-a
+    # responses规范
+    provider: openai-responses
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY1
+    model: openai/gpt-5.4
+
+  - name: gpt-5.4-b
     # responses规范
     provider: openai-responses
     base_url: https://example.com/v1
@@ -46,9 +53,9 @@ models:
     model: claude-sonnet-4-6
 
 fallback:
-  primary-group:
-    - gpt-5.4
-    - claude-sonnet-4-6
+  gpt-5.4:
+    - gpt-5.4-a
+    - gpt-5.4-b
     - glm5.1
 ```
 Run the proxy server:

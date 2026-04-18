@@ -6,9 +6,10 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import type { ModelConfig } from "./src/config.js";
-import { loadConfig, resolveFallbackModels, resolveModel } from "./src/config.js";
+import { getPublicModelNames, loadConfig, resolveFallbackModels, resolveModel } from "./src/config.js";
 import { getUpstreamURL } from "./src/proxy.js";
 import { forwardRequest, forwardStreamRequest, passthroughRequest, passthroughStreamRequest } from "./src/proxy.js";
+import { sortFallbackGroupMembers } from "./src/fallback.js";
 import {
   normalizeOpenAIChatRequest,
   normalizeOpenAIResponsesRequest,
@@ -96,7 +97,7 @@ type Normalizer = (body: unknown) => NormalizedRequest;
 type Denormalizer = (normalized: NormalizedResponse) => unknown;
 type UpstreamOptions = { userAgent?: string };
 
-const FAILURE_WINDOW_MS = 3 * 60 * 1000;
+const FAILURE_WINDOW_MS = 5 * 60 * 1000;
 const modelFailures = new Map<string, number[]>();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
@@ -154,22 +155,15 @@ function orange(message: string): string {
 }
 
 function getCandidateModels(primaryModel: string): ModelConfig[] {
-  const candidateNames = resolveFallbackModels(config, primaryModel);
-  const fallbackOrder = new Map(candidateNames.map((name, index) => [name, index]));
   const now = Date.now();
+  const isFallbackGroup = primaryModel in config.fallback;
+  const candidateNames = isFallbackGroup
+    ? sortFallbackGroupMembers(resolveFallbackModels(config, primaryModel), (name) => getModelFailureCount(name, now))
+    : resolveFallbackModels(config, primaryModel);
 
   return candidateNames
     .map((name) => resolveModel(config, name))
-    .filter((model): model is ModelConfig => Boolean(model))
-    .sort((left, right) => {
-      if (left.name === primaryModel) return -1;
-      if (right.name === primaryModel) return 1;
-
-      const failureDelta = getModelFailureCount(left.name, now) - getModelFailureCount(right.name, now);
-      if (failureDelta !== 0) return failureDelta;
-
-      return (fallbackOrder.get(left.name) ?? Number.MAX_SAFE_INTEGER) - (fallbackOrder.get(right.name) ?? Number.MAX_SAFE_INTEGER);
-    });
+    .filter((model): model is ModelConfig => Boolean(model));
 }
 
 async function executeModelRequest(
@@ -238,9 +232,10 @@ function createRoute(incomingFormat: StreamFormat) {
     }
 
     const requestedModel = resolveModel(config, modelName);
-    if (!requestedModel) {
+    const requestedFallbackGroup = config.fallback[modelName];
+    if (!requestedModel && !requestedFallbackGroup) {
       return c.json(
-        { error: `Model '${modelName}' not found in config`, available: config.models.map((m) => m.name) },
+        { error: `Model '${modelName}' not found in config`, available: getPublicModelNames(config) },
         404,
       );
     }
@@ -457,7 +452,11 @@ app.get("/", (c) => {
   return c.json({
     ok: true,
     message: "nanollm gateway",
-    models: config.models.map((m) => ({ name: m.name, provider: m.provider, model: m.model })),
+    models: getPublicModelNames(config).map((name) => ({
+      name,
+      provider: config.fallback[name] ? "fallback-group" : resolveModel(config, name)?.provider,
+      model: config.fallback[name] ? config.fallback[name] : resolveModel(config, name)?.model,
+    })),
     endpoints: {
       health: "GET /health",
       chat: "POST /v1/chat/completions",
@@ -472,10 +471,10 @@ app.get("/health", (c) => c.json({ ok: true }));
 app.get("/v1/models", (c) => {
   return c.json({
     object: "list",
-    data: config.models.map((m) => ({
-      id: m.name,
+    data: getPublicModelNames(config).map((name) => ({
+      id: name,
       object: "model",
-      owned_by: m.provider,
+      owned_by: config.fallback[name] ? "fallback-group" : resolveModel(config, name)?.provider,
     })),
   });
 });

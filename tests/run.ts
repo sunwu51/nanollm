@@ -17,7 +17,8 @@ import {
   responsesRequestToChatParams,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
-import { loadConfig } from "../src/config.js";
+import { getPublicModelNames, loadConfig, resolveFallbackModels } from "../src/config.js";
+import { sortFallbackGroupMembers } from "../src/fallback.js";
 import { passthroughRequest, passthroughStreamRequest } from "../src/proxy.js";
 
 function run(name: string, fn: () => void) {
@@ -149,6 +150,85 @@ run("anthropic tool_result becomes chat tool message", () => {
   assert.equal((result.messages[2] as { tool_call_id: string }).tool_call_id, "call_1");
 });
 
+run("anthropic messages request only keeps function tools and drops typed server/custom tools", () => {
+  const chat = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    messages: [{ role: "user", content: "hello" }],
+    tools: [
+      {
+        name: "get_weather",
+        description: "Get weather",
+        input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+      },
+      {
+        name: "web_search",
+        type: "web_search_20250305",
+      },
+      {
+        name: "apply_patch",
+        type: "custom",
+        description: "Apply patch",
+        input_schema: { type: "object", properties: { arg: { type: "string" } }, required: ["arg"] },
+      },
+    ],
+    tool_choice: { type: "tool", name: "get_weather" },
+  } as any);
+
+  assert.equal(chat.tools?.length ?? 0, 1);
+  assert.equal((chat.tools?.[0] as any).type, "function");
+  assert.equal((chat.tools?.[0] as any).function.name, "get_weather");
+  assert.deepEqual((chat as any).tool_choice, { type: "function", function: { name: "get_weather" } });
+});
+
+run("anthropic server tool history is downgraded to function-style chat history", () => {
+  const result = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "server_tool_use",
+            id: "srv_1",
+            caller: { type: "server" },
+            name: "web_search",
+            input: { query: "nanollm" },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "web_search_tool_result",
+            tool_use_id: "srv_1",
+            content: [
+              {
+                type: "web_search_result",
+                title: "nanollm",
+                url: "https://example.com/nanollm",
+                encrypted_content: "enc_1",
+                page_age: null,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  } as any);
+
+  assert.equal(result.messages[0].role, "assistant");
+  assert.equal((result.messages[0].tool_calls?.[0] as any).type, "function");
+  assert.equal((result.messages[0].tool_calls?.[0] as any).function.name, "web_search");
+  assert.equal((result.messages[0].tool_calls?.[0] as any).function.arguments, "{\"query\":\"nanollm\"}");
+  assert.equal(result.messages[1].role, "tool");
+  assert.equal((result.messages[1] as any).tool_call_id, "srv_1");
+  assert.match(String((result.messages[1] as any).content), /nanollm/);
+  assert.match(String((result.messages[1] as any).content), /https:\/\/example\.com\/nanollm/);
+});
+
 run("responses tool output becomes anthropic tool_result block", () => {
   const result = responsesRequestToAnthropicMessageRequest({
     model: "gpt-4o-mini",
@@ -261,6 +341,68 @@ run("built-in tools are ignored instead of failing", () => {
   } as any);
   assert.equal(responsesToChat.tools?.length ?? 0, 0);
   assert.equal((responsesToChat as any).tool_choice, undefined);
+});
+
+run("responses custom tool call input is downgraded to function call with JSON arguments", () => {
+  const chat = responsesRequestToChatParams({
+    model: "gpt-5",
+    input: [
+      { type: "custom_tool_call", call_id: "call_custom", name: "apply_patch", input: "*** Begin Patch\n*** End Patch\n" },
+      { type: "custom_tool_call_output", call_id: "call_custom", output: "ok" },
+    ],
+  } as any);
+
+  assert.equal(chat.messages[0].role, "assistant");
+  assert.equal((chat.messages[0].tool_calls?.[0] as any).type, "function");
+  assert.equal((chat.messages[0].tool_calls?.[0] as any).function.name, "apply_patch");
+  assert.equal((chat.messages[0].tool_calls?.[0] as any).function.arguments, "{\"arg\":\"*** Begin Patch\\n*** End Patch\\n\"}");
+  assert.equal(chat.messages[1].role, "tool");
+  assert.equal((chat.messages[1] as any).tool_call_id, "call_custom");
+});
+
+run("non-function tools are ignored during normalization", () => {
+  const chatToResponses = chatParamsToResponsesRequest({
+    model: "gpt-5",
+    messages: [{ role: "user", content: "hello" }],
+    tools: [
+      { type: "custom", custom: { name: "apply_patch", description: "patch", format: { type: "grammar" } } },
+      { type: "customer", custom: { name: "bad_tool", description: "bad", format: { type: "grammar" } } },
+    ],
+    tool_choice: { type: "custom", custom: { name: "apply_patch" } },
+  } as any);
+  assert.equal(chatToResponses.tools?.length ?? 0, 0);
+  assert.equal((chatToResponses as any).tool_choice, undefined);
+
+  const responsesToChat = responsesRequestToChatParams({
+    model: "gpt-5",
+    input: "hello",
+    tools: [
+      { type: "custom", name: "apply_patch", description: "patch", format: { type: "grammar" } },
+      { type: "customer", name: "bad_tool", description: "bad", format: { type: "grammar" } },
+    ],
+    tool_choice: { type: "custom", name: "apply_patch" },
+  } as any);
+  assert.equal(responsesToChat.tools?.length ?? 0, 0);
+  assert.equal((responsesToChat as any).tool_choice, undefined);
+});
+
+run("responses custom tool response is downgraded to function tool call", () => {
+  const result = responsesResponseToChatCompletion({
+    id: "resp_1",
+    object: "response",
+    created_at: 1,
+    status: "completed",
+    error: null,
+    incomplete_details: null,
+    model: "gpt-5",
+    output: [{ type: "custom_tool_call", call_id: "call_custom", name: "apply_patch", input: "*** Begin Patch\n*** End Patch\n" }],
+    tools: [],
+    parallel_tool_calls: false,
+    text: { format: { type: "text" } },
+  } as any);
+
+  assert.equal(result.choices[0].message.tool_calls?.[0].type, "function");
+  assert.equal((result.choices[0].message.tool_calls?.[0] as any).function.arguments, "{\"arg\":\"*** Begin Patch\\n*** End Patch\\n\"}");
 });
 
 run("chat verbosity survives chat to responses to chat", () => {
@@ -989,6 +1131,74 @@ models:
   } finally {
     rmSync(dirname(configPath), { recursive: true, force: true });
   }
+});
+
+run("fallback group name is exposed as public model and resolves only by exact group name", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+  - name: beta
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-beta
+fallback:
+  group-a:
+    - alpha
+    - beta
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.deepEqual(getPublicModelNames(config), ["group-a", "alpha", "beta"]);
+    assert.deepEqual(resolveFallbackModels(config, "group-a"), ["alpha", "beta"]);
+    assert.deepEqual(resolveFallbackModels(config, "alpha"), ["alpha"]);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+runThrows("config rejects duplicate fallback group and model names", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+fallback:
+  alpha:
+    - alpha
+`);
+
+  try {
+    loadConfig(configPath);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+}, "Duplicate public model name 'alpha'");
+
+run("fallback group members are ordered by recent failure count minus two, then original order", () => {
+  const ordered = sortFallbackGroupMembers(["alpha", "beta", "gamma", "delta"], (name) => {
+    switch (name) {
+      case "alpha":
+        return 2;
+      case "beta":
+        return 5;
+      case "gamma":
+        return 5;
+      case "delta":
+        return 1;
+      default:
+        return 0;
+    }
+  });
+
+  assert.deepEqual(ordered, ["beta", "gamma", "alpha", "delta"]);
 });
 
 runThrows("config rejects invalid ttfb_timeout values", () => {

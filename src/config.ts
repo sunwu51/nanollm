@@ -20,6 +20,10 @@ export interface ServerConfig {
   fallback: Record<string, string[]>;
 }
 
+export function getPublicModelNames(config: ServerConfig): string[] {
+  return [...Object.keys(config.fallback), ...config.models.map((model) => model.name)];
+}
+
 function resolveEnvVars(value: string): string {
   return value.replace(/\$\{(\w+)\}/g, (_, key) => process.env[key] ?? "");
 }
@@ -112,20 +116,30 @@ export function resolveModel(config: ServerConfig, name: string): ModelConfig | 
 }
 
 export function resolveFallbackModels(config: ServerConfig, name: string): string[] {
-  for (const members of Object.values(config.fallback)) {
-    if (members.includes(name)) return members;
-  }
+  if (name in config.fallback) return config.fallback[name];
   return [name];
 }
 
 function validateFallback(models: ModelConfig[], fallback: Record<string, string[]>) {
   const knownModels = new Set(models.map((model) => model.name));
   const assignedGroups = new Map<string, string>();
+  const duplicateNames = new Set<string>();
+
+  for (const model of models) {
+    if (duplicateNames.has(model.name)) {
+      throw new Error(`Duplicate model name '${model.name}'`);
+    }
+    duplicateNames.add(model.name);
+  }
 
   for (const [groupName, members] of Object.entries(fallback)) {
     if (!Array.isArray(members) || members.length === 0) {
       throw new Error(`Fallback group '${groupName}' must be a non-empty model array`);
     }
+    if (duplicateNames.has(groupName)) {
+      throw new Error(`Duplicate public model name '${groupName}'`);
+    }
+    duplicateNames.add(groupName);
 
     for (const member of members) {
       if (!knownModels.has(member)) {

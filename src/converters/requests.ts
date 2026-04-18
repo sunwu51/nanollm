@@ -298,9 +298,7 @@ function normalizeOpenAIChatToolCall(toolCall: any) {
 function normalizeOpenAIChatTool(tool: any): NormalizedTool | undefined {
   return tool.type === "function"
     ? { kind: "function", name: tool.function.name, description: tool.function.description, inputSchema: tool.function.parameters ?? { type: "object" }, strict: tool.function.strict ?? null }
-    : tool.type === "custom"
-      ? { kind: "custom", name: tool.custom.name, description: tool.custom.description, format: tool.custom.format }
-      : undefined;
+    : undefined;
 }
 
 function normalizeOpenAIChatToolChoice(choice: any): NormalizedToolChoice | undefined {
@@ -339,13 +337,19 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
       }];
     }
     if (itemType === "function_call") return [{ role: "assistant", parts: [], toolCalls: [{ kind: "function", id: item.call_id, name: item.name, payload: item.arguments }] }];
-    if (itemType === "custom_tool_call") return [{ role: "assistant", parts: [], toolCalls: [{ kind: "custom", id: item.call_id, name: item.name, payload: item.input }] }];
+    if (itemType === "custom_tool_call") return [{ role: "assistant", parts: [], toolCalls: [{ kind: "function", id: item.call_id, name: item.name, payload: normalizeCustomToolInputToFunctionArguments(item.input) }] }];
     if (itemType === "function_call_output" || itemType === "custom_tool_call_output") {
       return [{ role: "tool", toolCallId: item.call_id, parts: normalizeOpenAIResponsesToolOutput(item.output) }];
     }
     if (itemType === "item_reference") return [];
     fail(`Responses input item type "${itemType}" is not supported`);
   });
+}
+
+function normalizeCustomToolInputToFunctionArguments(input: any): string {
+  if (typeof input === "string") return JSON.stringify({ arg: input });
+  if (input === undefined) return JSON.stringify({ arg: "" });
+  return JSON.stringify(input);
 }
 
 function normalizeOpenAIResponsesMessage(item: any): NormalizedMessage {
@@ -389,7 +393,6 @@ function normalizeOpenAIResponsesToolOutput(output: any): NormalizedMessage["par
 
 function normalizeOpenAIResponsesTool(tool: any): NormalizedTool | undefined {
   if (tool.type === "function") return { kind: "function", name: tool.name, description: tool.description, inputSchema: tool.parameters ?? { type: "object" }, strict: tool.strict ?? null };
-  if (tool.type === "custom") return { kind: "custom", name: tool.name, description: tool.description, format: tool.format };
   return undefined;
 }
 
@@ -452,9 +455,45 @@ function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
       normalized.push({ role: "tool", toolCallId: block.tool_use_id, isError: block.is_error, parts: normalizeAnthropicToolResultParts(block.content) });
       continue;
     }
+    if (isAnthropicServerToolResultBlock(block)) {
+      normalized.push({ role: "tool", toolCallId: block.tool_use_id, isError: isAnthropicServerToolErrorContent(block.content), parts: normalizeAnthropicServerToolResultParts(block.content) });
+      continue;
+    }
     fail(`Anthropic block "${block.type}" is not supported`);
   }
   return normalized;
+}
+
+function isAnthropicServerToolResultBlock(block: any): boolean {
+  return typeof block?.type === "string" && block.type.endsWith("_tool_result");
+}
+
+function isAnthropicServerToolErrorContent(content: any): boolean {
+  return !!content && !Array.isArray(content) && typeof content.type === "string" && content.type.endsWith("_error");
+}
+
+function normalizeAnthropicServerToolResultParts(content: any): NormalizedMessage["parts"] {
+  if (!content) return [];
+  if (typeof content === "string") return [text(content)];
+  if (Array.isArray(content)) {
+    return content.flatMap((block: any) => normalizeAnthropicServerToolResultParts(block));
+  }
+
+  if (content.type === "web_search_result") {
+    return [text([content.title, content.url, content.page_age ?? null].filter(Boolean).join("\n"))];
+  }
+
+  if (content.type === "web_fetch_result") {
+    const documentParts = normalizeAnthropicToolResultParts([content.content]);
+    if (documentParts.length > 0) return documentParts;
+    return [text(content.url ?? "web_fetch_result")];
+  }
+
+  if (content.type === "tool_search_tool_search_result") {
+    return [text((content.tool_references ?? []).map((tool: any) => tool.tool_name).join("\n"))];
+  }
+
+  return [text(JSON.stringify(content))];
 }
 
 function normalizeAnthropicToolResultParts(content: any): NormalizedMessage["parts"] {
@@ -474,8 +513,9 @@ function normalizeAnthropicToolResultParts(content: any): NormalizedMessage["par
 
 function normalizeAnthropicTool(tool: ToolUnion): NormalizedTool | undefined {
   if (!("input_schema" in tool)) return undefined;
+  if ("type" in tool && tool.type !== undefined && tool.type !== "function") return undefined;
   return {
-    kind: tool.type === "custom" ? "custom" : "function",
+    kind: "function",
     name: tool.name,
     description: "description" in tool ? tool.description : undefined,
     inputSchema: tool.input_schema ?? { type: "object" },

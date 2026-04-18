@@ -65,7 +65,7 @@ export function normalizeOpenAIResponsesResponse(response: OpenAIResponsesRespon
     }
 
     if (item.type === "custom_tool_call") {
-      toolCalls.push({ kind: "custom", id: item.call_id, name: item.name, payload: item.input });
+      toolCalls.push({ kind: "function", id: item.call_id, name: item.name, payload: normalizeCustomToolInputToFunctionArguments(item.input) });
       continue;
     }
 
@@ -94,6 +94,12 @@ export function normalizeOpenAIResponsesResponse(response: OpenAIResponsesRespon
     },
     usage: normalizeUsage(response.usage as Record<string, unknown> | undefined),
   };
+}
+
+function normalizeCustomToolInputToFunctionArguments(input: any): string {
+  if (typeof input === "string") return JSON.stringify({ arg: input });
+  if (input === undefined) return JSON.stringify({ arg: "" });
+  return JSON.stringify(input);
 }
 
 export function normalizeAnthropicResponse(response: AnthropicMessagesResponse): NormalizedResponse {
