@@ -20,6 +20,23 @@ import {
 import { getPublicModelNames, loadConfig, resolveFallbackModels } from "../src/config.js";
 import { sortFallbackGroupMembers } from "../src/fallback.js";
 import { passthroughRequest, passthroughStreamRequest } from "../src/proxy.js";
+import { renderRecordPage } from "../src/record-page.js";
+import {
+  appendRecordedAttemptResponseBody,
+  appendRecordedClientResponseBody,
+  beginRecordedRequest,
+  ensureRecordedAttempt,
+  getRecordedRequest,
+  getRecordSummary,
+  setRecordedAttemptResponseBody,
+  setRecordedAttemptResponseMeta,
+  setRecordedClientResponseBody,
+  setRecordedClientResponseMeta,
+  startRecording,
+  stopRecording,
+} from "../src/record.js";
+import { runWithRequestId } from "../src/request-context.js";
+import { StatusStore, getHealthTone } from "../src/status.js";
 
 function run(name: string, fn: () => void) {
   try {
@@ -1267,6 +1284,7 @@ await runAsync("stream request only enforces ttfb_timeout until response starts"
 
     assert.ok(Date.now() - startedAt < 70);
     assert.ok(result.body);
+    assert.ok(result.timing.ttfbMs >= 0);
     const reader = result.body.getReader();
     const chunks: string[] = [];
     const decoder = new TextDecoder();
@@ -1284,4 +1302,221 @@ await runAsync("stream request only enforces ttfb_timeout until response starts"
 
     assert.equal(chunks.join(""), "data: first\n\ndata: done\n\n");
   });
+});
+
+run("status store aggregates success rate and averages by five-minute bucket", () => {
+  const store = new StatusStore();
+  const bucketStart = Date.UTC(2026, 3, 19, 4, 0, 0);
+
+  store.recordAttempt("alpha", bucketStart + 5_000);
+  store.recordSuccess("alpha", 120, 40, {
+    nonCacheInputTokens: 1200,
+    cacheReadInputTokens: 300,
+    outputTokens: 450,
+  }, bucketStart + 5_000);
+  store.recordAttempt("alpha", bucketStart + 60_000);
+  store.recordFailure("alpha", 300, bucketStart + 60_000);
+
+  const cell = store.getModelSeries("alpha", bucketStart + 60_000).at(-1);
+  assert.ok(cell);
+  assert.equal(cell.totalRequests, 2);
+  assert.equal(cell.successRequests, 1);
+  assert.equal(Math.round(cell.successRate), 50);
+  assert.equal(cell.avgTtfbMs, 40);
+  assert.equal(cell.avgDurationMs, 210);
+  assert.equal(cell.nonCacheInputTokens, 1200);
+  assert.equal(cell.cacheReadInputTokens, 300);
+  assert.equal(cell.outputTokens, 450);
+  assert.equal(getHealthTone(cell.successRate, cell.totalRequests), "orange");
+});
+
+run("status store keeps only the last 6 hours of buckets", () => {
+  const store = new StatusStore();
+  const now = Date.UTC(2026, 3, 19, 23, 55, 0);
+  const expired = now - (6 * 60 * 60 * 1000) - (5 * 60 * 1000);
+
+  store.recordAttempt("alpha", expired);
+  store.recordSuccess("alpha", 100, 20, undefined, expired);
+  store.recordAttempt("alpha", now);
+  store.recordSuccess("alpha", 200, 30, undefined, now);
+
+  const series = store.getModelSeries("alpha", now);
+  assert.equal(series.length, 72);
+  assert.equal(series.some((cell) => cell.bucketStart === expired && cell.totalRequests > 0), false);
+  assert.equal(series.at(-1)?.totalRequests, 1);
+});
+
+run("record store resets on start and supports full request id lookup", () => {
+  startRecording();
+  const requestId = "abcdef12-3456-7890-abcd-ef1234567890";
+  assert.equal(
+    beginRecordedRequest({
+      requestId,
+      path: "/v1/chat/completions",
+      headers: { Authorization: "Bearer top-secret", "X-Test": "ok" },
+      body: { model: "alpha", messages: [{ role: "user", content: "hello" }] },
+      stream: false,
+    }),
+    true,
+  );
+  ensureRecordedAttempt({
+    requestId,
+    index: 1,
+    provider: "openai-chat",
+    modelName: "alpha",
+    url: "https://example.com/v1/chat/completions",
+    requestHeaders: { Authorization: "Bearer top-secret" },
+    requestBody: JSON.stringify({ model: "upstream-alpha", stream: false }),
+  });
+  setRecordedAttemptResponseMeta({
+    requestId,
+    index: 1,
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+  setRecordedAttemptResponseBody({
+    requestId,
+    index: 1,
+    body: JSON.stringify({ id: "chatcmpl_1", choices: [] }),
+  });
+  setRecordedClientResponseMeta({
+    requestId,
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+  setRecordedClientResponseBody({
+    requestId,
+    body: { id: "chatcmpl_1", choices: [] },
+  });
+
+  const record = getRecordedRequest(requestId);
+  assert.ok(record);
+  assert.equal(getRecordedRequest("abcdef")?.requestId, requestId);
+  assert.equal(getRecordedRequest("requestId=abcdef")?.requestId, requestId);
+  assert.equal(record?.clientRequest.headers.Authorization, "[REDACTED]");
+  assert.equal(record?.attempts[0].request.headers?.Authorization, "[REDACTED]");
+  assert.deepEqual(record?.attempts[0].request.body, { model: "upstream-alpha", stream: false });
+  assert.deepEqual(record?.attempts[0].response.body, { id: "chatcmpl_1", choices: [] });
+
+  startRecording();
+  assert.equal(getRecordedRequest(requestId), undefined);
+  assert.equal(getRecordSummary().capturedCount, 0);
+  stopRecording();
+  assert.equal(getRecordSummary().sessionStartedAt, undefined);
+});
+
+run("record store only captures the first 100 requests", () => {
+  startRecording();
+  for (let index = 0; index < 101; index += 1) {
+    beginRecordedRequest({
+      requestId: `${String(index).padStart(6, "0")}-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`,
+      path: "/v1/chat/completions",
+      headers: {},
+      body: { model: "alpha" },
+      stream: false,
+    });
+  }
+  assert.equal(getRecordSummary().capturedCount, 100);
+  assert.equal(getRecordedRequest("000100"), undefined);
+  stopRecording();
+});
+
+run("record page renders query UI and JSON tree viewer", () => {
+  const html = renderRecordPage({
+    enabled: true,
+    capturedCount: 3,
+    limit: 100,
+    sessionStartedAt: Date.UTC(2026, 3, 20, 10, 0, 0),
+    recentKeys: [{ key: "abcdef", requestId: "abcdef12-3456", path: "/v1/chat/completions", createdAt: Date.UTC(2026, 3, 20, 10, 0, 1) }],
+  });
+  assert.match(html, /Request Record/);
+  assert.match(html, /fetch\("\/record\/summary"/);
+  assert.match(html, /createValueNode/);
+  assert.match(html, /normalizeRequestIdInput/);
+  assert.match(html, /recent-key/);
+  assert.match(html, /开始采样/);
+});
+
+await runAsync("passthrough request records upstream request and response", async () => {
+  startRecording();
+  const requestId = "12345678-1234-5678-9abc-def012345678";
+  await withHTTPServer(async (_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json", "Set-Cookie": "secret=1" });
+    res.end(JSON.stringify({ id: "resp_1", usage: { prompt_tokens: 3, completion_tokens: 2 } }));
+  }, async (baseURL) => {
+    await runWithRequestId(requestId, async () => {
+      beginRecordedRequest({
+        requestId,
+        path: "/v1/responses",
+        headers: { Authorization: "Bearer top-secret" },
+        body: { model: "alpha", input: "hello" },
+        stream: false,
+      });
+      const result = await passthroughRequest({
+        name: "alpha",
+        provider: "openai-responses",
+        base_url: baseURL,
+        api_key: "test-key",
+        model: "upstream-alpha",
+      }, {
+        model: "alpha",
+        input: "hello",
+      }, {
+        attemptIndex: 1,
+        modelName: "alpha",
+      });
+      setRecordedClientResponseMeta({ requestId, status: 200, headers: { "Content-Type": "application/json" } });
+      setRecordedClientResponseBody({ requestId, body: result.json });
+    });
+  });
+
+  const record = getRecordedRequest(requestId);
+  assert.ok(record);
+  assert.equal(record?.attempts[0].response.status, 200);
+  assert.equal(record?.attempts[0].response.headers?.["content-type"], "application/json");
+  assert.equal(record?.attempts[0].request.headers?.Authorization, "[REDACTED]");
+  assert.deepEqual(record?.attempts[0].response.body, { id: "resp_1", usage: { prompt_tokens: 3, completion_tokens: 2 } });
+  assert.deepEqual(record?.clientResponse.body, { id: "resp_1", usage: { prompt_tokens: 3, completion_tokens: 2 } });
+  stopRecording();
+});
+
+run("record helpers append streaming provider and client chunks as text", () => {
+  startRecording();
+  const requestId = "654321ff-1234-5678-9abc-def012345678";
+  beginRecordedRequest({
+    requestId,
+    path: "/v1/chat/completions",
+    headers: {},
+    body: { model: "alpha", stream: true },
+    stream: true,
+  });
+  ensureRecordedAttempt({
+    requestId,
+    index: 1,
+    provider: "openai-chat",
+    modelName: "alpha",
+    url: "https://example.com/v1/chat/completions",
+    requestHeaders: {},
+    requestBody: JSON.stringify({ model: "upstream-alpha", stream: true }),
+  });
+  setRecordedAttemptResponseMeta({
+    requestId,
+    index: 1,
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+  setRecordedClientResponseMeta({
+    requestId,
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+  appendRecordedAttemptResponseBody({ requestId, index: 1, chunk: "data: raw-1\n\n" });
+  appendRecordedAttemptResponseBody({ requestId, index: 1, chunk: "data: raw-2\n\n" });
+  appendRecordedClientResponseBody({ requestId, chunk: "data: out-1\n\n" });
+  appendRecordedClientResponseBody({ requestId, chunk: "data: out-2\n\n" });
+
+  const record = getRecordedRequest(requestId);
+  assert.equal(record?.attempts[0].response.body, "data: raw-1\n\ndata: raw-2\n\n");
+  assert.equal(record?.clientResponse.body, "data: out-1\n\ndata: out-2\n\n");
+  stopRecording();
 });

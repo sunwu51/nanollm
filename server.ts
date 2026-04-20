@@ -10,6 +10,9 @@ import { getPublicModelNames, loadConfig, resolveFallbackModels, resolveModel } 
 import { getUpstreamURL } from "./src/proxy.js";
 import { forwardRequest, forwardStreamRequest, passthroughRequest, passthroughStreamRequest } from "./src/proxy.js";
 import { sortFallbackGroupMembers } from "./src/fallback.js";
+import { StatusStore } from "./src/status.js";
+import { renderStatusPage } from "./src/status-page.js";
+import { renderRecordPage } from "./src/record-page.js";
 import {
   normalizeOpenAIChatRequest,
   normalizeOpenAIResponsesRequest,
@@ -20,9 +23,21 @@ import {
   denormalizeToOpenAIResponsesResponse,
   denormalizeToAnthropicResponse,
 } from "./src/converters/responses.js";
-import { createSSEConverter, formatDone, SSEParser } from "./src/converters/streams.js";
-import { createRequestId, runWithRequestId, withRequestId } from "./src/request-context.js";
+import { createSSEConverter, createUsageCollector, formatDone, SSEParser } from "./src/converters/streams.js";
+import { createRequestId, getRequestId, runWithRequestId, withRequestId } from "./src/request-context.js";
 import { cacheResponseItems, resolveItemReferences } from "./src/response-cache.js";
+import {
+  appendRecordedAttemptResponseBody,
+  appendRecordedClientResponseBody,
+  beginRecordedRequest,
+  getRecordedRequest,
+  getRecordSummary,
+  setRecordedClientResponseBody,
+  setRecordedClientResponseMeta,
+  setRecordedRequestError,
+  startRecording,
+  stopRecording,
+} from "./src/record.js";
 import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
 
@@ -95,10 +110,11 @@ app.use(
 
 type Normalizer = (body: unknown) => NormalizedRequest;
 type Denormalizer = (normalized: NormalizedResponse) => unknown;
-type UpstreamOptions = { userAgent?: string };
+type UpstreamOptions = { userAgent?: string; attemptIndex?: number; modelName?: string };
 
 const FAILURE_WINDOW_MS = 5 * 60 * 1000;
 const modelFailures = new Map<string, number[]>();
+const statusStore = new StatusStore();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
 
@@ -177,12 +193,12 @@ async function executeModelRequest(
 
   if (sameFormat) {
     if (stream) {
-      const { body, headers } = await passthroughStreamRequest(modelConfig, rawBody, upstreamOptions);
-      return { kind: "stream" as const, body, headers, upstreamFormat: modelConfig.provider };
+      const { body, headers, timing } = await passthroughStreamRequest(modelConfig, rawBody, upstreamOptions);
+      return { kind: "stream" as const, body, headers, upstreamFormat: modelConfig.provider, timing };
     }
 
-    const json = await passthroughRequest(modelConfig, rawBody, upstreamOptions);
-    return { kind: "json" as const, json };
+    const { json, timing, usage } = await passthroughRequest(modelConfig, rawBody, upstreamOptions);
+    return { kind: "json" as const, json, timing, usage };
   }
 
   const normalize = getNormalizer(incomingFormat);
@@ -194,8 +210,8 @@ async function executeModelRequest(
     return { kind: "stream" as const, ...result };
   }
 
-  const normalizedResponse = await forwardRequest(modelConfig, normalized, upstreamOptions);
-  return { kind: "json" as const, json: denormalize(normalizedResponse) };
+  const { normalizedResponse, timing, usage } = await forwardRequest(modelConfig, normalized, upstreamOptions);
+  return { kind: "json" as const, json: denormalize(normalizedResponse), timing, usage };
 }
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -218,6 +234,28 @@ function tryParseJSON(text: string): unknown {
   }
 }
 
+function buildStatusPayload() {
+  const availableWindows = [1, 3, 6];
+  return {
+    availableWindows,
+    defaultWindowHours: 1,
+    refreshedAt: Date.now(),
+    bucketStarts: statusStore.listBuckets(),
+    models: config.models.map((model) => ({
+      name: model.name,
+      series: statusStore.getModelSeries(model.name),
+    })),
+  };
+}
+
+function buildRecordQueryPayload(requestIdOrPrefix: string) {
+  const record = getRecordedRequest(requestIdOrPrefix);
+  return {
+    summary: getRecordSummary(),
+    ...(record ? { record } : {}),
+  };
+}
+
 // ─── Route Factory ──────────────────────────────────────────────────────────
 
 function createRoute(incomingFormat: StreamFormat) {
@@ -226,21 +264,36 @@ function createRoute(incomingFormat: StreamFormat) {
     const upstreamOptions = { userAgent };
     const rawBody = await c.req.json();
     const modelName = extractModel(rawBody);
+    const stream = isStreamRequest(rawBody);
+    const requestId = getRequestId();
+    if (requestId) {
+      beginRecordedRequest({
+        requestId,
+        path: c.req.path,
+        headers: c.req.raw.headers,
+        body: rawBody,
+        stream,
+      });
+    }
 
     if (!modelName) {
-      return c.json({ error: "Missing 'model' in request body" }, 400);
+      const response = c.json({ error: "Missing 'model' in request body" }, 400);
+      setRecordedRequestError({ message: "Missing 'model' in request body" });
+      setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
+      setRecordedClientResponseBody({ body: { error: "Missing 'model' in request body" } });
+      return response;
     }
 
     const requestedModel = resolveModel(config, modelName);
     const requestedFallbackGroup = config.fallback[modelName];
     if (!requestedModel && !requestedFallbackGroup) {
-      return c.json(
-        { error: `Model '${modelName}' not found in config`, available: getPublicModelNames(config) },
-        404,
-      );
+      const errorBody = { error: `Model '${modelName}' not found in config`, available: getPublicModelNames(config) };
+      const response = c.json(errorBody, 404);
+      setRecordedRequestError({ message: errorBody.error });
+      setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
+      setRecordedClientResponseBody({ body: errorBody });
+      return response;
     }
-
-    const stream = isStreamRequest(rawBody);
 
     // Resolve item_reference for Responses API requests
     if (incomingFormat === "openai-responses" && Array.isArray(rawBody.input)) {
@@ -251,7 +304,9 @@ function createRoute(incomingFormat: StreamFormat) {
     let lastError: (Error & { status?: number; upstream?: string; cause?: unknown }) | undefined;
 
     try {
-      for (const modelConfig of candidateModels) {
+      for (const [candidateIndex, modelConfig] of candidateModels.entries()) {
+        const requestStartedAt = Date.now();
+        statusStore.recordAttempt(modelConfig.name, requestStartedAt);
         console.log(
           withRequestId(
             `[REQUEST] model=${modelName} path=${c.req.path} target=${getUpstreamURL(modelConfig)} candidate=${modelConfig.name}`,
@@ -259,10 +314,14 @@ function createRoute(incomingFormat: StreamFormat) {
         );
 
         try {
-          const result = await executeModelRequest(modelConfig, incomingFormat, rawBody, stream, upstreamOptions);
+          const result = await executeModelRequest(modelConfig, incomingFormat, rawBody, stream, {
+            ...upstreamOptions,
+            attemptIndex: candidateIndex + 1,
+            modelName: modelConfig.name,
+          });
 
           if (result.kind === "stream") {
-            const { body, upstreamFormat } = result;
+            const { body, upstreamFormat, timing } = result;
 
             const responseHeaders: Record<string, string> = {
               "Content-Type": "text/event-stream",
@@ -279,16 +338,31 @@ function createRoute(incomingFormat: StreamFormat) {
               }
             }
 
-            const readable = buildStreamReadable(body, incomingFormat, upstreamFormat, c.req.path);
+            const readable = buildStreamReadable(
+              body,
+              incomingFormat,
+              upstreamFormat,
+              c.req.path,
+              modelConfig.name,
+              timing,
+              candidateIndex + 1,
+            );
 
-            return new Response(readable, { headers: responseHeaders });
+            const response = new Response(readable, { headers: responseHeaders });
+            setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
+            return response;
           }
 
+          statusStore.recordSuccess(modelConfig.name, Date.now() - requestStartedAt, result.timing.ttfbMs, result.usage, requestStartedAt);
           cacheResponseItems((result.json as any)?.output);
-          return c.json(result.json);
+          const response = c.json(result.json);
+          setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
+          setRecordedClientResponseBody({ body: result.json });
+          return response;
         } catch (error) {
           const err = error as Error & { status?: number; upstream?: string; cause?: unknown };
           recordModelFailure(modelConfig.name);
+          statusStore.recordFailure(modelConfig.name, Date.now() - requestStartedAt, requestStartedAt);
           lastError = err;
           console.warn(
             orange(
@@ -309,13 +383,22 @@ function createRoute(incomingFormat: StreamFormat) {
     if (lastError) {
       console.error(orange(withRequestId(`[proxy error] ${lastError.message}`)), lastError.cause ?? "");
       const status = lastError.status || 500;
-      return c.json(
-        { error: lastError.message || "Request failed", ...(lastError.upstream ? { upstream: tryParseJSON(lastError.upstream) } : {}) },
-        status,
-      );
+      setRecordedRequestError({ message: lastError.message || "Request failed" });
+      const errorBody = {
+        error: lastError.message || "Request failed",
+        ...(lastError.upstream ? { upstream: tryParseJSON(lastError.upstream) } : {}),
+      };
+      const response = c.json(errorBody, status);
+      setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
+      setRecordedClientResponseBody({ body: errorBody });
+      return response;
     }
 
-    return c.json({ error: "Request failed" }, 500);
+    setRecordedRequestError({ message: "Request failed" });
+    const response = c.json({ error: "Request failed" }, 500);
+    setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
+    setRecordedClientResponseBody({ body: { error: "Request failed" } });
+    return response;
   };
 }
 
@@ -324,17 +407,29 @@ function buildStreamReadable(
   incomingFormat: StreamFormat,
   upstreamFormat: StreamFormat,
   path: string,
+  modelName: string,
+  timing: { startedAt: number; ttfbMs: number },
+  attemptIndex: number,
 ): ReadableStream<Uint8Array> {
   if (incomingFormat === "openai-responses") {
-    return buildPipeStreamAndCache(body, path, upstreamFormat !== incomingFormat ? createSSEConverter(upstreamFormat, incomingFormat) : undefined);
+    return buildPipeStreamAndCache(
+      body,
+      path,
+      modelName,
+      timing,
+      upstreamFormat,
+      attemptIndex,
+      upstreamFormat !== incomingFormat ? createSSEConverter(upstreamFormat, incomingFormat) : undefined,
+    );
   }
 
   if (upstreamFormat === incomingFormat) {
-    return buildPipeStreamAndCache(body, path);
+    return buildPipeStreamAndCache(body, path, modelName, timing, upstreamFormat, attemptIndex);
   }
 
   // Convert stream format
   const converter = createSSEConverter(upstreamFormat, incomingFormat);
+  const usageCollector = createUsageCollector(upstreamFormat);
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -347,18 +442,28 @@ function buildStreamReadable(
           const { done, value } = await reader.read();
           if (done) {
             for (const chunk of converter.flush()) {
+              const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
+              appendRecordedClientResponseBody({ chunk: outboundText });
               controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
             }
+            const usage = usageCollector.finish();
+            statusStore.recordSuccess(modelName, Date.now() - timing.startedAt, timing.ttfbMs, usage, timing.startedAt);
             console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms`));
             controller.close();
             return;
           }
 
-          for (const chunk of converter.push(decoder.decode(value, { stream: true }))) {
+          const text = decoder.decode(value, { stream: true });
+          appendRecordedAttemptResponseBody({ index: attemptIndex, chunk: text });
+          usageCollector.push(text);
+          for (const chunk of converter.push(text)) {
+            const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
+            appendRecordedClientResponseBody({ chunk: outboundText });
             controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
           }
         }
       } catch (error) {
+        statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);
       }
@@ -377,11 +482,16 @@ function buildStreamReadable(
 function buildPipeStreamAndCache(
   body: ReadableStream<Uint8Array>,
   path: string,
+  modelName: string,
+  timing: { startedAt: number; ttfbMs: number },
+  streamFormat: StreamFormat,
+  attemptIndex: number,
   converter?: ReturnType<typeof createSSEConverter>,
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const collector = new SSEParser();
+  const usageCollector = createUsageCollector(streamFormat);
   const outputItems: unknown[] = [];
   const encoder = new TextEncoder();
   const started = Date.now();
@@ -405,7 +515,9 @@ function buildPipeStreamAndCache(
           if (done) {
             if (converter) {
               for (const chunk of converter.flush()) {
-                collectItems(typeof chunk === "string" ? chunk : decoder.decode(chunk));
+                const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
+                collectItems(outboundText);
+                appendRecordedClientResponseBody({ chunk: outboundText });
                 controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
               }
             }
@@ -418,23 +530,31 @@ function buildPipeStreamAndCache(
               } catch {}
             }
             cacheResponseItems(outputItems);
+            const usage = usageCollector.finish();
+            statusStore.recordSuccess(modelName, Date.now() - timing.startedAt, timing.ttfbMs, usage, timing.startedAt);
             console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms`));
             controller.close();
             return;
           }
 
           const text = decoder.decode(value, { stream: true });
+          appendRecordedAttemptResponseBody({ index: attemptIndex, chunk: text });
+          usageCollector.push(text);
           if (converter) {
             for (const chunk of converter.push(text)) {
-              collectItems(typeof chunk === "string" ? chunk : decoder.decode(chunk));
+              const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
+              collectItems(outboundText);
+              appendRecordedClientResponseBody({ chunk: outboundText });
               controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
             }
           } else {
             collectItems(text);
+            appendRecordedClientResponseBody({ chunk: text });
             controller.enqueue(value);
           }
         }
       } catch (error) {
+        statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);
       }
@@ -459,6 +579,11 @@ app.get("/", (c) => {
     })),
     endpoints: {
       health: "GET /health",
+      record: "GET /record",
+      recordSummary: "GET /record/summary",
+      recordQuery: "GET /record/{requestId}",
+      recordStart: "POST /record/start",
+      recordStop: "POST /record/stop",
       chat: "POST /v1/chat/completions",
       responses: "POST /v1/responses",
       messages: "POST /v1/messages",
@@ -467,6 +592,21 @@ app.get("/", (c) => {
 });
 
 app.get("/health", (c) => c.json({ ok: true }));
+
+app.get("/status", (c) => c.html(renderStatusPage(buildStatusPayload())));
+app.get("/status/data", (c) => c.json(buildStatusPayload()));
+app.get("/record", (c) => c.html(renderRecordPage(getRecordSummary())));
+app.get("/record/summary", (c) => c.json(getRecordSummary()));
+app.post("/record/start", (c) => c.json(startRecording()));
+app.post("/record/stop", (c) => c.json(stopRecording()));
+app.get("/record/:requestId", (c) => {
+  const requestId = c.req.param("requestId");
+  const payload = buildRecordQueryPayload(requestId);
+  if (!payload.record) {
+    return c.json({ error: `Record '${requestId.slice(0, 6)}' not found`, summary: payload.summary }, 404);
+  }
+  return c.json(payload);
+});
 
 app.get("/v1/models", (c) => {
   return c.json({

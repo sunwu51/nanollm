@@ -1021,6 +1021,39 @@ export function createSSEConverter(from: StreamFormat, to: StreamFormat): SSEStr
   return new SSEStreamConverter(from, to);
 }
 
+export function createUsageCollector(format: StreamFormat) {
+  const sseParser = new SSEParser();
+  const parser = createParser(format);
+  let latestUsage: import("./shared.js").NormalizedUsage | undefined;
+
+  function collect(events: NormalizedStreamEvent[]) {
+    for (const event of events) {
+      if (event.type === "end" && event.usage) {
+        latestUsage = event.usage;
+      }
+    }
+  }
+
+  return {
+    push(sseText: string) {
+      for (const { data } of sseParser.push(sseText)) {
+        try {
+          collect(parser.parse(JSON.parse(data)));
+        } catch {}
+      }
+    },
+    finish() {
+      for (const { data } of sseParser.flush()) {
+        try {
+          collect(parser.parse(JSON.parse(data)));
+        } catch {}
+      }
+      collect(parser.finish());
+      return latestUsage;
+    },
+  };
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function normalizeChatFinishReason(reason: string | null): "stop" | "length" | "tool_calls" | "content_filter" | null {

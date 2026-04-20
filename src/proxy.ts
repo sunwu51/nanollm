@@ -1,7 +1,7 @@
 // @ts-nocheck
 import type { ModelConfig } from "./config.js";
 import type { StreamFormat } from "./converters/streams.js";
-import type { NormalizedRequest, NormalizedResponse } from "./converters/shared.js";
+import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "./converters/shared.js";
 import {
   denormalizeToOpenAIChatRequest,
   denormalizeToOpenAIResponsesRequest,
@@ -12,10 +12,25 @@ import {
   normalizeOpenAIResponsesResponse,
   normalizeAnthropicResponse,
 } from "./converters/responses.js";
+import { normalizeUsage } from "./converters/shared.js";
+import {
+  ensureRecordedAttempt,
+  setRecordedAttemptError,
+  setRecordedAttemptResponseBody,
+  setRecordedAttemptResponseMeta,
+} from "./record.js";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 
-interface UpstreamRequestOptions {
+export interface UpstreamRequestOptions {
   userAgent?: string;
+  attemptIndex?: number;
+  modelName?: string;
+}
+
+export interface UpstreamTiming {
+  startedAt: number;
+  responseStartedAt: number;
+  ttfbMs: number;
 }
 
 // ─── Upstream URL ───────────────────────────────────────────────────────────
@@ -116,12 +131,18 @@ function getForwardHeaders(config: ModelConfig, options?: UpstreamRequestOptions
   };
 }
 
-async function upstreamFetch(config: ModelConfig, body: string, stream: boolean, options?: UpstreamRequestOptions): Promise<Response> {
+async function upstreamFetch(
+  config: ModelConfig,
+  body: string,
+  stream: boolean,
+  options?: UpstreamRequestOptions,
+): Promise<{ response: Response; timing: UpstreamTiming }> {
   const url = getUpstreamURL(config);
   const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
   const timeoutMs = config.ttfb_timeout;
   const abortController = timeoutMs !== undefined ? new AbortController() : undefined;
   let timeoutHandle: NodeJS.Timeout | undefined;
+  const startedAt = Date.now();
 
   const fetchOptions: RequestInit = {
     method: "POST",
@@ -129,6 +150,14 @@ async function upstreamFetch(config: ModelConfig, body: string, stream: boolean,
     body,
     ...(abortController ? { signal: abortController.signal } : {}),
   };
+  ensureRecordedAttempt({
+    index: options?.attemptIndex ?? 0,
+    provider: config.provider,
+    modelName: options?.modelName ?? config.name,
+    url,
+    requestHeaders: fetchOptions.headers as Record<string, string>,
+    requestBody: body,
+  });
 
   if (proxyUrl) {
     fetchOptions.dispatcher = new ProxyAgent(proxyUrl);
@@ -145,24 +174,51 @@ async function upstreamFetch(config: ModelConfig, body: string, stream: boolean,
     res = await undiciFetch(url, fetchOptions);
   } catch (error) {
     if (abortController?.signal.aborted && error === abortController.signal.reason) {
+      setRecordedAttemptError({
+        index: options?.attemptIndex ?? 0,
+        message: `Upstream TTFB timeout after ${timeoutMs}ms`,
+      });
       const err = new Error(`Upstream TTFB timeout after ${timeoutMs}ms`) as Error & { cause?: unknown };
       err.cause = error;
       throw err;
     }
+    setRecordedAttemptError({
+      index: options?.attemptIndex ?? 0,
+      message: error instanceof Error ? error.message : String(error),
+    });
     throw error;
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
 
+  const responseStartedAt = Date.now();
+  const timing: UpstreamTiming = {
+    startedAt,
+    responseStartedAt,
+    ttfbMs: responseStartedAt - startedAt,
+  };
+  setRecordedAttemptResponseMeta({
+    index: options?.attemptIndex ?? 0,
+    status: res.status,
+    headers: res.headers,
+  });
+
   if (!res.ok) {
     const text = await res.text();
+    setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
+    setRecordedAttemptError({
+      index: options?.attemptIndex ?? 0,
+      message: `Upstream ${res.status}: ${text}`,
+      status: res.status,
+      upstream: text,
+    });
     const err = new Error(`Upstream ${res.status}: ${text}`) as Error & { status: number; upstream: string };
     err.status = res.status;
     err.upstream = text;
     throw err;
   }
 
-  return res;
+  return { response: res, timing };
 }
 
 // ─── Passthrough (same format, no conversion) ───────────────────────────────
@@ -171,21 +227,25 @@ export async function passthroughRequest(
   config: ModelConfig,
   rawBody: Record<string, unknown>,
   options?: UpstreamRequestOptions,
-): Promise<unknown> {
+): Promise<{ json: unknown; timing: UpstreamTiming; usage?: NormalizedUsage }> {
   const body = applyModelBodyOverrides(config, { ...rawBody, model: config.model, stream: false });
-  const res = await upstreamFetch(config, JSON.stringify(body), false, options);
-  return res.json();
+  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, options);
+  const text = await response.text();
+  setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
+  const json = JSON.parse(text);
+  const usage = normalizeUsage((json as Record<string, unknown>)?.usage as Record<string, unknown> | undefined);
+  return { json, timing, usage };
 }
 
 export async function passthroughStreamRequest(
   config: ModelConfig,
   rawBody: Record<string, unknown>,
   options?: UpstreamRequestOptions,
-): Promise<{ body: ReadableStream<Uint8Array>; headers: Headers }> {
+): Promise<{ body: ReadableStream<Uint8Array>; headers: Headers; timing: UpstreamTiming }> {
   const body = applyModelBodyOverrides(config, { ...rawBody, model: config.model, stream: true });
-  const res = await upstreamFetch(config, JSON.stringify(body), true, options);
-  if (!res.body) throw new Error("Upstream returned no streaming body");
-  return { body: res.body, headers: res.headers };
+  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, options);
+  if (!response.body) throw new Error("Upstream returned no streaming body");
+  return { body: response.body, headers: response.headers, timing };
 }
 
 // ─── Forward with conversion (different format) ────────────────────────────
@@ -194,26 +254,29 @@ export async function forwardRequest(
   config: ModelConfig,
   normalized: NormalizedRequest,
   options?: UpstreamRequestOptions,
-): Promise<NormalizedResponse> {
+): Promise<{ normalizedResponse: NormalizedResponse; timing: UpstreamTiming; usage?: NormalizedUsage }> {
   normalized.stream = false;
   normalized.model = config.model;
 
   const body = applyModelBodyOverrides(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config.provider, normalized)));
-  const res = await upstreamFetch(config, JSON.stringify(body), false, options);
-  const json = await res.json();
-  return normalizeUpstreamResponse(config.provider, json);
+  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, options);
+  const text = await response.text();
+  setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
+  const json = JSON.parse(text);
+  const normalizedResponse = normalizeUpstreamResponse(config.provider, json);
+  return { normalizedResponse, timing, usage: normalizedResponse.usage };
 }
 
 export async function forwardStreamRequest(
   config: ModelConfig,
   normalized: NormalizedRequest,
   options?: UpstreamRequestOptions,
-): Promise<{ body: ReadableStream<Uint8Array>; upstreamFormat: StreamFormat }> {
+): Promise<{ body: ReadableStream<Uint8Array>; upstreamFormat: StreamFormat; timing: UpstreamTiming }> {
   normalized.stream = true;
   normalized.model = config.model;
 
   const body = applyModelBodyOverrides(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config.provider, normalized)));
-  const res = await upstreamFetch(config, JSON.stringify(body), true, options);
-  if (!res.body) throw new Error("Upstream returned no streaming body");
-  return { body: res.body, upstreamFormat: config.provider };
+  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, options);
+  if (!response.body) throw new Error("Upstream returned no streaming body");
+  return { body: response.body, upstreamFormat: config.provider, timing };
 }
