@@ -25,6 +25,19 @@ export interface ServerConfig {
   };
 }
 
+export interface ParsedConfigDocument {
+  server?: { port?: number; ttfb_timeout?: number };
+  record?: { max_size?: number };
+  models?: ModelConfig[];
+  fallback?: Record<string, string[]>;
+}
+
+export interface MaterializeConfigOptions {
+  port?: number;
+  ttfb_timeout?: number;
+  recordMaxSize?: number;
+}
+
 export function getPublicModelNames(config: ServerConfig): string[] {
   return [...Object.keys(config.fallback), ...config.models.map((model) => model.name)];
 }
@@ -96,19 +109,25 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
   };
 }
 
-export function loadConfig(path: string): ServerConfig {
-  const raw = readFileSync(path, "utf-8");
-  const parsed = resolveDeep(parseYAML(raw)) as {
-    server?: { port?: number; ttfb_timeout?: number };
-    record?: { max_size?: number };
-    models?: ModelConfig[];
-    fallback?: Record<string, string[]>;
-  };
+function parseDocument(rawText: string, options?: { resolveEnv?: boolean }): ParsedConfigDocument {
+  const parsed = parseYAML(rawText);
+  return (options?.resolveEnv ?? true ? resolveDeep(parsed) : parsed) as ParsedConfigDocument;
+}
 
-  const defaultTTFBTimeout = normalizeTimeout(parsed.server?.ttfb_timeout, "server.ttfb_timeout");
-  const recordMaxSize = normalizePositiveInteger(parsed.record?.max_size, "record.max_size") ?? DEFAULT_RECORD_MAX_SIZE;
-  const models = (parsed.models ?? []).map((model) => normalizeModelConfig(model, defaultTTFBTimeout));
-  const fallback = parsed.fallback ?? {};
+export function parseConfigDocument(rawText: string): ParsedConfigDocument {
+  return parseDocument(rawText, { resolveEnv: true });
+}
+
+export function parseSourceConfigDocument(rawText: string): ParsedConfigDocument {
+  return parseDocument(rawText, { resolveEnv: false });
+}
+
+export function materializeConfig(document: ParsedConfigDocument, options?: MaterializeConfigOptions): ServerConfig {
+  const defaultTTFBTimeout = options?.ttfb_timeout ?? normalizeTimeout(document.server?.ttfb_timeout, "server.ttfb_timeout");
+  const recordMaxSize = options?.recordMaxSize ?? (normalizePositiveInteger(document.record?.max_size, "record.max_size") ?? DEFAULT_RECORD_MAX_SIZE);
+  const models = (document.models ?? []).map((model) => normalizeModelConfig(model, defaultTTFBTimeout));
+  const fallback = document.fallback ?? {};
+
   for (const m of models) {
     if (!m.name) throw new Error("Model config missing 'name'");
     if (!m.provider) throw new Error(`Model '${m.name}' missing 'provider'`);
@@ -121,7 +140,7 @@ export function loadConfig(path: string): ServerConfig {
   validateFallback(models, fallback);
 
   return {
-    port: Number(process.env.PORT) || (parsed.server?.port ?? 3000),
+    port: Number(process.env.PORT) || options?.port || (document.server?.port ?? 3000),
     ...(defaultTTFBTimeout !== undefined ? { ttfb_timeout: defaultTTFBTimeout } : {}),
     models,
     fallback,
@@ -129,6 +148,14 @@ export function loadConfig(path: string): ServerConfig {
       max_size: recordMaxSize,
     },
   };
+}
+
+export function parseConfigText(rawText: string): ServerConfig {
+  return materializeConfig(parseConfigDocument(rawText));
+}
+
+export function loadConfig(path: string): ServerConfig {
+  return parseConfigText(readFileSync(path, "utf-8"));
 }
 
 export function resolveModel(config: ServerConfig, name: string): ModelConfig | undefined {
@@ -160,10 +187,15 @@ function validateFallback(models: ModelConfig[], fallback: Record<string, string
     }
     duplicateNames.add(groupName);
 
+    const seenMembers = new Set<string>();
     for (const member of members) {
       if (!knownModels.has(member)) {
         throw new Error(`Fallback group '${groupName}' references unknown model '${member}'`);
       }
+      if (seenMembers.has(member)) {
+        throw new Error(`Fallback group '${groupName}' contains duplicate model '${member}'`);
+      }
+      seenMembers.add(member);
     }
   }
 }

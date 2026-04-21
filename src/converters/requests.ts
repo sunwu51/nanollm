@@ -340,7 +340,7 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
     const itemType = item.type ?? "message";
     if (itemType === "message") return [normalizeOpenAIResponsesMessage(item)];
     if (itemType === "reasoning") {
-      const thinkingFromSummary = item.summary?.map((part: any) => ({ type: "thinking" as const, thinking: part.text, signature: item.encrypted_content || undefined })) ?? [];
+      const thinkingFromSummary = item.summary?.map((part: any) => ({ type: "thinking" as const, thinking: part.text })) ?? [];
       const thinkingFromContent = item.content?.map((part: any) => ({ type: "thinking" as const, thinking: part.text })) ?? [];
       const redactedThinking = item.encrypted_content && !item.summary?.length && !item.content?.length ? [{ type: "redacted_thinking" as const, data: item.encrypted_content }] : [];
       return [{
@@ -684,29 +684,15 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
       return contentParts.length > 0 ? [{ type: "message", role: message.role, content: contentParts }] : [];
     }
     case "assistant": {
-      const reasoningItems = preserveThinking
-        ? message.parts
-            .filter((part) => part.type === "thinking" || part.type === "redacted_thinking")
-            .map((part, index) =>
-              part.type === "thinking"
-                ? {
-                    id: `reasoning_${index}`,
-                    type: "reasoning",
-                    summary: [{ type: "summary_text", text: part.thinking }],
-                    content: [{ type: "reasoning_text", text: part.thinking }],
-                    encrypted_content: part.signature || null,
-                    status: "completed",
-                  }
-                : {
-                    id: `reasoning_${index}`,
-                    type: "reasoning",
-                    summary: [],
-                    content: [],
-                    encrypted_content: part.data,
-                    status: "completed",
-                  },
-            )
-        : [];
+      const reasoningItems = message.parts
+        .filter((part) => part.type === "thinking")
+        .map((part, index) => ({
+          id: `reasoning_${index}`,
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: part.thinking }],
+          content: [{ type: "reasoning_text", text: part.thinking }],
+          status: "completed",
+        }));
       
       const contentParts = message.parts
         .filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking")
@@ -772,8 +758,8 @@ function denormalizeAnthropicUserParts(parts: NormalizedMessage["parts"]): any {
 function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserveThinking: boolean): any[] {
   const blocks: any[] = message.parts.flatMap((part) => {
     if (part.type === "text" || part.type === "refusal") return { type: "text", text: part.text, citations: null };
-    if (part.type === "thinking") return preserveThinking ? [{ type: "thinking", thinking: part.thinking, signature: part.signature ?? "" }] : [];
-    if (part.type === "redacted_thinking") return preserveThinking ? [{ type: "redacted_thinking", data: part.data }] : [];
+    if (part.type === "thinking") return [{ type: "thinking", thinking: part.thinking, signature: part.signature ?? "" }];
+    if (part.type === "redacted_thinking") return [];
     return { type: "text", text: collapseText([part]), citations: null };
   });
   for (const toolCall of message.toolCalls ?? []) {

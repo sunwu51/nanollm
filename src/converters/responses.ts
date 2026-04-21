@@ -179,7 +179,7 @@ export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): O
 }
 
 export function denormalizeToOpenAIResponsesResponse(response: NormalizedResponse): OpenAIResponsesResponse {
-  const preserveThinking = response.sourceFormat === "openai-responses";
+  const reasoningParts = response.message.parts.filter((part) => part.type === "thinking");
   const visibleParts = response.message.parts.filter((part) => part.type === "text" || part.type === "refusal");
   return {
     id: response.id,
@@ -192,28 +192,13 @@ export function denormalizeToOpenAIResponsesResponse(response: NormalizedRespons
     instructions: null,
     // metadata: null,
     output: [
-      ...(preserveThinking
-        ? response.message.parts
-            .filter((part) => part.type === "thinking" || part.type === "redacted_thinking")
-            .map((part, index) =>
-              part.type === "thinking"
-                ? {
-                    id: `reasoning_${index}`,
-                    type: "reasoning",
-                    summary: [{ type: "summary_text", text: part.thinking }],
-                    content: [{ type: "reasoning_text", text: part.thinking }],
-                    encrypted_content: part.signature ?? null,
-                    status: "completed",
-                  }
-                : {
-                    id: `reasoning_${index}`,
-                    type: "reasoning",
-                    summary: [],
-                    encrypted_content: part.data,
-                    status: "completed",
-                  },
-            )
-        : []),
+      ...reasoningParts.map((part, index) => ({
+        id: `reasoning_${index}`,
+        type: "reasoning",
+        summary: [{ type: "summary_text", text: part.thinking }],
+        content: [{ type: "reasoning_text", text: part.thinking }],
+        status: "completed",
+      })),
       ...(visibleParts.length > 0
         ? [
             {
@@ -247,7 +232,6 @@ export function denormalizeToOpenAIResponsesResponse(response: NormalizedRespons
 }
 
 export function denormalizeToAnthropicResponse(response: NormalizedResponse): AnthropicMessagesResponse {
-  const preserveThinking = response.sourceFormat === "anthropic";
   return {
     id: response.id,
     type: "message",
@@ -259,8 +243,8 @@ export function denormalizeToAnthropicResponse(response: NormalizedResponse): An
     content: [
       ...response.message.parts.flatMap((part) => {
         if (part.type === "text" || part.type === "refusal") return [{ type: "text" as const, text: part.text, citations: null }];
-        if (part.type === "thinking") return preserveThinking ? [{ type: "thinking" as const, thinking: part.thinking, signature: part.signature ?? "" }] : [];
-        if (part.type === "redacted_thinking") return preserveThinking ? [{ type: "redacted_thinking" as const, data: part.data }] : [];
+        if (part.type === "thinking") return [{ type: "thinking" as const, thinking: part.thinking, signature: part.signature ?? "" }];
+        if (part.type === "redacted_thinking") return [];
         return [{ type: "text" as const, text: collapseText([part]), citations: null }];
       }),
       ...(response.message.toolCalls?.map((toolCall) => {

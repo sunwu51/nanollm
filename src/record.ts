@@ -158,12 +158,29 @@ class RecordStore {
     }
   }
 
+  private trimToLimit() {
+    while (this.records.size > this.limit && this.records.size > 0) {
+      const oldestKey = this.records.keys().next().value;
+      if (!oldestKey) break;
+      this.records.delete(oldestKey);
+      this.capturedCount = Math.max(0, this.capturedCount - 1);
+    }
+  }
+
   start(options?: { maxSize?: number }) {
     this.limit = options?.maxSize ?? DEFAULT_RECORD_MAX_SIZE;
     this.enabled = true;
     this.capturedCount = 0;
     if (!this.sessionStartedAt) this.sessionStartedAt = Date.now();
     this.records.clear();
+  }
+
+  configure(options?: { maxSize?: number }) {
+    if (options?.maxSize !== undefined) {
+      this.limit = options.maxSize;
+      this.trimToLimit();
+    }
+    return this.summary();
   }
 
   stop() {
@@ -355,6 +372,10 @@ export function startRecording(options?: { maxSize?: number }) {
 export function stopRecording() {
   recordStore.stop();
   return recordStore.summary();
+}
+
+export function configureRecording(options?: { maxSize?: number }) {
+  return recordStore.configure(options);
 }
 
 export function getRecordSummary() {

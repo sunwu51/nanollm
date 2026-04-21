@@ -3,8 +3,8 @@ export function sortFallbackGroupMembers(
   getFailureCount: (name: string) => number,
 ): string[] {
   return [...members].sort((left, right) => {
-    const leftScore = getFailureCount(left) - 2;
-    const rightScore = getFailureCount(right) - 2;
+    const leftScore = Math.max(0, getFailureCount(left) - 1);
+    const rightScore = Math.max(0, getFailureCount(right) - 1);
     return leftScore - rightScore;
   });
 }

@@ -20,6 +20,7 @@ import {
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { getPublicModelNames, loadConfig, resolveFallbackModels } from "../src/config.js";
+import { ConfigManager } from "../src/config-manager.js";
 import { sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
 import { passthroughRequest, passthroughStreamRequest } from "../src/proxy.js";
@@ -28,6 +29,7 @@ import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
   beginRecordedRequest,
+  configureRecording,
   ensureRecordedAttempt,
   getRecordedRequest,
   getRecordSummary,
@@ -99,6 +101,15 @@ function writeTempConfig(yaml: string): string {
   const file = join(dir, "config.yaml");
   writeFileSync(file, yaml);
   return file;
+}
+
+async function waitForCondition(check: () => boolean, timeoutMs = 3000, intervalMs = 50): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`Condition not met within ${timeoutMs}ms`);
 }
 
 function parseSSEObjects(chunks: string[]): Array<{ event?: string; data: any }> {
@@ -910,6 +921,50 @@ run("chat stream tool call with stop finish_reason becomes responses tool_calls 
   assert.equal(completed?.data.response.output[2].call_id, "call_stream_1");
 });
 
+run("chat stream reasoning field is treated like reasoning_content", () => {
+  const converter = createSSEConverter("openai-chat", "openai-responses");
+  const chunks = [
+    ...converter.push(
+      [
+        {
+          id: "resp_stream_reasoning_field",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        },
+        {
+          id: "resp_stream_reasoning_field",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { reasoning: "Need to think first." }, finish_reason: null }],
+        },
+        {
+          id: "resp_stream_reasoning_field",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { content: "Final answer." }, finish_reason: "stop" }],
+        },
+      ]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(""),
+    ),
+    ...converter.flush(),
+  ];
+
+  const events = parseSSEObjects(chunks);
+  const reasoningDelta = events.find((event) => event.event === "response.reasoning_summary_text.delta");
+  const completed = events.find((event) => event.event === "response.completed");
+
+  assert.ok(reasoningDelta);
+  assert.equal(reasoningDelta?.data.delta, "Need to think first.");
+  assert.ok(completed);
+  assert.equal(completed?.data.response.output[0].type, "reasoning");
+  assert.equal(completed?.data.response.output[1].type, "message");
+});
+
 run("chat stream carries usage from separate tail chunk after finish_reason", () => {
   const converter = createSSEConverter("openai-chat", "openai-responses");
   const chunks = [
@@ -1280,7 +1335,7 @@ run("chat response round-trip through anthropic preserves tool call name", () =>
   assert.equal((chat.choices[0].message.tool_calls?.[0] as any).function.name, "lookup");
 });
 
-run("anthropic request thinking block is dropped in responses request", () => {
+run("anthropic request thinking block is preserved in responses request without encrypted content", () => {
   const responses = anthropicMessageRequestToResponsesRequest({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -1303,12 +1358,16 @@ run("anthropic request thinking block is dropped in responses request", () => {
   });
 
   const input = responses.input as Array<{ type: string }>;
-  assert.equal(input.length, 1);
-  assert.equal(input[0].type, "message");
-  assert.equal((input[0] as any).content[0].text, "Let me check.");
+  assert.equal(input.length, 2);
+  assert.equal(input[0].type, "reasoning");
+  assert.deepEqual((input[0] as any).summary, [{ type: "summary_text", text: "I should call the weather tool." }]);
+  assert.deepEqual((input[0] as any).content, [{ type: "reasoning_text", text: "I should call the weather tool." }]);
+  assert.equal((input[0] as any).encrypted_content, undefined);
+  assert.equal(input[1].type, "message");
+  assert.equal((input[1] as any).content[0].text, "Let me check.");
 });
 
-run("anthropic response thinking block is dropped in responses response", () => {
+run("anthropic response thinking block is preserved in responses response without encrypted content", () => {
   const responses = anthropicMessageToResponsesResponse({
     id: "msg_thinking",
     type: "message",
@@ -1341,12 +1400,16 @@ run("anthropic response thinking block is dropped in responses response", () => 
     },
   } as any);
 
-  assert.equal((responses.output as any[]).length, 1);
-  assert.equal((responses.output[0] as any).type, "message");
-  assert.equal(((responses.output[0] as any).content[0] ?? {}).text, "final answer");
+  assert.equal((responses.output as any[]).length, 2);
+  assert.equal((responses.output[0] as any).type, "reasoning");
+  assert.deepEqual((responses.output[0] as any).summary, [{ type: "summary_text", text: "Need to reason first." }]);
+  assert.deepEqual((responses.output[0] as any).content, [{ type: "reasoning_text", text: "Need to reason first." }]);
+  assert.equal((responses.output[0] as any).encrypted_content, undefined);
+  assert.equal((responses.output[1] as any).type, "message");
+  assert.equal(((responses.output[1] as any).content[0] ?? {}).text, "final answer");
 });
 
-run("responses request reasoning block is dropped in anthropic request", () => {
+run("responses request reasoning block preserves plaintext and drops encrypted content in anthropic request", () => {
   const anthropic = responsesRequestToAnthropicMessageRequest({
     model: "gpt-5",
     input: [
@@ -1365,13 +1428,17 @@ run("responses request reasoning block is dropped in anthropic request", () => {
   } as any);
 
   assert.equal((anthropic.messages as any[]).length, 2);
-  assert.equal(((anthropic.messages[0] as any).content ?? [])[0].type, "text");
-  assert.equal(((anthropic.messages[0] as any).content ?? [])[0].text, "visible answer");
+  assert.equal(((anthropic.messages[0] as any).content ?? [])[0].type, "thinking");
+  assert.equal(((anthropic.messages[0] as any).content ?? [])[0].thinking, "internal summary");
+  assert.equal(((anthropic.messages[0] as any).content ?? [])[1].type, "thinking");
+  assert.equal(((anthropic.messages[0] as any).content ?? [])[1].thinking, "internal detail");
+  assert.equal(((anthropic.messages[0] as any).content ?? [])[2].type, "text");
+  assert.equal(((anthropic.messages[0] as any).content ?? [])[2].text, "visible answer");
   assert.equal((anthropic.messages[1] as any).role, "user");
   assert.equal((anthropic.messages[1] as any).content, "go on");
 });
 
-run("responses response reasoning block is dropped in anthropic response", () => {
+run("responses response reasoning block preserves plaintext and drops encrypted content in anthropic response", () => {
   const anthropic = responsesResponseToAnthropicMessage({
     id: "resp_reasoning",
     object: "response",
@@ -1402,9 +1469,13 @@ run("responses response reasoning block is dropped in anthropic response", () =>
     text: { format: { type: "text" } },
   } as any);
 
-  assert.equal((anthropic.content as any[]).length, 1);
-  assert.equal((anthropic.content[0] as any).type, "text");
-  assert.equal((anthropic.content[0] as any).text, "visible answer");
+  assert.equal((anthropic.content as any[]).length, 3);
+  assert.equal((anthropic.content[0] as any).type, "thinking");
+  assert.equal((anthropic.content[0] as any).thinking, "internal detail");
+  assert.equal((anthropic.content[1] as any).type, "thinking");
+  assert.equal((anthropic.content[1] as any).thinking, "internal summary");
+  assert.equal((anthropic.content[2] as any).type, "text");
+  assert.equal((anthropic.content[2] as any).text, "visible answer");
 });
 
 run("anthropic response usage total includes cache read and write when converted to responses", () => {
@@ -1657,6 +1728,33 @@ fallback:
   }
 }, "Duplicate public model name 'alpha'");
 
+runThrows("config rejects duplicate model names inside the same fallback group", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+  - name: beta
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-beta
+fallback:
+  group-a:
+    - alpha
+    - beta
+    - alpha
+`);
+
+  try {
+    loadConfig(configPath);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+}, "Fallback group 'group-a' contains duplicate model 'alpha'");
+
 run("fallback group members prefer lower recent failure counts, then original order", () => {
   const ordered = sortFallbackGroupMembers(["alpha", "beta", "gamma", "delta"], (name) => {
     switch (name) {
@@ -1674,6 +1772,25 @@ run("fallback group members prefer lower recent failure counts, then original or
   });
 
   assert.deepEqual(ordered, ["delta", "alpha", "beta", "gamma"]);
+});
+
+run("fallback group members tolerate one failure before changing priority", () => {
+  const ordered = sortFallbackGroupMembers(["alpha", "beta", "gamma", "delta"], (name) => {
+    switch (name) {
+      case "alpha":
+        return 1;
+      case "beta":
+        return 0;
+      case "gamma":
+        return 2;
+      case "delta":
+        return 3;
+      default:
+        return 0;
+    }
+  });
+
+  assert.deepEqual(ordered, ["alpha", "beta", "gamma", "delta"]);
 });
 
 runThrows("config rejects invalid ttfb_timeout values", () => {
@@ -1715,6 +1832,148 @@ models:
     rmSync(dirname(configPath), { recursive: true, force: true });
   }
 }, "'record.max_size' must be a positive integer");
+
+run("config manager hot-reloads models, fallback, ttfb_timeout and record max_size while keeping port pending restart", () => {
+  const configPath = writeTempConfig(`
+server:
+  port: 3000
+  ttfb_timeout: 1500
+
+record:
+  max_size: 10
+
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+
+fallback:
+  primary:
+    - alpha
+`);
+
+  const manager = new ConfigManager(configPath);
+  try {
+    const result = manager.applyText(`
+server:
+  port: 4000
+  ttfb_timeout: 2600
+
+record:
+  max_size: 25
+
+models:
+  - name: beta
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-beta
+
+fallback:
+  primary:
+    - beta
+`, "ui");
+
+    assert.deepEqual(result.appliedFields, ["models", "fallback", "server.ttfb_timeout", "record.max_size"]);
+    assert.deepEqual(result.requiresRestartFields, ["server.port"]);
+    assert.equal(result.snapshot.effectiveConfig.port, 3000);
+    assert.equal(result.snapshot.effectiveConfig.ttfb_timeout, 2600);
+    assert.equal(result.snapshot.effectiveConfig.record.max_size, 25);
+    assert.equal(result.snapshot.effectiveConfig.models[0].name, "beta");
+    assert.equal(result.snapshot.effectiveConfig.models[0].ttfb_timeout, 2600);
+    assert.deepEqual(result.snapshot.effectiveConfig.fallback, { primary: ["beta"] });
+  } finally {
+    manager.dispose();
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+run("config manager keeps last valid config when new text is invalid", () => {
+  const configPath = writeTempConfig(`
+server:
+  port: 3000
+
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+`);
+
+  const manager = new ConfigManager(configPath);
+  try {
+    assert.throws(() => {
+      manager.applyText(`
+models:
+  - name: broken
+    provider: invalid-provider
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-broken
+`, "ui");
+    }, /invalid provider/);
+
+    const snapshot = manager.getActiveSnapshot();
+    assert.equal(snapshot.effectiveConfig.models[0].name, "alpha");
+    assert.match(snapshot.rawText, /invalid-provider/);
+    assert.ok(snapshot.lastError);
+    assert.match(snapshot.lastError?.message ?? "", /invalid provider/);
+  } finally {
+    manager.dispose();
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+runAsync("config manager watcher applies external file changes", async () => {
+  const configPath = writeTempConfig(`
+server:
+  port: 3000
+
+record:
+  max_size: 10
+
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+`);
+
+  const manager = new ConfigManager(configPath);
+  try {
+    writeFileSync(configPath, `
+server:
+  port: 3010
+  ttfb_timeout: 2200
+
+record:
+  max_size: 6
+
+models:
+  - name: beta
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-beta
+`, "utf-8");
+
+    await waitForCondition(() => manager.getActiveSnapshot().version > 1);
+
+    const snapshot = manager.getActiveSnapshot();
+    assert.equal(snapshot.effectiveConfig.port, 3000);
+    assert.equal(snapshot.effectiveConfig.ttfb_timeout, 2200);
+    assert.equal(snapshot.effectiveConfig.record.max_size, 6);
+    assert.equal(snapshot.effectiveConfig.models[0].name, "beta");
+    assert.deepEqual(snapshot.requiresRestartFields, ["server.port"]);
+  } finally {
+    manager.dispose();
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
 
 await runAsync("upstream request fails when first byte exceeds ttfb_timeout", async () => {
   await withHTTPServer(async (_req, res) => {
@@ -2160,6 +2419,42 @@ run("record helpers append streaming provider and client chunks as text", () => 
   assert.equal(record?.clientResponse.body, "data: out-1\n\ndata: out-2\n\n");
   assert.equal(record?.attempts[0].response.truncated, false);
   assert.equal(record?.clientResponse.truncated, false);
+  stopRecording();
+});
+
+run("record store can hot-update max_size without clearing all captured entries", () => {
+  startRecording({ maxSize: 3 });
+  beginRecordedRequest({
+    requestId: "111111ff-1234-5678-9abc-def012345678",
+    path: "/v1/chat/completions",
+    headers: {},
+    body: { model: "alpha" },
+    stream: false,
+  });
+  beginRecordedRequest({
+    requestId: "222222ff-1234-5678-9abc-def012345678",
+    path: "/v1/chat/completions",
+    headers: {},
+    body: { model: "beta" },
+    stream: false,
+  });
+  beginRecordedRequest({
+    requestId: "333333ff-1234-5678-9abc-def012345678",
+    path: "/v1/chat/completions",
+    headers: {},
+    body: { model: "gamma" },
+    stream: false,
+  });
+
+  const summaryBefore = getRecordSummary();
+  assert.equal(summaryBefore.limit, 3);
+  assert.equal(summaryBefore.size, 3);
+
+  configureRecording({ maxSize: 1 });
+  const summaryAfter = getRecordSummary();
+  assert.equal(summaryAfter.limit, 1);
+  assert.equal(summaryAfter.size, 1);
+  assert.deepEqual(summaryAfter.recentKeys.map((item) => item.key), ["333333"]);
   stopRecording();
 });
 

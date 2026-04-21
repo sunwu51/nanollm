@@ -166,13 +166,20 @@ export class OpenAIChatStreamParser implements StreamParser {
       out.push({ type: "content_delta", index: this.refusalBlockIndex, delta: delta.refusal });
     }
 
-    if ((delta as any)?.reasoning_content != null && (delta as any).reasoning_content !== "") {
+    const reasoningDelta =
+      typeof (delta as any)?.reasoning === "string" && (delta as any).reasoning !== ""
+        ? (delta as any).reasoning
+        : typeof (delta as any)?.reasoning_content === "string" && (delta as any).reasoning_content !== ""
+          ? (delta as any).reasoning_content
+          : null;
+
+    if (reasoningDelta != null) {
       if (this.thinkingBlockIndex == null) {
         this.thinkingBlockIndex = this.nextIndex++;
         this.openContentBlocks.add(this.thinkingBlockIndex);
         out.push({ type: "content_start", index: this.thinkingBlockIndex, contentType: "thinking" });
       }
-      out.push({ type: "content_delta", index: this.thinkingBlockIndex, delta: (delta as any).reasoning_content });
+      out.push({ type: "content_delta", index: this.thinkingBlockIndex, delta: reasoningDelta });
     }
 
     if (delta?.tool_calls) {

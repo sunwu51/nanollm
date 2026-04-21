@@ -1046,6 +1046,7 @@ const SCRIPT = String.raw`
         const toolCallMap = new Map();
         let textContent = "";
         let refusalContent = "";
+        let reasoningContent = "";
         let sawChatChunk = false;
 
         for (const item of events) {
@@ -1076,6 +1077,11 @@ const SCRIPT = String.raw`
           if (typeof delta.refusal === "string" && delta.refusal) {
             refusalContent += delta.refusal;
           }
+          if (typeof delta.reasoning === "string" && delta.reasoning) {
+            reasoningContent += delta.reasoning;
+          } else if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+            reasoningContent += delta.reasoning_content;
+          }
           if (Array.isArray(delta.tool_calls)) {
             delta.tool_calls.forEach((toolCall) => {
               const index = Number.isFinite(toolCall.index) ? toolCall.index : 0;
@@ -1105,6 +1111,9 @@ const SCRIPT = String.raw`
           content: null,
           refusal: refusalContent || null,
         };
+        if (reasoningContent) {
+          message.reasoning = reasoningContent;
+        }
         if (textContent && refusalContent) {
           message.content = [
             { type: "text", text: textContent },

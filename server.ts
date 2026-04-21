@@ -1,18 +1,21 @@
 // @ts-nocheck
 import "dotenv/config";
-import { existsSync } from "node:fs";
+import { existsSync, renameSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
-import type { ModelConfig } from "./src/config.js";
-import { getPublicModelNames, loadConfig, resolveFallbackModels, resolveModel } from "./src/config.js";
+import { randomUUID } from "node:crypto";
+import type { ModelConfig, ServerConfig } from "./src/config.js";
+import { getPublicModelNames, parseConfigText, parseSourceConfigDocument, resolveFallbackModels, resolveModel } from "./src/config.js";
+import { ConfigManager } from "./src/config-manager.js";
 import { getUpstreamURL } from "./src/proxy.js";
 import { forwardRequest, forwardStreamRequest, passthroughRequest, passthroughStreamRequest } from "./src/proxy.js";
 import { sortFallbackGroupMembers } from "./src/fallback.js";
 import { StatusStore } from "./src/status.js";
 import { renderStatusPage } from "./src/status-page.js";
 import { renderRecordPage } from "./src/record-page.js";
+import { renderAdminConfigPage } from "./src/admin-config-page.js";
 import { getHTTPLogLevel, shouldEmitLog } from "./src/http-log.js";
 import {
   normalizeOpenAIChatRequest,
@@ -31,6 +34,7 @@ import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
   beginRecordedRequest,
+  configureRecording,
   getRecordedRequest,
   getRecordSummary,
   startRecording,
@@ -41,6 +45,7 @@ import {
 import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
 import { shouldIgnoreStreamReadError } from "./src/stream-errors.js";
+import { stringify as stringifyYAML } from "yaml";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -74,9 +79,23 @@ function resolveConfigPath(argv: string[]): string {
 }
 
 const configPath = resolveConfigPath(process.argv.slice(2));
-const config = loadConfig(configPath);
-startRecording({ maxSize: config.record.max_size });
+const configManager = new ConfigManager(configPath);
+const startupSnapshot = configManager.getActiveSnapshot();
+startRecording({ maxSize: startupSnapshot.effectiveConfig.record.max_size });
+configManager.onUpdate(({ snapshot }, source) => {
+  configureRecording({ maxSize: snapshot.effectiveConfig.record.max_size });
+  if (source !== "startup") {
+    console.log(
+      `[CONFIG APPLY] source=${source} models=${snapshot.effectiveConfig.models.length} fallback_groups=${Object.keys(snapshot.effectiveConfig.fallback).length} record_max_size=${snapshot.effectiveConfig.record.max_size}`,
+    );
+  }
+});
 const app = new Hono();
+const apiCors = cors({
+  origin: "*",
+  allowMethods: ["GET", "POST", "OPTIONS"],
+  allowHeaders: ["Content-Type", "Authorization"],
+});
 
 app.use("*", async (c, next) => {
   const requestId = createRequestId();
@@ -105,25 +124,201 @@ app.use("*", async (c, next) => {
   });
 });
 
-app.use(
-  cors({
-    origin: "*",
-    allowMethods: ["GET", "POST", "OPTIONS"],
-    allowHeaders: ["Content-Type", "Authorization"],
-  }),
-);
+app.use("*", async (c, next) => {
+  if (c.req.path.startsWith("/admin/")) {
+    return next();
+  }
+  return apiCors(c, next);
+});
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 type Normalizer = (body: unknown) => NormalizedRequest;
 type Denormalizer = (normalized: NormalizedResponse) => unknown;
 type UpstreamOptions = { userAgent?: string; attemptIndex?: number; modelName?: string };
+type AdminModelDraft = {
+  name: string;
+  provider: string;
+  base_url: string;
+  api_key: string;
+  model: string;
+  extras?: Record<string, unknown>;
+};
+type AdminFallbackDraft = {
+  name: string;
+  members: string[];
+};
+type AdminConfigForm = {
+  rootExtras?: Record<string, unknown>;
+  serverExtras?: Record<string, unknown>;
+  recordExtras?: Record<string, unknown>;
+  server: {
+    port: string;
+    ttfb_timeout: string;
+  };
+  record: {
+    max_size: string;
+  };
+  models: AdminModelDraft[];
+  fallbackGroups: AdminFallbackDraft[];
+};
 
 const FAILURE_WINDOW_MS = 5 * 60 * 1000;
 const modelFailures = new Map<string, number[]>();
 const statusStore = new StatusStore();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
+
+function writeConfigAtomic(path: string, text: string) {
+  const tempPath = `${path}.${randomUUID()}.tmp`;
+  writeFileSync(tempPath, text, "utf-8");
+  renameSync(tempPath, path);
+}
+
+function toInputString(value: unknown): string {
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function toPositiveIntegerOrUndefined(value: unknown, fieldName: string): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const normalized = Number(value);
+  if (!Number.isInteger(normalized) || normalized <= 0) {
+    throw new Error(`'${fieldName}' must be a positive integer`);
+  }
+  return normalized;
+}
+
+function toPlainObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
+}
+
+function buildAdminConfigForm(rawText: string): AdminConfigForm {
+  const sourceConfig = parseSourceConfigDocument(rawText) as Record<string, unknown>;
+  const { server, record, models, fallback, ...rootExtras } = sourceConfig;
+  const serverObject = toPlainObject(server);
+  const recordObject = toPlainObject(record);
+  const { port, ttfb_timeout, ...serverExtras } = serverObject;
+  const { max_size, ...recordExtras } = recordObject;
+
+  return {
+    rootExtras,
+    serverExtras,
+    recordExtras,
+    server: {
+      port: toInputString(port),
+      ttfb_timeout: toInputString(ttfb_timeout),
+    },
+    record: {
+      max_size: toInputString(max_size),
+    },
+    models: Array.isArray(models)
+      ? models.map((entry) => {
+          const modelObject = toPlainObject(entry);
+          const { name, provider, base_url, api_key, model, ...extras } = modelObject;
+          return {
+            name: toInputString(name),
+            provider: toInputString(provider),
+            base_url: toInputString(base_url),
+            api_key: toInputString(api_key),
+            model: toInputString(model),
+            extras,
+          };
+        })
+      : [],
+    fallbackGroups:
+      fallback && typeof fallback === "object" && !Array.isArray(fallback)
+        ? Object.entries(fallback as Record<string, unknown>).map(([name, members]) => ({
+            name,
+            members: Array.isArray(members) ? members.map((member) => toInputString(member)).filter(Boolean) : [],
+          }))
+        : [],
+  };
+}
+
+function buildAdminConfigFormFromEffectiveConfig(config: ServerConfig): AdminConfigForm {
+  return {
+    rootExtras: {},
+    serverExtras: {},
+    recordExtras: {},
+    server: {
+      port: toInputString(config.port),
+      ttfb_timeout: toInputString(config.ttfb_timeout),
+    },
+    record: {
+      max_size: toInputString(config.record.max_size),
+    },
+    models: config.models.map((model) => ({
+      name: model.name,
+      provider: model.provider,
+      base_url: model.base_url,
+      api_key: model.api_key,
+      model: model.model,
+      extras: {},
+    })),
+    fallbackGroups: Object.entries(config.fallback).map(([name, members]) => ({
+      name,
+      members,
+    })),
+  };
+}
+
+function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { preservedPort?: unknown }): string {
+  const root = toPlainObject(form.rootExtras);
+  const serverExtras = toPlainObject(form.serverExtras);
+  const recordExtras = toPlainObject(form.recordExtras);
+  const preservedPort = toPositiveIntegerOrUndefined(options?.preservedPort, "server.port");
+  const serverTTFBTimeout = toPositiveIntegerOrUndefined(form.server?.ttfb_timeout, "server.ttfb_timeout");
+  const recordMaxSize = toPositiveIntegerOrUndefined(form.record?.max_size, "record.max_size");
+
+  const models = Array.isArray(form.models)
+    ? form.models.map((entry) => ({
+        ...toPlainObject(entry.extras),
+        name: entry.name ?? "",
+        provider: entry.provider ?? "",
+        base_url: entry.base_url ?? "",
+        api_key: entry.api_key ?? "",
+        model: entry.model ?? "",
+      }))
+    : [];
+
+  const fallbackGroups = Object.fromEntries(
+    (Array.isArray(form.fallbackGroups) ? form.fallbackGroups : [])
+      .filter((group) => group && typeof group.name === "string" && group.name.trim())
+      .map((group) => [
+        group.name.trim(),
+        (Array.isArray(group.members) ? group.members : []).map((member) => String(member).trim()).filter(Boolean),
+      ]),
+  );
+
+  const document: Record<string, unknown> = { ...root };
+
+  if (Object.keys(serverExtras).length > 0 || preservedPort !== undefined || serverTTFBTimeout !== undefined) {
+    document.server = {
+      ...serverExtras,
+      ...(preservedPort !== undefined ? { port: preservedPort } : {}),
+      ...(serverTTFBTimeout !== undefined ? { ttfb_timeout: serverTTFBTimeout } : {}),
+    };
+  }
+
+  if (Object.keys(recordExtras).length > 0 || recordMaxSize !== undefined) {
+    document.record = {
+      ...recordExtras,
+      ...(recordMaxSize !== undefined ? { max_size: recordMaxSize } : {}),
+    };
+  }
+
+  document.models = models;
+  if (Object.keys(fallbackGroups).length > 0) {
+    document.fallback = fallbackGroups;
+  } else if ("fallback" in document) {
+    delete document.fallback;
+  }
+
+  return stringifyYAML(document, {
+    lineWidth: 0,
+    defaultStringType: "PLAIN",
+  });
+}
 
 function getNormalizer(format: StreamFormat): Normalizer {
   switch (format) {
@@ -177,7 +372,7 @@ function orange(message: string): string {
   return `${ORANGE}${message}${RESET}`;
 }
 
-function getCandidateModels(primaryModel: string): ModelConfig[] {
+function getCandidateModels(config: ServerConfig, primaryModel: string): ModelConfig[] {
   const now = Date.now();
   const isFallbackGroup = primaryModel in config.fallback;
   const candidateNames = isFallbackGroup
@@ -241,7 +436,7 @@ function tryParseJSON(text: string): unknown {
   }
 }
 
-function buildStatusPayload() {
+function buildStatusPayload(config: ServerConfig) {
   const availableWindows = [1, 3, 6];
   return {
     availableWindows,
@@ -263,10 +458,27 @@ function buildRecordQueryPayload(requestIdOrPrefix: string) {
   };
 }
 
+function buildConfigAdminPayload() {
+  const snapshot = configManager.getActiveSnapshot();
+  let form: AdminConfigForm;
+  try {
+    form = buildAdminConfigForm(snapshot.rawText);
+  } catch {
+    form = buildAdminConfigFormFromEffectiveConfig(snapshot.effectiveConfig);
+  }
+  return {
+    ...snapshot,
+    configPath,
+    form,
+  };
+}
+
 // ─── Route Factory ──────────────────────────────────────────────────────────
 
 function createRoute(incomingFormat: StreamFormat) {
   return async (c) => {
+    const snapshot = configManager.getActiveSnapshot();
+    const config = snapshot.effectiveConfig;
     const userAgent = c.req.header("user-agent");
     const upstreamOptions = { userAgent };
     const rawBody = await c.req.json();
@@ -307,7 +519,7 @@ function createRoute(incomingFormat: StreamFormat) {
       rawBody.input = resolveItemReferences(rawBody.input);
     }
 
-    const candidateModels = getCandidateModels(modelName);
+    const candidateModels = getCandidateModels(config, modelName);
     let lastError: (Error & { status?: number; upstream?: string; cause?: unknown }) | undefined;
 
     try {
@@ -651,6 +863,7 @@ function buildPipeStreamAndCache(
 // ─── Routes ─────────────────────────────────────────────────────────────────
 
 app.get("/", (c) => {
+  const config = configManager.getActiveSnapshot().effectiveConfig;
   return c.json({
     ok: true,
     message: "nanollm gateway",
@@ -664,6 +877,7 @@ app.get("/", (c) => {
       record: "GET /record",
       recordSummary: "GET /record/summary",
       recordQuery: "GET /record/{requestId}",
+      admin: "GET /admin",
       chat: "POST /v1/chat/completions",
       responses: "POST /v1/responses",
       messages: "POST /v1/messages",
@@ -673,8 +887,8 @@ app.get("/", (c) => {
 
 app.get("/health", (c) => c.json({ ok: true }));
 
-app.get("/status", (c) => c.html(renderStatusPage(buildStatusPayload())));
-app.get("/status/data", (c) => c.json(buildStatusPayload()));
+app.get("/status", (c) => c.html(renderStatusPage(buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig))));
+app.get("/status/data", (c) => c.json(buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig)));
 app.get("/record", (c) => c.html(renderRecordPage(getRecordSummary())));
 app.get("/record/summary", (c) => c.json(getRecordSummary()));
 app.get("/record/:requestId", (c) => {
@@ -686,7 +900,68 @@ app.get("/record/:requestId", (c) => {
   return c.json(payload);
 });
 
+app.get("/admin", (c) => c.html(renderAdminConfigPage(buildConfigAdminPayload())));
+app.get("/admin/config", (c) => c.redirect("/admin", 302));
+app.get("/admin/config/data", (c) => c.json(buildConfigAdminPayload()));
+app.post("/admin/config/apply", async (c) => {
+  let body: { config?: unknown; baseVersion?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", currentSnapshot: buildConfigAdminPayload() }, 400);
+  }
+
+  if (!body.config || typeof body.config !== "object" || Array.isArray(body.config)) {
+    return c.json({ error: "Field 'config' must be an object", currentSnapshot: buildConfigAdminPayload() }, 400);
+  }
+  if (!Number.isInteger(body.baseVersion)) {
+    return c.json({ error: "Field 'baseVersion' must be an integer", currentSnapshot: buildConfigAdminPayload() }, 400);
+  }
+
+  const currentSnapshot = configManager.getActiveSnapshot();
+  if (body.baseVersion !== currentSnapshot.version) {
+    return c.json({ error: "Config version conflict", currentSnapshot: buildConfigAdminPayload() }, 409);
+  }
+
+  let yamlText: string;
+  try {
+    const currentForm = buildAdminConfigForm(currentSnapshot.rawText);
+    yamlText = buildYamlTextFromAdminForm(body.config as AdminConfigForm, {
+      preservedPort: currentForm.server.port,
+    });
+    parseConfigText(yamlText);
+  } catch (error) {
+    return c.json(
+      {
+        error: error instanceof Error ? error.message : String(error),
+        currentSnapshot: buildConfigAdminPayload(),
+      },
+      400,
+    );
+  }
+
+  try {
+    writeConfigAtomic(configPath, yamlText);
+    const result = configManager.applyText(yamlText, "ui");
+    return c.json({
+      ok: true,
+      snapshot: buildConfigAdminPayload(),
+      appliedFields: result.appliedFields,
+      requiresRestartFields: result.requiresRestartFields,
+    });
+  } catch (error) {
+    return c.json(
+      {
+        error: error instanceof Error ? error.message : String(error),
+        currentSnapshot: buildConfigAdminPayload(),
+      },
+      500,
+    );
+  }
+});
+
 app.get("/v1/models", (c) => {
+  const config = configManager.getActiveSnapshot().effectiveConfig;
   return c.json({
     object: "list",
     data: getPublicModelNames(config).map((name) => ({
@@ -703,12 +978,13 @@ app.post("/v1/messages", createRoute("anthropic"));
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 
-const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
+const startupConfig = startupSnapshot.effectiveConfig;
+const server = serve({ fetch: app.fetch, port: startupConfig.port }, (info) => {
   console.log(`nanollm gateway listening on http://localhost:${info.port}`);
-  console.log(`Models: ${config.models.map((m) => m.name).join(", ") || "(none)"}`);
+  console.log(`Models: ${startupConfig.models.map((m) => m.name).join(", ") || "(none)"}`);
   console.log(
     `Fallback groups: ${
-      Object.entries(config.fallback)
+      Object.entries(startupConfig.fallback)
         .map(([group, models]) => `${group}=[${models.join(", ")}]`)
         .join("; ") || "(none)"
     }`,
@@ -717,12 +993,16 @@ const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
 
 server.once("error", (error: Error & { code?: string }) => {
   if (error.code === "EADDRINUSE") {
-    console.error(`Failed to start nanollm: port ${config.port} is already in use.`);
+    console.error(`Failed to start nanollm: port ${startupConfig.port} is already in use.`);
     console.error("Use a different port in config.yaml, stop the other process, or set PORT.");
   } else {
     console.error("Failed to start nanollm:", error);
   }
   process.exitCode = 1;
+});
+
+server.once("close", () => {
+  configManager.dispose();
 });
 
 export { server };
