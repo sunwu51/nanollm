@@ -1967,6 +1967,9 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /createStringNode/);
   assert.match(html, /parseStreamEvents/);
   assert.match(html, /renderStreamBody/);
+  assert.match(html, /createCopyButton/);
+  assert.match(html, /复制合并 JSON/);
+  assert.match(html, /box-actions/);
   assert.match(html, /setInterval\(\(\) =>/);
   assert.match(html, /fetch\("\/record\/summary"/);
   assert.match(html, /normalizeRequestIdInput/);

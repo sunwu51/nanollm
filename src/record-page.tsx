@@ -381,10 +381,17 @@ const STYLE = /* css */ String.raw`
         background: #fffdfa;
         min-width: 0;
       }
-      .copy-btn {
+      .box-actions {
         position: absolute;
         top: 10px;
         right: 10px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        max-width: calc(100% - 24px);
+      }
+      .copy-btn {
         padding: 6px 10px;
         border-radius: 10px;
         font-size: 12px;
@@ -919,12 +926,19 @@ const SCRIPT = String.raw`
             lastResponse = payload.response;
           }
           if (type === "response.completed" && payload.response) {
-            return payload.response;
+            const output = payload.response.output;
+            if (Array.isArray(output) && output.length > 0) {
+              return payload.response;
+            }
+            // response.completed has empty output; continue to reconstruct from delta events
           }
         }
-        if (!sawResponsesEvent || !lastResponse) return null;
+        if (!sawResponsesEvent) return null;
+        if (!lastResponse) {
+          lastResponse = { id: "", object: "response", status: "completed", output: [], model: "", created_at: 0 };
+        }
 
-        // If we didn't see response.completed, reconstruct output from delta events
+        // If response.completed is missing or has incomplete output, reconstruct from stream events
         const outputItems = new Map();
         const contentBuffers = new Map();
         const toolInputBuffers = new Map();
@@ -949,6 +963,11 @@ const SCRIPT = String.raw`
             } else {
               outputItems.set(oi, { ...base, ...payload.item });
             }
+          }
+
+          if (type === "response.output_item.done" && payload.item) {
+            const oi = payload.output_index ?? outputItems.size;
+            outputItems.set(oi, Object.assign({}, payload.item));
           }
 
           if (type === "response.content_part.added" && payload.part) {
@@ -1241,7 +1260,7 @@ const SCRIPT = String.raw`
         const events = parseStreamEvents(value);
         if (!events || events.length === 0) {
           parent.appendChild(renderStreamValue(value));
-          return;
+          return { events: null, reconstructed: null };
         }
 
         const reconstructed = reconstructStreamResponse(events);
@@ -1267,6 +1286,30 @@ const SCRIPT = String.raw`
         });
         listFold.body.appendChild(list);
         parent.appendChild(listFold.fold);
+        return { events, reconstructed };
+      }
+
+      function setCopyButtonState(button, temporaryLabel, resetLabel) {
+        button.textContent = temporaryLabel;
+        setTimeout(() => {
+          button.textContent = resetLabel;
+        }, 1500);
+      }
+
+      function createCopyButton(label, getText) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "copy-btn";
+        button.textContent = label;
+        button.addEventListener("click", () => {
+          const text = getText();
+          navigator.clipboard.writeText(text).then(() => {
+            setCopyButtonState(button, "已复制", label);
+          }).catch(() => {
+            setCopyButtonState(button, "失败", label);
+          });
+        });
+        return button;
       }
 
      function appendBodyBox(parent, title, value, options) {
@@ -1275,30 +1318,56 @@ const SCRIPT = String.raw`
        const heading = document.createElement("h3");
        heading.textContent = title;
        box.appendChild(heading);
+        const isStreamText = options?.streamText === true && typeof value === "string";
+        const streamState = isStreamText ? { events: parseStreamEvents(value), reconstructed: null } : null;
+        if (streamState?.events?.length) {
+          streamState.reconstructed = reconstructStreamResponse(streamState.events);
+        }
         if (value != null && value !== "") {
-          const copyBtn = document.createElement("button");
-          copyBtn.type = "button";
-          copyBtn.className = "copy-btn";
-          copyBtn.textContent = "复制";
-          copyBtn.addEventListener("click", () => {
-            const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-            navigator.clipboard.writeText(text).then(() => {
-              copyBtn.textContent = "已复制";
-              setTimeout(() => { copyBtn.textContent = "复制"; }, 1500);
-            }).catch(() => {
-              copyBtn.textContent = "失败";
-              setTimeout(() => { copyBtn.textContent = "复制"; }, 1500);
-            });
-          });
-          box.appendChild(copyBtn);
+          const actions = document.createElement("div");
+          actions.className = "box-actions";
+          actions.appendChild(createCopyButton("复制", () => (
+            typeof value === "string" ? value : JSON.stringify(value, null, 2)
+          )));
+          if (streamState?.reconstructed != null) {
+            actions.appendChild(createCopyButton("复制合并 JSON", () => (
+              JSON.stringify(streamState.reconstructed, null, 2)
+            )));
+          }
+          box.appendChild(actions);
         }
         if (value == null || value === "") {
          const empty = document.createElement("div");
          empty.className = "empty";
          empty.textContent = "无内容";
          box.appendChild(empty);
-       } else if (options?.streamText === true && typeof value === "string") {
-          renderStreamBody(box, value);
+       } else if (isStreamText) {
+          if (streamState?.events?.length) {
+            if (streamState.reconstructed) {
+              const fold = createFold("完整响应");
+              fold.body.appendChild(renderStreamValue(streamState.reconstructed));
+              box.appendChild(fold.fold);
+            }
+
+            const listFold = createFold("流事件");
+            const list = document.createElement("div");
+            list.className = "stream-list";
+            streamState.events.forEach((item, index) => {
+              const fold = createFold(getStreamEventLabel(item, index + 1));
+              if (item.event) {
+                const meta = document.createElement("div");
+                meta.className = "stream-meta";
+                meta.textContent = "event: " + item.event;
+                fold.body.appendChild(meta);
+              }
+              fold.body.appendChild(renderStreamValue(item.parsed ?? item.data));
+              list.appendChild(fold.fold);
+            });
+            listFold.body.appendChild(list);
+            box.appendChild(listFold.fold);
+          } else {
+            renderStreamBody(box, value);
+          }
         } else if (typeof value === "string") {
           const pre = document.createElement("pre");
           pre.textContent = value;
