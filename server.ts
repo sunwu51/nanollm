@@ -45,6 +45,7 @@ import {
 import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
 import { shouldIgnoreStreamReadError } from "./src/stream-errors.js";
+import { handleServerStartupError } from "./src/startup-error.js";
 import { stringify as stringifyYAML } from "yaml";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -992,13 +993,10 @@ const server = serve({ fetch: app.fetch, port: startupConfig.port }, (info) => {
 });
 
 server.once("error", (error: Error & { code?: string }) => {
-  if (error.code === "EADDRINUSE") {
-    console.error(`Failed to start nanollm: port ${startupConfig.port} is already in use.`);
-    console.error("Use a different port in config.yaml, stop the other process, or set PORT.");
-  } else {
-    console.error("Failed to start nanollm:", error);
-  }
-  process.exitCode = 1;
+  handleServerStartupError(error, {
+    port: startupConfig.port,
+    dispose: () => configManager.dispose(),
+  });
 });
 
 server.once("close", () => {

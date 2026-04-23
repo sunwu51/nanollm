@@ -26,6 +26,7 @@ import { sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
 import { passthroughRequest, passthroughStreamRequest } from "../src/proxy.js";
 import { renderRecordPage } from "../src/record-page.js";
+import { handleServerStartupError } from "../src/startup-error.js";
 import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
@@ -1592,6 +1593,27 @@ run("chat high reasoning is capped by explicit anthropic max_tokens", () => {
   assert.deepEqual((anthropic as any).thinking, { type: "enabled", budget_tokens: 4999 });
 });
 
+run("config uses default ttfb_timeout when server section is omitted", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.equal(config.port, 3000);
+    assert.equal(config.ttfb_timeout, 5000);
+    assert.equal(config.models[0].ttfb_timeout, 5000);
+    assert.equal(config.record.max_size, 10);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
 run("config applies server-level ttfb_timeout and model override", () => {
   const configPath = writeTempConfig(`
 server:
@@ -2517,4 +2539,26 @@ run("admin page refreshes clean state after history restore", () => {
   assert.match(html, /if \(saving \|\| dirty \|\| !isHistoryRestore\(event\)\) return;/);
   assert.match(html, /window\.addEventListener\("pageshow", \(event\) => \{/);
   assert.match(html, /refreshFromServer\(\)\.catch\(\(error\) => \{/);
+});
+
+run("startup error disposes resources and exits on occupied port", () => {
+  const logs: unknown[][] = [];
+  const calls: string[] = [];
+
+  handleServerStartupError(Object.assign(new Error("listen EADDRINUSE"), { code: "EADDRINUSE" }), {
+    port: 3000,
+    dispose() {
+      calls.push("dispose");
+    },
+    log(...args) {
+      logs.push(args);
+    },
+    exit(code) {
+      calls.push(`exit:${code}`);
+    },
+  });
+
+  assert.deepEqual(calls, ["dispose", "exit:1"]);
+  assert.equal(logs[0]?.[0], "Failed to start nanollm: port 3000 is already in use.");
+  assert.equal(logs[1]?.[0], "Use a different port in config.yaml, stop the other process, or set PORT.");
 });

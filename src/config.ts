@@ -3,6 +3,7 @@ import { parse as parseYAML } from "yaml";
 import type { StreamFormat } from "./converters/streams.js";
 
 export const DEFAULT_RECORD_MAX_SIZE = 10;
+export const DEFAULT_TTFB_TIMEOUT = 5000;
 
 export interface ModelConfig {
   name: string;
@@ -123,7 +124,7 @@ export function parseSourceConfigDocument(rawText: string): ParsedConfigDocument
 }
 
 export function materializeConfig(document: ParsedConfigDocument, options?: MaterializeConfigOptions): ServerConfig {
-  const defaultTTFBTimeout = options?.ttfb_timeout ?? normalizeTimeout(document.server?.ttfb_timeout, "server.ttfb_timeout");
+  const defaultTTFBTimeout = options?.ttfb_timeout ?? normalizeTimeout(document.server?.ttfb_timeout, "server.ttfb_timeout") ?? DEFAULT_TTFB_TIMEOUT;
   const recordMaxSize = options?.recordMaxSize ?? (normalizePositiveInteger(document.record?.max_size, "record.max_size") ?? DEFAULT_RECORD_MAX_SIZE);
   const models = (document.models ?? []).map((model) => normalizeModelConfig(model, defaultTTFBTimeout));
   const fallback = document.fallback ?? {};
