@@ -353,6 +353,10 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
     if (itemType === "function_call_output" || itemType === "custom_tool_call_output") {
       return [{ role: "tool", toolCallId: item.call_id, parts: normalizeOpenAIResponsesToolOutput(item.output) }];
     }
+    if (itemType === "tool_search_call" || itemType === "tool_search_output") {
+      console.warn(`Dropping unsupported Responses input item type "${itemType}" during conversion`);
+      return [];
+    }
     if (itemType === "item_reference") return [];
     fail(`Responses input item type "${itemType}" is not supported`);
   });
