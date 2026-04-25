@@ -171,7 +171,9 @@ export class OpenAIChatStreamParser implements StreamParser {
         ? (delta as any).reasoning
         : typeof (delta as any)?.reasoning_content === "string" && (delta as any).reasoning_content !== ""
           ? (delta as any).reasoning_content
-          : null;
+          : typeof (delta as any)?.thinking === "string" && (delta as any).thinking !== ""
+            ? (delta as any).thinking
+            : null;
 
     if (reasoningDelta != null) {
       if (this.thinkingBlockIndex == null) {
@@ -503,6 +505,8 @@ export class OpenAIChatStreamEmitter implements StreamEmitter {
           out.push(this.chunk({ content: event.delta }));
         } else if (ct === "refusal") {
           out.push(this.chunk({ refusal: event.delta }));
+        } else if (ct === "thinking") {
+          out.push(this.chunk({ thinking: event.delta, reasoning: event.delta, reasoning_content: event.delta }));
         }
         break;
       }

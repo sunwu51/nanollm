@@ -17,7 +17,7 @@ export interface RecordSummary {
   capturedCount: number;
   limit: number;
   sessionStartedAt?: number;
-  recentKeys?: Array<{ key: string; requestId: string; path: string; model?: string; actualModel?: string; source: "claudecode" | "codex" | "opencode" | "other"; status: "in_progress" | "success" | "failure"; createdAt: number }>;
+  recentKeys?: Array<{ key: string; requestId: string; path: string; model?: string; actualModel?: string; source: "claudecode" | "codex" | "opencode" | "other"; status: "in_progress" | "success" | "failure"; responseStatus?: number; createdAt: number }>;
 }
 
 const STYLE = /* css */ String.raw`
@@ -283,6 +283,9 @@ const STYLE = /* css */ String.raw`
       .status-badge.failure {
         background: rgba(190, 74, 56, 0.14);
         color: var(--danger);
+      }
+      .status-badge.status-code {
+        min-width: 32px;
       }
       .recent-toggle {
         min-width: 44px;
@@ -557,6 +560,18 @@ const SCRIPT = String.raw`
         return "请求中...";
       }
 
+      function getStatusBadgeClass(item) {
+        if (typeof item.responseStatus === "number") {
+          return "status-badge status-code " + (item.responseStatus >= 400 ? "failure" : item.responseStatus >= 200 && item.responseStatus < 300 ? "success" : "in_progress");
+        }
+        return "status-badge " + item.status;
+      }
+
+      function getStatusBadgeLabel(item) {
+        if (typeof item.responseStatus === "number") return String(item.responseStatus);
+        return getStatusLabel(item.status);
+      }
+
       function renderRecentButton(item) {
         const button = document.createElement("button");
         button.type = "button";
@@ -573,8 +588,8 @@ const SCRIPT = String.raw`
         sourceBadge.textContent = getSourceBadgeLabel(item.source);
         titleRow.appendChild(sourceBadge);
         const statusBadge = document.createElement("span");
-        statusBadge.className = "status-badge " + item.status;
-        statusBadge.textContent = getStatusLabel(item.status);
+        statusBadge.className = getStatusBadgeClass(item);
+        statusBadge.textContent = getStatusBadgeLabel(item);
         titleRow.appendChild(statusBadge);
         button.appendChild(titleRow);
 

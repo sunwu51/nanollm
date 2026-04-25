@@ -37,6 +37,7 @@ export function normalizeOpenAIChatResponse(response: OpenAIChatResponse): Norma
         ...(typeof message?.content === "string"
           ? [text(message.content)]
           : message?.content?.map((part) => (part.type === "text" ? text(part.text) : refusal(part.refusal))) ?? []),
+        ...normalizeOpenAIChatThinkingParts(message),
         ...(message?.refusal ? [refusal(message.refusal)] : []),
       ],
       toolCalls:
@@ -101,6 +102,11 @@ export function normalizeOpenAIResponsesResponse(response: OpenAIResponsesRespon
   };
 }
 
+function normalizeOpenAIChatThinkingParts(message: any): NormalizedMessage["parts"] {
+  const thinking = message?.thinking ?? message?.reasoning ?? message?.reasoning_content;
+  return typeof thinking === "string" && thinking ? [{ type: "thinking", thinking }] : [];
+}
+
 function normalizeCustomToolInputToFunctionArguments(input: any): string {
   return wrapResponsesCustomToolInput(input);
 }
@@ -152,6 +158,7 @@ export function normalizeAnthropicResponse(response: AnthropicMessagesResponse):
 
 export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): OpenAIChatResponse {
   const visibleParts = response.message.parts.filter((part) => part.type === "text" || part.type === "refusal");
+  const thinking = response.message.parts.filter((part) => part.type === "thinking").map((part) => part.thinking).join("\n");
   return {
     id: response.id,
     object: "chat.completion",
@@ -166,6 +173,7 @@ export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): O
           role: "assistant",
           content: visibleParts.length === 0 ? null : visibleParts.map((part) => (part.type === "text" ? { type: "text", text: part.text } : { type: "refusal", refusal: part.text })),
           refusal: visibleParts.find((part) => part.type === "refusal")?.text ?? null,
+          ...(thinking ? { thinking, reasoning: thinking, reasoning_content: thinking } : {}),
           tool_calls: response.message.toolCalls?.map((toolCall) =>
             toolCall.kind === "function"
               ? { id: toolCall.id, type: "function", function: { name: toolCall.name, arguments: toolCall.payload } }

@@ -64,7 +64,7 @@ export interface RecordSummary {
   limit: number;
   sessionStartedAt?: number;
   size: number;
-  recentKeys: Array<{ key: string; requestId: string; path: string; model?: string; actualModel?: string; source: RequestSource; status: RequestStatus; createdAt: number }>;
+  recentKeys: Array<{ key: string; requestId: string; path: string; model?: string; actualModel?: string; source: RequestSource; status: RequestStatus; responseStatus?: number; createdAt: number }>;
 }
 
 function extractRequestModel(body: unknown): string | undefined {
@@ -205,6 +205,7 @@ class RecordStore {
           actualModel: record.clientRequest.actualModel,
           source: record.clientRequest.source,
           status: record.clientRequest.status,
+          responseStatus: record.clientResponse.status,
           createdAt: record.createdAt,
         })),
     };

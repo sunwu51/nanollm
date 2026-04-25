@@ -64,7 +64,7 @@ export function normalizeOpenAIChatRequest(request: OpenAIChatRequest): Normaliz
     promptCacheKey: request.prompt_cache_key ?? (request as any).promptCacheKey,
     promptCacheRetention: request.prompt_cache_retention ?? (request as any).promptCacheRetention ?? null,
     safetyIdentifier: request.safety_identifier,
-    reasoningEffort: request.reasoning_effort ?? null,
+    reasoningEffort: request.reasoning_effort ?? request.reasoning?.effort ?? null,
     thinkingBudgetTokens: null,
     textVerbosity: request.verbosity ?? null,
     responseFormat: normalizeOpenAIChatResponseFormat(request.response_format as any),
@@ -147,7 +147,10 @@ export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): No
     stopSequences: request.stop_sequences,
     parallelToolCalls: normalizedToolChoice?.type === "none" ? undefined : normalizedToolChoice?.disableParallel === undefined ? undefined : !normalizedToolChoice.disableParallel,
     promptCacheKey,
-    reasoningEffort: normalizeReasoningEffortFromBudget(request.thinking?.type === "enabled" ? request.thinking.budget_tokens : null),
+    reasoningEffort:
+      request.thinking?.type === "adaptive"
+        ? request.output_config?.effort ?? null
+        : normalizeReasoningEffortFromBudget(request.thinking?.type === "enabled" ? request.thinking.budget_tokens : null),
     thinkingBudgetTokens: request.thinking?.type === "enabled" ? request.thinking.budget_tokens : null,
     textVerbosity: null,
     responseFormat: request.output_config?.format ? { type: "json_schema", name: "anthropic_output", schema: request.output_config.format.schema } : undefined,
@@ -172,6 +175,9 @@ export function denormalizeToOpenAIChatRequest(request: NormalizedRequest): Open
     prompt_cache_retention: request.promptCacheRetention ?? undefined,
     safety_identifier: request.safetyIdentifier,
     reasoning_effort: ((request.reasoningEffort ?? normalizeReasoningEffortFromBudget(request.thinkingBudgetTokens)) ?? undefined) as OpenAIChatRequest["reasoning_effort"],
+    reasoning: (request.reasoningEffort ?? normalizeReasoningEffortFromBudget(request.thinkingBudgetTokens))
+      ? { effort: (request.reasoningEffort ?? normalizeReasoningEffortFromBudget(request.thinkingBudgetTokens)) as never }
+      : undefined,
     verbosity: request.textVerbosity ?? undefined,
     response_format: denormalizeOpenAIChatResponseFormat(request.responseFormat),
     tools: request.tools?.map((tool) =>
@@ -254,8 +260,8 @@ export function denormalizeToAnthropicRequest(request: NormalizedRequest): Messa
     top_p: request.topP ?? undefined,
     tools: request.tools?.filter(tool => tool.kind === "function").map((tool) => denormalizeAnthropicTool(tool)),
     tool_choice: denormalizeAnthropicToolChoice(request.toolChoice, request.parallelToolCalls, (request.tools?.length ?? 0) > 0),
-    output_config: request.responseFormat?.type === "json_schema" ? { format: { type: "json_schema", schema: request.responseFormat.schema ?? {} } } : undefined,
-    thinking: denormalizeAnthropicThinking(request.reasoningEffort, request.thinkingBudgetTokens, maxTokens),
+    output_config: denormalizeAnthropicOutputConfig(request.responseFormat, request.reasoningEffort, request.thinkingBudgetTokens),
+    thinking: denormalizeAnthropicThinking(request.reasoningEffort, request.thinkingBudgetTokens),
     cache_control: request.cacheControl ?? { type: "ephemeral" },
   };
 }
@@ -299,6 +305,8 @@ function normalizeOpenAIChatAssistantParts(message: any): NormalizedMessage["par
   const parts: NormalizedMessage["parts"] = [];
   if (typeof message.content === "string") parts.push(text(message.content));
   else for (const part of message.content ?? []) parts.push(part.type === "text" ? text(part.text) : refusal(part.refusal));
+  const thinking = message.thinking ?? message.reasoning ?? message.reasoning_content;
+  if (typeof thinking === "string" && thinking) parts.push({ type: "thinking", thinking });
   if (message.refusal) parts.push(refusal(message.refusal));
   return parts;
 }
@@ -581,7 +589,14 @@ function denormalizeOpenAIChatMessage(message: NormalizedMessage): OpenAIChatReq
       const content = denormalizeOpenAIChatAssistantParts(message.parts);
       const toolCalls = message.toolCalls?.map((toolCall) => denormalizeOpenAIChatToolCall(toolCall)) as any;
       if (content === null && (!toolCalls || toolCalls.length === 0)) return [];
-      return [{ role: "assistant", content, refusal: message.parts.find((part) => part.type === "refusal")?.text ?? null, tool_calls: toolCalls }];
+      const thinking = message.parts.filter((part) => part.type === "thinking").map((part) => part.thinking).join("\n");
+      return [{
+        role: "assistant",
+        content,
+        refusal: message.parts.find((part) => part.type === "refusal")?.text ?? null,
+        ...(thinking ? { thinking, reasoning: thinking, reasoning_content: thinking } : {}),
+        tool_calls: toolCalls,
+      }];
     }
     case "tool":
       return denormalizeOpenAIChatToolResultMessage(message, message.toolCallId ?? "tool");
@@ -876,17 +891,16 @@ function denormalizeAnthropicMetadata(metadata: NormalizedRequest["metadata"]) {
   fail("Anthropic metadata only supports user_id");
 }
 
-function denormalizeAnthropicThinking(reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined, maxOutputTokens: number) {
-  const maxBudgetTokens = maxOutputTokens - 1;
-  if (maxBudgetTokens <= 0) return undefined;
-  if (thinkingBudgetTokens != null) {
-    return { type: "enabled" as const, budget_tokens: Math.min(thinkingBudgetTokens, maxBudgetTokens) };
-  }
-  if (!reasoningEffort) return undefined;
-  const effortMap: Record<string, number> = { low: 1000, medium: 5000, high: 10000 };
-  if (!(reasoningEffort in effortMap)) fail(`Unsupported reasoning effort "${reasoningEffort}"`);
-  const budgetTokens = Math.min(effortMap[reasoningEffort], maxBudgetTokens);
-  return { type: "enabled" as const, budget_tokens: budgetTokens };
+function denormalizeAnthropicOutputConfig(responseFormat: NormalizedRequest["responseFormat"], reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined) {
+  const effort = reasoningEffort ?? normalizeReasoningEffortFromBudget(thinkingBudgetTokens);
+  const format = responseFormat?.type === "json_schema" ? { type: "json_schema", schema: responseFormat.schema ?? {} } : undefined;
+  if (!format && !effort) return undefined;
+  return { ...(format ? { format } : {}), ...(effort ? { effort } : {}) };
+}
+
+function denormalizeAnthropicThinking(reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined) {
+  if (!reasoningEffort && thinkingBudgetTokens == null) return undefined;
+  return { type: "adaptive" as const };
 }
 
 function normalizeOpenAIServiceTier(tier: string | null | undefined): OpenAIChatRequest["service_tier"] | undefined {
