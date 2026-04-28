@@ -41,6 +41,7 @@ models:
     base_url: https://example.com/v1
     api_key: YOUR_KEY2
     model: glm5.1
+    image: true # optional, default true; only effective for openai-chat provider
     ttfb_timeout: 3000 # optional, overrides server.ttfb_timeout
     headers:
       user-agent: nanollm
@@ -76,6 +77,33 @@ claude-sonnet-4-6
 gpt-5.4
 ```
 这样5个模型，其中`gpt-5.4`是兜底分组名，当使用这个模型的时候，会在下属列表的模型中寻找可用的模型，尝试顺序为按`max(0, 最近5min失败次数-1)`升序；如果分数相同，则保持配置里的原始顺序。
+
+### `openai-chat` 的图片兼容选项
+
+`models[*].image` 目前只对 `provider: openai-chat` 生效，主要用于兼容不同 OpenAI-compatible chat 服务对图片输入的支持差异。默认值为 `true`。
+
+- `image: true`（默认）：如果请求中包含图片，转为 chat 接口时保留 OpenAI chat 多模态 `content` 数组，例如：
+
+```json
+{
+  "role": "user",
+  "content": [
+    { "type": "text", "text": "请解释这张图" },
+    { "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } }
+  ]
+}
+```
+
+- `image: false`：用于 DeepSeek 等只接受 `content: string` 的 chat 上游；图片、文件、音频等非文本内容会降级为字符串描述，文本内容用换行拼接，例如：
+
+```json
+{
+  "role": "user",
+  "content": "请解释这张图\nAttached image: https://example.com/cat.png"
+}
+```
+
+注意：`image: false` 当前不影响 `provider: openai-responses` 或 `provider: anthropic`，这两类上游仍按各自协议保留图片结构。
 
 也可以指定配置文件运行：
 ```bash

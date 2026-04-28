@@ -11,6 +11,7 @@ export interface ModelConfig {
   base_url: string;
   api_key: string;
   model: string;
+  image?: boolean;
   ttfb_timeout?: number;
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
@@ -101,9 +102,11 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
       ? Object.fromEntries(Object.entries(model.body).map(([key, value]) => [key, parseJSONLikeValue(value)]))
       : undefined;
   const ttfb_timeout = normalizeTimeout(model.ttfb_timeout, `models.${model.name || "<unknown>"}.ttfb_timeout`) ?? defaultTTFBTimeout;
+  const image = model.image === undefined ? true : !!model.image;
 
   return {
     ...model,
+    image,
     ...(ttfb_timeout !== undefined ? { ttfb_timeout } : {}),
     ...(headers ? { headers } : {}),
     ...(body ? { body } : {}),

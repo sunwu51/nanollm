@@ -799,6 +799,47 @@ run("anthropic document user content degrades to chat text instead of failing", 
   assert.match(String(chat.messages[0].content), /https:\/\/example\.com\/report\.pdf/);
 });
 
+run("anthropic image user content stays chat multimodal array when image is enabled", () => {
+  const chat = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    image: true,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "请解释这张图" },
+          { type: "image", source: { type: "url", url: "https://example.com/cat.png" } },
+        ],
+      },
+    ],
+  } as any);
+
+  const content = (chat.messages[0] as any).content;
+  assert.equal(Array.isArray(content), true);
+  assert.deepEqual(content[0], { type: "text", text: "请解释这张图" });
+  assert.deepEqual(content[1], { type: "image_url", image_url: { url: "https://example.com/cat.png", detail: undefined } });
+});
+
+run("anthropic image user content degrades to chat string when image is disabled", () => {
+  const chat = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    image: false,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "请解释这张图" },
+          { type: "image", source: { type: "url", url: "https://example.com/cat.png" } },
+        ],
+      },
+    ],
+  } as any);
+
+  assert.equal((chat.messages[0] as any).content, "请解释这张图\nAttached image: https://example.com/cat.png");
+});
+
 run("chat completion response with tool_calls becomes anthropic tool_use response", () => {
   const result = chatCompletionToAnthropicMessage({
     id: "chat_1",
@@ -1133,10 +1174,11 @@ run("anthropic tool_result block array becomes chat tool text", () => {
   assert.equal((result.messages[0] as { content: string }).content, "Sunny\n25C");
 });
 
-run("anthropic image tool_result becomes chat user multimodal fallback", () => {
+run("anthropic image tool_result becomes chat user multimodal fallback when image is enabled", () => {
   const result = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
+    image: true,
     messages: [
       {
         role: "assistant",
@@ -1153,7 +1195,7 @@ run("anthropic image tool_result becomes chat user multimodal fallback", () => {
         ],
       },
     ],
-  });
+  } as any);
 
   const fallback = result.messages[1] as { role: string; content: Array<{ type: string; text?: string; image_url?: { url?: string } }> };
   assert.equal(fallback.role, "user");
@@ -1161,6 +1203,35 @@ run("anthropic image tool_result becomes chat user multimodal fallback", () => {
   assert.match(fallback.content[0].text ?? "", /Tool result for call_img/);
   assert.equal(fallback.content[1].type, "image_url");
   assert.equal(fallback.content[1].image_url?.url, "https://example.com/tool.png");
+});
+
+run("anthropic image tool_result becomes chat user string fallback when image is disabled", () => {
+  const result = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    image: false,
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_img", caller: { type: "direct" }, name: "view_image", input: { path: "/tmp/a.png" } }],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_img",
+            content: [{ type: "image", source: { type: "url", url: "https://example.com/tool.png" } }],
+          },
+        ],
+      },
+    ],
+  } as any);
+
+  const fallback = result.messages[1] as { role: string; content: string };
+  assert.equal(fallback.role, "user");
+  assert.match(fallback.content, /Tool result for call_img/);
+  assert.match(fallback.content, /Attached image: https:\/\/example\.com\/tool\.png/);
 });
 
 run("chat tool result round-trip through anthropic preserves tool id", () => {
@@ -1440,6 +1511,54 @@ run("responses request reasoning block preserves plaintext and drops encrypted c
   assert.equal((anthropic.messages[1] as any).content, "go on");
 });
 
+run("anthropic assistant thinking block becomes top-level chat reasoning fields", () => {
+  const chat = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "internal detail", signature: "sig_1" },
+          { type: "text", text: "visible answer" },
+        ],
+      },
+      { role: "user", content: "go on" },
+    ],
+  } as any);
+
+  const assistant = chat.messages[0] as any;
+  assert.equal(assistant.role, "assistant");
+  assert.equal(assistant.content, "visible answer");
+  assert.equal(assistant.thinking, "internal detail");
+  assert.equal(assistant.reasoning, "internal detail");
+  assert.equal(assistant.reasoning_content, "internal detail");
+  assert.equal(assistant.tool_calls, null);
+});
+
+run("chat assistant top-level reasoning fields survive anthropic round-trip", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-5",
+    messages: [
+      {
+        role: "assistant",
+        content: "visible answer",
+        thinking: "internal detail",
+        reasoning: "internal detail",
+        reasoning_content: "internal detail",
+      } as any,
+      { role: "user", content: "go on" },
+    ],
+  });
+
+  const assistant = (anthropic.messages as any[])[0];
+  assert.equal(assistant.role, "assistant");
+  assert.equal(assistant.content[0].type, "thinking");
+  assert.equal(assistant.content[0].thinking, "internal detail");
+  assert.equal(assistant.content[1].type, "text");
+  assert.equal(assistant.content[1].text, "visible answer");
+});
+
 run("responses response reasoning block preserves plaintext and drops encrypted content in anthropic response", () => {
   const anthropic = responsesResponseToAnthropicMessage({
     id: "resp_reasoning",
@@ -1608,7 +1727,27 @@ models:
     assert.equal(config.port, 3000);
     assert.equal(config.ttfb_timeout, 5000);
     assert.equal(config.models[0].ttfb_timeout, 5000);
+    assert.equal(config.models[0].image, true);
     assert.equal(config.record.max_size, 10);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+run("config respects model image flag", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+    image: false
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.equal(config.models[0].image, false);
   } finally {
     rmSync(dirname(configPath), { recursive: true, force: true });
   }

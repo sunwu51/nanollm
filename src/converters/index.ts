@@ -28,7 +28,9 @@ export function chatParamsToResponsesRequest(request: OpenAIChatRequest): OpenAI
 }
 
 export function responsesRequestToChatParams(request: OpenAIResponsesRequest): OpenAIChatRequest {
-  return denormalizeToOpenAIChatRequest(normalizeOpenAIResponsesRequest(request));
+  const normalized = normalizeOpenAIResponsesRequest(request);
+  normalized.image = (request as any).image ?? true;
+  return denormalizeToOpenAIChatRequest(normalized);
 }
 
 export function chatParamsToAnthropicMessageRequest(request: OpenAIChatRequest): AnthropicMessagesRequest {
@@ -36,7 +38,9 @@ export function chatParamsToAnthropicMessageRequest(request: OpenAIChatRequest):
 }
 
 export function anthropicMessageRequestToChatParams(request: AnthropicMessagesRequest): OpenAIChatRequest {
-  return denormalizeToOpenAIChatRequest(normalizeAnthropicRequest(request));
+  const normalized = normalizeAnthropicRequest(request);
+  normalized.image = (request as any).image ?? true;
+  return denormalizeToOpenAIChatRequest(normalized);
 }
 
 export function responsesRequestToAnthropicMessageRequest(request: OpenAIResponsesRequest): AnthropicMessagesRequest {

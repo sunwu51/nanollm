@@ -63,6 +63,7 @@ export interface NormalizedMessage {
 export interface NormalizedRequest {
   model: string;
   sourceFormat?: "openai-chat" | "openai-responses" | "anthropic";
+  image?: boolean;
   maxOutputTokens?: number;
   messages: NormalizedMessage[];
   tools?: NormalizedTool[];

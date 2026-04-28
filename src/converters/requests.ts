@@ -161,7 +161,7 @@ export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): No
 export function denormalizeToOpenAIChatRequest(request: NormalizedRequest): OpenAIChatRequest {
   return {
     model: request.model,
-    messages: request.messages.flatMap((message) => denormalizeOpenAIChatMessage(message)),
+    messages: denormalizeOpenAIChatMessages(request.messages, request.image ?? true),
     max_completion_tokens: request.maxOutputTokens,
     metadata: request.metadata ?? undefined,
     service_tier: normalizeOpenAIServiceTier(request.serviceTier),
@@ -187,6 +187,58 @@ export function denormalizeToOpenAIChatRequest(request: NormalizedRequest): Open
     ) as OpenAIChatRequest["tools"],
     tool_choice: denormalizeOpenAIChatToolChoice(request.toolChoice),
   };
+}
+
+function denormalizeOpenAIChatMessages(messages: NormalizedMessage[], imageEnabled: boolean): OpenAIChatRequest["messages"] {
+  const denormalized = messages.flatMap((message) => denormalizeOpenAIChatMessage(message, imageEnabled)) as any[];
+  if (!imageEnabled) {
+    const merged: any[] = [];
+    for (const message of denormalized) {
+      const previous = merged.at(-1);
+      if (previous?.role === "user" && message?.role === "user" && typeof previous.content === "string" && typeof message.content === "string") {
+        previous.content = [previous.content, message.content].filter(Boolean).join("\n");
+        continue;
+      }
+      merged.push(message);
+    }
+    return merged;
+  }
+
+  const merged: any[] = [];
+  for (const message of denormalized) {
+    const previous = merged.at(-1);
+    if (
+      previous?.role === "user" &&
+      message?.role === "user" &&
+      Array.isArray(previous.content) &&
+      Array.isArray(message.content)
+    ) {
+      previous.content.push(...message.content);
+      continue;
+    }
+    if (
+      previous?.role === "user" &&
+      message?.role === "user" &&
+      Array.isArray(previous.content) &&
+      typeof message.content === "string" &&
+      message.content
+    ) {
+      previous.content.unshift({ type: "text", text: message.content });
+      continue;
+    }
+    if (
+      previous?.role === "user" &&
+      message?.role === "user" &&
+      typeof previous.content === "string" &&
+      Array.isArray(message.content)
+    ) {
+      message.content.unshift({ type: "text", text: previous.content });
+      merged[merged.length - 1] = { ...message };
+      continue;
+    }
+    merged.push(message);
+  }
+  return merged;
 }
 
 export function denormalizeToOpenAIResponsesRequest(request: NormalizedRequest): OpenAIResponsesRequest {
@@ -303,10 +355,15 @@ function normalizeOpenAIChatUserParts(content: any): NormalizedMessage["parts"] 
 
 function normalizeOpenAIChatAssistantParts(message: any): NormalizedMessage["parts"] {
   const parts: NormalizedMessage["parts"] = [];
-  if (typeof message.content === "string") parts.push(text(message.content));
-  else for (const part of message.content ?? []) parts.push(part.type === "text" ? text(part.text) : refusal(part.refusal));
   const thinking = message.thinking ?? message.reasoning ?? message.reasoning_content;
   if (typeof thinking === "string" && thinking) parts.push({ type: "thinking", thinking });
+  if (typeof message.content === "string") parts.push(text(message.content));
+  else for (const part of message.content ?? []) {
+    if (part.type === "text") parts.push(text(part.text));
+    else if (part.type === "thinking") parts.push({ type: "thinking", thinking: part.thinking ?? part.text, signature: part.signature });
+    else if (part.type === "redacted_thinking") parts.push({ type: "redacted_thinking", data: part.data });
+    else parts.push(refusal(part.refusal));
+  }
   if (message.refusal) parts.push(refusal(message.refusal));
   return parts;
 }
@@ -577,58 +634,59 @@ function normalizeAnthropicToolChoice(choice: ToolChoice): NormalizedToolChoice 
   }
 }
 
-function denormalizeOpenAIChatMessage(message: NormalizedMessage): OpenAIChatRequest["messages"] {
+function denormalizeOpenAIChatMessage(message: NormalizedMessage, imageEnabled: boolean): OpenAIChatRequest["messages"] {
   switch (message.role) {
     case "system":
       return [{ role: "system", content: collapseText(requireTextOnly(message.parts, "Chat system message")) }];
     case "developer":
       return [{ role: "system", content: collapseText(requireTextOnly(message.parts, "Chat developer message")) }];
     case "user":
-      return [{ role: "user", content: denormalizeOpenAIChatUserParts(message.parts) }];
+      return [{ role: "user", content: denormalizeOpenAIChatUserParts(message.parts, imageEnabled) }];
     case "assistant": {
-      const content = denormalizeOpenAIChatAssistantParts(message.parts);
-      const toolCalls = message.toolCalls?.map((toolCall) => denormalizeOpenAIChatToolCall(toolCall)) as any;
+      let content = denormalizeOpenAIChatAssistantParts(message.parts);
+      const toolCalls = message.toolCalls?.map((toolCall) => denormalizeOpenAIChatToolCall(toolCall)) as any[] | undefined;
+      const thinking = message.parts.filter((part) => part.type === "thinking").map((part) => part.thinking).filter(Boolean).join("\n");
+      if (content === null && thinking) content = "";
       if (content === null && (!toolCalls || toolCalls.length === 0)) return [];
-      const thinking = message.parts.filter((part) => part.type === "thinking").map((part) => part.thinking).join("\n");
       return [{
         role: "assistant",
         content,
         refusal: message.parts.find((part) => part.type === "refusal")?.text ?? null,
         ...(thinking ? { thinking, reasoning: thinking, reasoning_content: thinking } : {}),
-        tool_calls: toolCalls,
+        tool_calls: toolCalls?.length ? toolCalls : null,
       }];
     }
     case "tool":
-      return denormalizeOpenAIChatToolResultMessage(message, message.toolCallId ?? "tool");
+      return denormalizeOpenAIChatToolResultMessage(message, message.toolCallId ?? "tool", undefined, imageEnabled);
     case "function":
-      return denormalizeOpenAIChatToolResultMessage(message, message.name ?? "function", message.name);
+      return denormalizeOpenAIChatToolResultMessage(message, message.name ?? "function", message.name, imageEnabled);
   }
 }
 
-function denormalizeOpenAIChatUserParts(parts: NormalizedMessage["parts"]): any {
-  const chatParts = parts.map((part) => {
-    if (part.type === "text" || part.type === "refusal") return { type: "text", text: part.text };
-    if (part.type === "image_url") return { type: "image_url", image_url: { url: part.url, detail: part.detail } };
-    if (part.type === "input_audio") return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
-    if (part.type === "document_url" || part.type === "document_base64") return { type: "text", text: describeNormalizedDocumentPart(part) };
-    fail(`OpenAI Chat does not support user part "${part.type}"`);
-  });
-
-  return chatParts.every((part) => part.type === "text") ? chatParts.map((part) => part.text).join("\n") : chatParts;
+function denormalizeOpenAIChatUserParts(parts: NormalizedMessage["parts"], imageEnabled: boolean): any {
+  const preserveImages = imageEnabled && parts.some((part) => part.type === "image_url");
+  if (preserveImages) {
+    return parts.map((part) => denormalizeOpenAIChatUserPart(part, true));
+  }
+  return parts.map((part) => stringifyOpenAIChatPart(part, "Chat user message")).filter(Boolean).join("\n");
 }
 
 function denormalizeOpenAIChatAssistantParts(parts: NormalizedMessage["parts"]): any {
   if (parts.length === 0) return null;
-  const chatParts = parts.filter(part => part.type === "text" || part.type === "refusal");
+  const chatParts = parts.filter(part => part.type === "text" || part.type === "refusal").map((part) => {
+    if (part.type === "text") return { type: "text", text: part.text };
+    return { type: "refusal", refusal: part.text };
+  });
   if (chatParts.length === 0) return null;
-  return chatParts.map((part) => (part.type === "text" ? { type: "text", text: part.text } : { type: "refusal", refusal: part.text }));
+  if (chatParts.every((part) => part.type === "text")) return chatParts.map((part) => part.text).join("\n");
+  return chatParts;
 }
 
 function denormalizeOpenAIChatToolCall(toolCall: NonNullable<NormalizedMessage["toolCalls"]>[number]): any {
   return toolCall.kind === "function" ? { id: toolCall.id, type: "function", function: { name: toolCall.name, arguments: toolCall.payload } } : { id: toolCall.id, type: "custom", custom: { name: toolCall.name, input: toolCall.payload } };
 }
 
-function denormalizeOpenAIChatToolResultMessage(message: NormalizedMessage, identifier: string, legacyFunctionName?: string): OpenAIChatRequest["messages"] {
+function denormalizeOpenAIChatToolResultMessage(message: NormalizedMessage, identifier: string, legacyFunctionName?: string, imageEnabled = true): OpenAIChatRequest["messages"] {
   if (message.parts.every((part) => part.type === "text" || part.type === "refusal")) {
     const content = collapseText(requireTextOnly(message.parts, legacyFunctionName ? "Chat function result" : "Chat tool result"));
     return legacyFunctionName
@@ -636,33 +694,29 @@ function denormalizeOpenAIChatToolResultMessage(message: NormalizedMessage, iden
       : [{ role: "tool", tool_call_id: message.toolCallId ?? "", content }];
   }
 
+  if (imageEnabled && message.parts.some((part) => part.type === "image_url")) {
+    return [{ role: "user", content: [{ type: "text", text: `Tool result for ${identifier}` }, ...message.parts.map((part) => denormalizeOpenAIChatUserPart(part, true))] }];
+  }
   return [{ role: "user", content: denormalizeOpenAIChatToolFallbackParts(message.parts, identifier) }];
 }
 
-function denormalizeOpenAIChatToolFallbackParts(parts: NormalizedMessage["parts"], identifier: string): any[] {
-  const fallbackParts: any[] = [{ type: "text", text: `Tool result for ${identifier}` }];
+function denormalizeOpenAIChatToolFallbackParts(parts: NormalizedMessage["parts"], identifier: string): string {
+  return [`Tool result for ${identifier}`, ...parts.map((part) => stringifyOpenAIChatPart(part, "Chat tool result fallback")).filter(Boolean)].join("\n");
+}
 
-  for (const part of parts) {
-    if (part.type === "text" || part.type === "refusal") {
-      fallbackParts.push({ type: "text", text: part.text });
-      continue;
-    }
-    if (part.type === "image_url") {
-      fallbackParts.push({ type: "image_url", image_url: { url: part.url, detail: part.detail } });
-      continue;
-    }
-    if (part.type === "input_audio") {
-      fallbackParts.push({ type: "input_audio", input_audio: { data: part.data, format: part.format } });
-      continue;
-    }
-    if (part.type === "document_url") {
-      fallbackParts.push({ type: "text", text: describeNormalizedDocumentPart(part) });
-      continue;
-    }
-    fallbackParts.push({ type: "text", text: describeNormalizedDocumentPart(part) });
-  }
+function denormalizeOpenAIChatUserPart(part: NormalizedMessage["parts"][number], preserveImages: boolean): any {
+  if (part.type === "text" || part.type === "refusal") return { type: "text", text: part.text };
+  if (part.type === "image_url" && preserveImages) return { type: "image_url", image_url: { url: part.url, detail: part.detail } };
+  return { type: "text", text: stringifyOpenAIChatPart(part, "Chat user message") };
+}
 
-  return fallbackParts;
+function stringifyOpenAIChatPart(part: NormalizedMessage["parts"][number], context: string): string {
+  if (part.type === "text" || part.type === "refusal") return part.text;
+  if (part.type === "image_url") return part.detail ? `Attached image: ${part.url} (detail: ${part.detail})` : `Attached image: ${part.url}`;
+  if (part.type === "input_audio") return `Attached audio (${part.format})`;
+  if (part.type === "document_url" || part.type === "document_base64") return describeNormalizedDocumentPart(part);
+  if (part.type === "thinking" || part.type === "redacted_thinking") return "";
+  fail(`${context} cannot stringify part "${part.type}"`);
 }
 
 function describeNormalizedDocumentPart(part: Extract<NormalizedMessage["parts"][number], { type: "document_url" | "document_base64" }>): string {

@@ -257,6 +257,7 @@ export async function forwardRequest(
 ): Promise<{ normalizedResponse: NormalizedResponse; timing: UpstreamTiming; usage?: NormalizedUsage }> {
   normalized.stream = false;
   normalized.model = config.model;
+  normalized.image = config.image ?? true;
 
   const body = applyModelBodyOverrides(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config.provider, normalized)));
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, options);
@@ -274,6 +275,7 @@ export async function forwardStreamRequest(
 ): Promise<{ body: ReadableStream<Uint8Array>; upstreamFormat: StreamFormat; timing: UpstreamTiming }> {
   normalized.stream = true;
   normalized.model = config.model;
+  normalized.image = config.image ?? true;
 
   const body = applyModelBodyOverrides(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config.provider, normalized)));
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, options);

@@ -159,6 +159,11 @@ export function normalizeAnthropicResponse(response: AnthropicMessagesResponse):
 export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): OpenAIChatResponse {
   const visibleParts = response.message.parts.filter((part) => part.type === "text" || part.type === "refusal");
   const thinking = response.message.parts.filter((part) => part.type === "thinking").map((part) => part.thinking).join("\n");
+  const toolCalls = response.message.toolCalls?.map((toolCall) =>
+    toolCall.kind === "function"
+      ? { id: toolCall.id, type: "function", function: { name: toolCall.name, arguments: toolCall.payload } }
+      : { id: toolCall.id, type: "custom", custom: { name: toolCall.name, input: toolCall.payload } },
+  );
   return {
     id: response.id,
     object: "chat.completion",
@@ -174,11 +179,7 @@ export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): O
           content: visibleParts.length === 0 ? null : visibleParts.map((part) => (part.type === "text" ? { type: "text", text: part.text } : { type: "refusal", refusal: part.text })),
           refusal: visibleParts.find((part) => part.type === "refusal")?.text ?? null,
           ...(thinking ? { thinking, reasoning: thinking, reasoning_content: thinking } : {}),
-          tool_calls: response.message.toolCalls?.map((toolCall) =>
-            toolCall.kind === "function"
-              ? { id: toolCall.id, type: "function", function: { name: toolCall.name, arguments: toolCall.payload } }
-              : { id: toolCall.id, type: "custom", custom: { name: toolCall.name, input: toolCall.payload } },
-          ),
+          tool_calls: toolCalls?.length ? toolCalls : null,
         },
       },
     ],
