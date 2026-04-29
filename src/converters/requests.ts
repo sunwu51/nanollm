@@ -653,6 +653,10 @@ function denormalizeOpenAIChatMessage(message: NormalizedMessage, imageEnabled: 
         content,
         refusal: message.parts.find((part) => part.type === "refusal")?.text ?? null,
         ...(thinking ? { thinking, reasoning: thinking, reasoning_content: thinking } : {}),
+        // DeepSeek-compatible string-only chat mode may reject assistant history
+        // without a reasoning_content field, so keep an empty placeholder when
+        // model.image is false and there is no preserved thinking text.
+        ...(!imageEnabled && !thinking ? { reasoning_content: "" } : {}),
         tool_calls: toolCalls?.length ? toolCalls : null,
       }];
     }

@@ -1536,6 +1536,28 @@ run("anthropic assistant thinking block becomes top-level chat reasoning fields"
   assert.equal(assistant.tool_calls, null);
 });
 
+run("image disabled chat assistant without thinking gets empty reasoning_content placeholder", () => {
+  const chat = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    image: false,
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "visible answer" }],
+      },
+      { role: "user", content: "go on" },
+    ],
+  } as any);
+
+  const assistant = chat.messages[0] as any;
+  assert.equal(assistant.role, "assistant");
+  assert.equal(assistant.content, "visible answer");
+  assert.equal(assistant.reasoning_content, "");
+  assert.equal(assistant.thinking, undefined);
+  assert.equal(assistant.reasoning, undefined);
+});
+
 run("chat assistant top-level reasoning fields survive anthropic round-trip", () => {
   const anthropic = chatParamsToAnthropicMessageRequest({
     model: "gpt-5",
