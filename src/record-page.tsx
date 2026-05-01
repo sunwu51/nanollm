@@ -444,6 +444,7 @@ const STYLE = /* css */ String.raw`
       }
       .json-tree .string {
         color: #0b6f51;
+        white-space: pre-wrap;
       }
       .json-tree .number {
         color: #2f5cb8;

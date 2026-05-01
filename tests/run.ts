@@ -964,6 +964,80 @@ run("chat stream tool call with stop finish_reason becomes responses tool_calls 
   assert.equal(completed?.data.response.output[2].call_id, "call_stream_1");
 });
 
+run("chat stream tool arguments preserve trailing spaces when converted to responses", () => {
+  const converter = createSSEConverter("openai-chat", "openai-responses");
+  const toolArguments = JSON.stringify({
+    file_path: "C:\\Users\\sunwu\\Desktop\\code\\TabManager\\src\\api\\llm.js",
+    old_string: '    name: "stash_in_browser",a',
+    new_string: '    name: "stash_in_browser",a  ',
+  });
+  const chunks = [
+    ...converter.push(
+      [
+        {
+          id: "resp_stream_trailing_spaces",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        },
+        {
+          id: "resp_stream_trailing_spaces",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_trailing_spaces",
+                    type: "function",
+                    function: { name: "Edit", arguments: toolArguments.slice(0, -3) },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: "resp_stream_trailing_spaces",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-5.4",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    function: { arguments: toolArguments.slice(-3) },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+      ]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(""),
+    ),
+    ...converter.flush(),
+  ];
+
+  const events = parseSSEObjects(chunks);
+  const completed = events.find((event) => event.event === "response.completed");
+  const outputArguments = completed?.data.response.output[0].arguments;
+
+  assert.equal(outputArguments, toolArguments);
+  assert.equal(JSON.parse(outputArguments).new_string, '    name: "stash_in_browser",a  ');
+});
+
 run("chat stream reasoning field is treated like reasoning_content", () => {
   const converter = createSSEConverter("openai-chat", "openai-responses");
   const chunks = [
@@ -1711,7 +1785,7 @@ run("anthropic thinking budget 4000 maps to responses medium reasoning.effort", 
   assert.deepEqual((responses as any).reasoning, { effort: "medium" });
 });
 
-run("chat medium reasoning is capped by anthropic default max_tokens", () => {
+run("chat medium reasoning maps to anthropic adaptive thinking", () => {
   const anthropic = chatParamsToAnthropicMessageRequest({
     model: "gpt-4o-mini",
     reasoning_effort: "medium",
@@ -1719,10 +1793,10 @@ run("chat medium reasoning is capped by anthropic default max_tokens", () => {
   });
 
   assert.equal(anthropic.max_tokens, 10240);
-  assert.deepEqual((anthropic as any).thinking, { type: "enabled", budget_tokens: 5000 });
+  assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
 });
 
-run("chat high reasoning is capped by explicit anthropic max_tokens", () => {
+run("chat high reasoning maps to anthropic adaptive thinking with explicit max_tokens", () => {
   const anthropic = chatParamsToAnthropicMessageRequest({
     model: "gpt-4o-mini",
     reasoning_effort: "high",
@@ -1731,7 +1805,7 @@ run("chat high reasoning is capped by explicit anthropic max_tokens", () => {
   });
 
   assert.equal(anthropic.max_tokens, 5000);
-  assert.deepEqual((anthropic as any).thinking, { type: "enabled", budget_tokens: 4999 });
+  assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
 });
 
 run("config uses default ttfb_timeout when server section is omitted", () => {
@@ -2454,7 +2528,7 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /titleRow\.className = "recent-title-row"/);
   assert.match(html, /title\.className = "recent-title"/);
   assert.match(html, /sourceBadge\.className = "source-badge " \+ item\.source/);
-  assert.match(html, /statusBadge\.className = "status-badge " \+ item\.status/);
+  assert.match(html, /statusBadge\.className = getStatusBadgeClass\(item\)/);
   assert.match(html, /actualModel\.textContent = "-> " \+ \(item\.actualModel \|\| "-"\)/);
   assert.match(html, /meta\.textContent = item\.path \+ " · " \+ new Date\(item\.createdAt\)\.toLocaleTimeString\("zh-CN"\)/);
   assert.match(html, /renderRecentList/);

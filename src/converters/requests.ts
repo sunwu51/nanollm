@@ -161,7 +161,7 @@ export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): No
 export function denormalizeToOpenAIChatRequest(request: NormalizedRequest): OpenAIChatRequest {
   return {
     model: request.model,
-    messages: denormalizeOpenAIChatMessages(request.messages, request.image ?? true),
+    messages: denormalizeOpenAIChatMessages(reorderMessagesForOpenAIChatToolResults(request.messages), request.image ?? true),
     max_completion_tokens: request.maxOutputTokens,
     metadata: request.metadata ?? undefined,
     service_tier: normalizeOpenAIServiceTier(request.serviceTier),
@@ -207,6 +207,28 @@ function denormalizeOpenAIChatMessages(messages: NormalizedMessage[], imageEnabl
   const merged: any[] = [];
   for (const message of denormalized) {
     const previous = merged.at(-1);
+    if (previous?.role === "assistant" && message?.role === "assistant") {
+      if (previous.content === null && message.content !== null) {
+        previous.content = message.content;
+      } else if (previous.content !== null && message.content !== null) {
+        previous.content = [previous.content, message.content].filter(Boolean).join("\n");
+      }
+      if (message.tool_calls?.length) {
+        previous.tool_calls = [...(previous.tool_calls ?? []), ...message.tool_calls];
+      }
+      const prevThinking = previous.thinking || previous.reasoning || previous.reasoning_content || "";
+      const msgThinking = message.thinking || message.reasoning || message.reasoning_content || "";
+      const mergedThinking = [prevThinking, msgThinking].filter(Boolean).join("\n");
+      if (mergedThinking) {
+        previous.thinking = mergedThinking;
+        previous.reasoning = mergedThinking;
+        previous.reasoning_content = mergedThinking;
+      }
+      if (message.refusal && !previous.refusal) {
+        previous.refusal = message.refusal;
+      }
+      continue;
+    }
     if (
       previous?.role === "user" &&
       message?.role === "user" &&
@@ -925,6 +947,44 @@ function ensureAnthropicMessagesEndWithUser(messages: NormalizedMessage[]): Norm
   const last = messages.at(-1);
   if (!last || last.role === "user" || last.role === "tool" || last.role === "function") return messages;
   return [...messages, { role: "user", parts: [text("go on")] }];
+}
+
+function reorderMessagesForOpenAIChatToolResults(messages: NormalizedMessage[]): NormalizedMessage[] {
+  const used = new Array(messages.length).fill(false);
+  const reordered: NormalizedMessage[] = [];
+
+  for (let index = 0; index < messages.length; index += 1) {
+    if (used[index]) continue;
+    const message = messages[index];
+    used[index] = true;
+    reordered.push(message);
+
+    const pendingToolResultIds = getOpenAIChatPendingToolResultIds(message);
+    if (pendingToolResultIds.size === 0) continue;
+
+    for (let nextIndex = index + 1; nextIndex < messages.length; nextIndex += 1) {
+      if (used[nextIndex]) continue;
+      const candidate = messages[nextIndex];
+      const candidateToolResultId = getOpenAIChatToolResultId(candidate);
+      if (!candidateToolResultId || !pendingToolResultIds.has(candidateToolResultId)) continue;
+      used[nextIndex] = true;
+      reordered.push(candidate);
+      pendingToolResultIds.delete(candidateToolResultId);
+      if (pendingToolResultIds.size === 0) break;
+    }
+  }
+
+  return reordered;
+}
+
+function getOpenAIChatPendingToolResultIds(message: NormalizedMessage): Set<string> {
+  if (message.role !== "assistant" || !message.toolCalls?.length) return new Set();
+  return new Set(message.toolCalls.map((tc) => tc.id));
+}
+
+function getOpenAIChatToolResultId(message: NormalizedMessage): string | undefined {
+  if (message.role === "tool") return message.toolCallId ?? undefined;
+  return undefined;
 }
 
 function getAnthropicPendingToolResultIds(message: NormalizedMessage): Set<string> {
