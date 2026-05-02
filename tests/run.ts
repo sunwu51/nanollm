@@ -274,6 +274,177 @@ run("responses tool output becomes anthropic tool_result block", () => {
   assert.equal((result.messages[0].content as Array<{ type: string }>)[0].type, "tool_result");
 });
 
+run("responses namespace tools flatten to qualified function names", () => {
+  const result = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5",
+    input: "hello",
+    tools: [
+      {
+        type: "namespace",
+        name: "mcp__mcpcenter__",
+        description: "MCP Center tools",
+        tools: [
+          {
+            type: "function",
+            name: "calendar_get_events",
+            description: "Get calendar events",
+            parameters: {
+              type: "object",
+              properties: {
+                start: { type: "string" },
+                end: { type: "string" },
+              },
+              required: ["start", "end"],
+            },
+            strict: false,
+          },
+        ],
+      },
+    ],
+  } as any);
+
+  assert.equal(result.tools?.length ?? 0, 1);
+  assert.equal((result.tools?.[0] as any).name, "mcp__mcpcenter__calendar_get_events");
+});
+
+run("responses non-mcp namespace tools stay unsupported in anthropic conversion", () => {
+  const result = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5",
+    input: "hello",
+    tools: [
+      {
+        type: "namespace",
+        name: "crm",
+        description: "CRM tools",
+        tools: [
+          {
+            type: "function",
+            name: "lookup_account",
+            description: "Look up an account",
+            parameters: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+              },
+              required: ["id"],
+            },
+            strict: false,
+          },
+        ],
+      },
+    ],
+  } as any);
+
+  assert.equal(result.tools?.length ?? 0, 0);
+});
+
+run("responses namespace tool calls flatten to qualified function names", () => {
+  const result = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5",
+    input: [
+      {
+        type: "function_call",
+        call_id: "call_1",
+        namespace: "mcp__mcpcenter__",
+        name: "calendar_get_events",
+        arguments: "{\"start\":\"2026-05-01\",\"end\":\"2026-05-02\"}",
+      },
+      { type: "function_call_output", call_id: "call_1", output: "[]" },
+    ],
+    tools: [
+      {
+        type: "namespace",
+        name: "mcp__mcpcenter__",
+        description: "MCP Center tools",
+        tools: [
+          {
+            type: "function",
+            name: "calendar_get_events",
+            description: "Get calendar events",
+            parameters: {
+              type: "object",
+              properties: {
+                start: { type: "string" },
+                end: { type: "string" },
+              },
+              required: ["start", "end"],
+            },
+            strict: false,
+          },
+        ],
+      },
+    ],
+  } as any);
+
+  assert.equal(result.messages[0].role, "assistant");
+  assert.equal(((result.messages[0].content ?? []) as Array<{ type: string }>)[0].type, "tool_use");
+  assert.equal(((result.messages[0].content ?? []) as Array<{ name?: string }>)[0].name, "mcp__mcpcenter__calendar_get_events");
+});
+
+run("anthropic qualified mcp tools become responses namespace tools", () => {
+  const result = anthropicMessageRequestToResponsesRequest({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    messages: [{ role: "user", content: "hello" }],
+    tools: [
+      {
+        name: "mcp__mcpcenter__calendar_get_events",
+        description: "Get calendar events",
+        input_schema: {
+          type: "object",
+          properties: {
+            start: { type: "string" },
+            end: { type: "string" },
+          },
+          required: ["start", "end"],
+        },
+      },
+    ],
+  } as any);
+
+  assert.equal((result.tools ?? []).length, 1);
+  assert.equal((result.tools?.[0] as any).type, "namespace");
+  assert.equal((result.tools?.[0] as any).name, "mcp__mcpcenter__");
+  assert.equal(((result.tools?.[0] as any).tools ?? [])[0].name, "calendar_get_events");
+});
+
+run("anthropic qualified mcp tool use becomes responses namespaced function_call input", () => {
+  const result = anthropicMessageRequestToResponsesRequest({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "call_1",
+            caller: { type: "direct" },
+            name: "mcp__mcpcenter__calendar_get_events",
+            input: { start: "2026-05-01", end: "2026-05-02" },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_1",
+            content: "[]",
+          },
+        ],
+      },
+    ],
+  } as any);
+
+  const functionCall = ((result.input ?? []) as any[]).find((item) => item.type === "function_call");
+  assert.ok(functionCall);
+  assert.equal(functionCall.namespace, "mcp__mcpcenter__");
+  assert.equal(functionCall.name, "calendar_get_events");
+  assert.equal(functionCall.arguments, "{\"start\":\"2026-05-01\",\"end\":\"2026-05-02\"}");
+});
+
 run("responses anthropic conversion makes tool_use and tool_result adjacent", () => {
   const result = responsesRequestToAnthropicMessageRequest({
     model: "gpt-5",
@@ -649,6 +820,136 @@ run("responses custom tool stream preserves windows paths through chat arguments
   const argumentsText = toolArgChunks.join("");
 
   assert.equal(JSON.parse(argumentsText).content, input);
+});
+
+run("responses stream namespaced mcp function calls become qualified chat tool names", () => {
+  const converter = createSSEConverter("openai-responses", "openai-chat");
+  const argumentsText = "{\"start\":\"2026-05-01\",\"end\":\"2026-05-02\"}";
+  const chunks = [
+    ...converter.push(
+      [
+        { type: "response.created", response: { id: "resp_ns_stream", object: "response", created_at: 1, model: "gpt-5.4", status: "in_progress", output: [], usage: null } },
+        {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            id: "item_ns_stream",
+            type: "function_call",
+            status: "in_progress",
+            call_id: "call_ns_stream",
+            namespace: "mcp__mcpcenter__",
+            name: "calendar_get_events",
+            arguments: "",
+          },
+          sequence_number: 1,
+        },
+        { type: "response.function_call_arguments.delta", item_id: "item_ns_stream", output_index: 0, delta: argumentsText, sequence_number: 2 },
+        { type: "response.function_call_arguments.done", item_id: "item_ns_stream", output_index: 0, name: "calendar_get_events", arguments: argumentsText, sequence_number: 3 },
+        {
+          type: "response.completed",
+          response: {
+            id: "resp_ns_stream",
+            object: "response",
+            created_at: 1,
+            model: "gpt-5.4",
+            status: "completed",
+            output: [
+              {
+                id: "item_ns_stream",
+                type: "function_call",
+                status: "completed",
+                call_id: "call_ns_stream",
+                namespace: "mcp__mcpcenter__",
+                name: "calendar_get_events",
+                arguments: argumentsText,
+              },
+            ],
+            usage: null,
+          },
+          sequence_number: 4,
+        },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    ),
+    ...converter.flush(),
+  ];
+
+  const events = parseSSEObjects(chunks);
+  const toolName = events
+    .flatMap((event) => event.data.choices ?? [])
+    .flatMap((choice: any) => choice.delta?.tool_calls ?? [])
+    .map((toolCall: any) => toolCall.function?.name)
+    .find(Boolean);
+
+  assert.equal(toolName, "mcp__mcpcenter__calendar_get_events");
+});
+
+run("anthropic stream qualified mcp tool_use becomes responses namespaced function_call events", () => {
+  const converter = createSSEConverter("anthropic", "openai-responses");
+  const argumentsText = "{\"start\":\"2026-05-01\",\"end\":\"2026-05-02\"}";
+  const chunks = [
+    ...converter.push(
+      [
+        {
+          type: "message_start",
+          message: {
+            id: "msg_ns_stream",
+            type: "message",
+            role: "assistant",
+            model: "claude-sonnet-4-5",
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 0 },
+          },
+        },
+        {
+          type: "content_block_start",
+          index: 0,
+          content_block: {
+            type: "tool_use",
+            id: "call_ns_stream",
+            name: "mcp__mcpcenter__calendar_get_events",
+            input: {},
+          },
+        },
+        {
+          type: "content_block_delta",
+          index: 0,
+          delta: {
+            type: "input_json_delta",
+            partial_json: argumentsText,
+          },
+        },
+        { type: "content_block_stop", index: 0 },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "tool_use" },
+          usage: {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: null,
+            cache_read_input_tokens: null,
+          },
+        },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    ),
+    ...converter.flush(),
+  ];
+
+  const events = parseSSEObjects(chunks);
+  const added = events.find((event) => event.event === "response.output_item.added");
+  const done = events.find((event) => event.event === "response.function_call_arguments.done");
+  const completed = events.find((event) => event.event === "response.completed");
+
+  assert.ok(added);
+  assert.equal(added?.data.item.namespace, "mcp__mcpcenter__");
+  assert.equal(added?.data.item.name, "calendar_get_events");
+  assert.ok(done);
+  assert.equal(done?.data.name, "calendar_get_events");
+  assert.ok(completed);
+  assert.equal(completed?.data.response.output[0].namespace, "mcp__mcpcenter__");
+  assert.equal(completed?.data.response.output[0].name, "calendar_get_events");
+  assert.equal(completed?.data.response.output[0].arguments, argumentsText);
 });
 
 run("chat stream restores wrapped custom tool windows paths exactly", () => {
@@ -1226,6 +1527,43 @@ run("anthropic response with tool_use becomes chat completion tool_calls", () =>
   assert.equal(result.choices[0].message.tool_calls?.[0].type, "function");
 });
 
+run("anthropic response qualified mcp tool_use becomes responses namespaced function_call", () => {
+  const result = anthropicMessageToResponsesResponse({
+    id: "msg_mcp_tool_use",
+    type: "message",
+    role: "assistant",
+    model: "claude-sonnet-4-5",
+    container: null,
+    stop_reason: "tool_use",
+    stop_sequence: null,
+    content: [
+      {
+        type: "tool_use",
+        id: "call_1",
+        caller: { type: "direct" },
+        name: "mcp__mcpcenter__calendar_get_events",
+        input: { start: "2026-05-01", end: "2026-05-02" },
+      },
+    ],
+    usage: {
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_creation_input_tokens: null,
+      cache_read_input_tokens: null,
+      cache_creation: null,
+      inference_geo: null,
+      service_tier: null,
+      server_tool_use: null,
+    },
+  } as any);
+
+  assert.equal((result.output as any[]).length, 1);
+  assert.equal((result.output[0] as any).type, "function_call");
+  assert.equal((result.output[0] as any).namespace, "mcp__mcpcenter__");
+  assert.equal((result.output[0] as any).name, "calendar_get_events");
+  assert.equal((result.output[0] as any).arguments, "{\"start\":\"2026-05-01\",\"end\":\"2026-05-02\"}");
+});
+
 run("anthropic tool_result block array becomes chat tool text", () => {
   const result = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
@@ -1628,8 +1966,8 @@ run("image disabled chat assistant without thinking gets empty reasoning_content
   assert.equal(assistant.role, "assistant");
   assert.equal(assistant.content, "visible answer");
   assert.equal(assistant.reasoning_content, "");
-  assert.equal(assistant.thinking, undefined);
-  assert.equal(assistant.reasoning, undefined);
+  assert.equal(assistant.thinking, "");
+  assert.equal(assistant.reasoning, "");
 });
 
 run("chat assistant top-level reasoning fields survive anthropic round-trip", () => {

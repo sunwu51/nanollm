@@ -14,7 +14,9 @@ import {
   fail,
   normalizeUsage,
   parseJson,
+  qualifyOpenAIResponsesToolName,
   refusal,
+  splitQualifiedOpenAIResponsesToolName,
   text,
   unwrapResponsesCustomToolInput,
   wrapResponsesCustomToolInput,
@@ -65,12 +67,17 @@ export function normalizeOpenAIResponsesResponse(response: OpenAIResponsesRespon
     }
 
     if (item.type === "function_call") {
-      toolCalls.push({ kind: "function", id: item.call_id, name: item.name, payload: item.arguments });
+      toolCalls.push({ kind: "function", id: item.call_id, name: qualifyOpenAIResponsesToolName(item.name, item.namespace), payload: item.arguments });
       continue;
     }
 
     if (item.type === "custom_tool_call") {
-      toolCalls.push({ kind: "function", id: item.call_id, name: item.name, payload: normalizeCustomToolInputToFunctionArguments(item.input) });
+      toolCalls.push({
+        kind: "function",
+        id: item.call_id,
+        name: qualifyOpenAIResponsesToolName(item.name, item.namespace),
+        payload: normalizeCustomToolInputToFunctionArguments(item.input),
+      });
       continue;
     }
 
@@ -224,9 +231,28 @@ export function denormalizeToOpenAIResponsesResponse(response: NormalizedRespons
           ]
         : []),
       ...(response.message.toolCalls?.map((toolCall) =>
-        toolCall.kind === "custom" || (toolCall.kind === "function" && isResponsesCustomToolName(toolCall.name))
-          ? { id: toolCall.id, type: "custom_tool_call", call_id: toolCall.id, name: toolCall.name, input: toolCall.kind === "custom" ? toolCall.payload : unwrapResponsesCustomToolInput(toolCall.payload), status: "completed" }
-          : { id: toolCall.id, type: "function_call", call_id: toolCall.id, name: toolCall.name, arguments: toolCall.payload, status: "completed" },
+        (() => {
+          const { name, namespace } = splitQualifiedOpenAIResponsesToolName(toolCall.name);
+          return toolCall.kind === "custom" || (toolCall.kind === "function" && isResponsesCustomToolName(toolCall.name))
+            ? {
+                id: toolCall.id,
+                type: "custom_tool_call",
+                call_id: toolCall.id,
+                name,
+                ...(namespace ? { namespace } : {}),
+                input: toolCall.kind === "custom" ? toolCall.payload : unwrapResponsesCustomToolInput(toolCall.payload),
+                status: "completed",
+              }
+            : {
+                id: toolCall.id,
+                type: "function_call",
+                call_id: toolCall.id,
+                name,
+                ...(namespace ? { namespace } : {}),
+                arguments: toolCall.payload,
+                status: "completed",
+              };
+        })()
       ) ?? []),
     ] as OpenAIResponsesResponse["output"],
     parallel_tool_calls: (response.message.toolCalls?.length ?? 0) > 1,

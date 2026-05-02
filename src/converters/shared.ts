@@ -204,6 +204,33 @@ export function unwrapResponsesCustomToolInput(argumentsText: string): string {
   }
 }
 
+const OPENAI_RESPONSES_MCP_QUALIFIED_TOOL_PATTERN = /^(mcp__.+?__)(.+)$/;
+
+export function isOpenAIResponsesMcpNamespace(namespace: string | null | undefined): namespace is string {
+  return typeof namespace === "string" && namespace.startsWith("mcp__");
+}
+
+export function joinOpenAIResponsesNamespacePath(name: string, namespace?: string | null): string {
+  return namespace ? `${namespace}${name}` : name;
+}
+
+export function qualifyOpenAIResponsesToolName(name: string, namespace?: string | null): string {
+  return isOpenAIResponsesMcpNamespace(namespace) ? joinOpenAIResponsesNamespacePath(name, namespace) : name;
+}
+
+export function splitQualifiedOpenAIResponsesToolName(name: string): { name: string; namespace?: string } {
+  const match = OPENAI_RESPONSES_MCP_QUALIFIED_TOOL_PATTERN.exec(name);
+  if (!match) return { name };
+
+  const [, namespace, localName] = match;
+  if (!isOpenAIResponsesMcpNamespace(namespace) || !localName) return { name };
+
+  return {
+    namespace,
+    name: localName,
+  };
+}
+
 export function makeDataUrl(mediaType: string, data: string): string {
   return `data:${mediaType};base64,${data}`;
 }

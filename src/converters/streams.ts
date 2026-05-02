@@ -2,7 +2,7 @@
 import type { ChatCompletionChunk } from "openai/resources/chat/completions/completions";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
 import type { RawMessageStreamEvent } from "@anthropic-ai/sdk/resources/messages/messages";
-import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, unwrapResponsesCustomToolInput } from "./shared.js";
+import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, qualifyOpenAIResponsesToolName, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput } from "./shared.js";
 import { isResponsesCustomToolName, } from "../request-context.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -253,7 +253,13 @@ export class ResponsesStreamParser implements StreamParser {
           const idx = this.nextIndex++;
           const key = `tool_${event.output_index}`;
           this.blockMapping.set(key, idx);
-          out.push({ type: "tool_start", index: idx, id: item.call_id, name: item.name, kind: item.type === "custom_tool_call" ? "custom" : "function" });
+          out.push({
+            type: "tool_start",
+            index: idx,
+            id: item.call_id,
+            name: qualifyOpenAIResponsesToolName(item.name, item.namespace),
+            kind: item.type === "custom_tool_call" ? "custom" : "function",
+          });
         }
         break;
       }
@@ -696,12 +702,13 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         const oi = this.outputIndex++;
         const itemId = this.makeItemId(oi, event.id || "fc");
         this.blockToMapping.set(event.index, { outputIndex: oi });
+        const splitName = splitQualifiedOpenAIResponsesToolName(event.name);
         out.push({
           type: "response.output_item.added",
           output_index: oi,
           item: custom
-            ? { id: itemId, type: "custom_tool_call", status: "in_progress", call_id: event.id, name: event.name, input: "" }
-            : { id: itemId, type: "function_call", status: "in_progress", call_id: event.id, name: event.name, arguments: "" },
+            ? { id: itemId, type: "custom_tool_call", status: "in_progress", call_id: event.id, name: splitName.name, ...(splitName.namespace ? { namespace: splitName.namespace } : {}), input: "" }
+            : { id: itemId, type: "function_call", status: "in_progress", call_id: event.id, name: splitName.name, ...(splitName.namespace ? { namespace: splitName.namespace } : {}), arguments: "" },
           sequence_number: this.nextSeq(),
         });
         break;
@@ -743,10 +750,11 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         const itemId = this.itemIds.get(mapping.outputIndex);
         if (!itemId) break;
         const info = this.toolCallInfo.get(event.index);
+        const splitName = splitQualifiedOpenAIResponsesToolName(info?.name ?? "");
         const customInput = info?.custom ? (info.wrapped ? unwrapResponsesCustomToolInput(acc) : acc) : "";
         const fcItem = info?.custom
-          ? { id: itemId, type: "custom_tool_call", status: "completed", call_id: info?.id ?? "", name: info?.name ?? "", input: customInput }
-          : { id: itemId, type: "function_call", status: "completed", call_id: info?.id ?? "", name: info?.name ?? "", arguments: acc };
+          ? { id: itemId, type: "custom_tool_call", status: "completed", call_id: info?.id ?? "", name: splitName.name, ...(splitName.namespace ? { namespace: splitName.namespace } : {}), input: customInput }
+          : { id: itemId, type: "function_call", status: "completed", call_id: info?.id ?? "", name: splitName.name, ...(splitName.namespace ? { namespace: splitName.namespace } : {}), arguments: acc };
         this.completedOutputItems.set(mapping.outputIndex, fcItem);
         if (info?.custom && info.wrapped && customInput) {
           const emittedLength = this.wrappedToolDecodedLengths.get(event.index) ?? 0;
@@ -762,8 +770,8 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         }
         out.push(
           info?.custom
-            ? { type: "response.custom_tool_call_input.done", item_id: itemId, output_index: mapping.outputIndex, name: info?.name ?? "", input: customInput, sequence_number: this.nextSeq() }
-            : { type: "response.function_call_arguments.done", item_id: itemId, output_index: mapping.outputIndex, name: info?.name ?? "", arguments: acc, sequence_number: this.nextSeq() },
+            ? { type: "response.custom_tool_call_input.done", item_id: itemId, output_index: mapping.outputIndex, name: splitName.name, input: customInput, sequence_number: this.nextSeq() }
+            : { type: "response.function_call_arguments.done", item_id: itemId, output_index: mapping.outputIndex, name: splitName.name, arguments: acc, sequence_number: this.nextSeq() },
         );
         out.push({ type: "response.output_item.done", output_index: mapping.outputIndex, item: fcItem, sequence_number: this.nextSeq() });
         break;

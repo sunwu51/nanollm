@@ -15,7 +15,7 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | `model` | `model` | `model` | `model` | Forwarded and overwritten by configured upstream model before provider calls. |
 | `maxOutputTokens` | `max_completion_tokens`, fallback `max_tokens` | `max_output_tokens` | `max_tokens` | Denormalizing to Chat always uses `max_completion_tokens`. |
 | `messages` | `messages[]` | `instructions` + `input` | `system` + `messages[]` | System/developer messages become Anthropic `system`; Responses leading system/developer messages become `instructions`. |
-| `tools` | `tools[]`, legacy `functions[]` | `tools[]` | `tools[]` | Only function-style normalized tools survive all protocols. Unsupported hosted/server tools are dropped while normalizing tools. |
+| `tools` | `tools[]`, legacy `functions[]` | `tools[]` | `tools[]` | Only function-style normalized tools survive all protocols. Responses MCP namespace tools are flattened to qualified function-style names like `mcp__server__tool`; unsupported hosted/server tools and non-MCP namespaces are dropped while normalizing tools. |
 | `toolChoice` | `tool_choice`, legacy `function_call` | `tool_choice` | `tool_choice` | Unsupported named choices are filtered out if the named tool was dropped. |
 | `metadata` | `metadata` | `metadata` | `metadata.user_id` only | Anthropic denormalization rejects metadata except a single string `user_id`. |
 | `serviceTier` | `service_tier` | `service_tier` | `service_tier` | Each provider validates its allowed values on denormalization. |
@@ -58,9 +58,10 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | OpenAI Chat `type=function` | Preserved as `kind=function` with JSON schema. | Emits Chat function tool, Responses function tool, or Anthropic tool. |
 | OpenAI Chat non-function tools | Dropped during tool normalization. | Not emitted. |
 | OpenAI legacy `functions[]` | Added as function-style tools. | Denormalizes to modern `tools[]`; legacy `functions[]` are not regenerated. |
-| OpenAI Responses `type=function` | Preserved as function-style tool. | Emits provider-native function tool. |
+| OpenAI Responses `type=function` | Preserved as function-style tool. `defer_loading` is ignored during normalization. | Emits provider-native function tool without `defer_loading`. |
 | OpenAI Responses `type=custom` | Converted to function-style tool with generated schema; tool name is marked as Responses custom. | Back to Responses `custom` only when target is Responses and name was marked; otherwise function-style. |
-| OpenAI Responses namespace/hosted tools | Dropped. | Not emitted. |
+| OpenAI Responses `type=namespace` tools | Only MCP namespaces are flattened to function-style tools named `mcp__server__tool`. Child function `defer_loading` flags are ignored during normalization. Other namespaces are dropped. | When target is Responses, qualified MCP tool names are grouped back under `type=namespace` tools. Namespace descriptions and lazy-loading metadata are not preserved. |
+| OpenAI Responses hosted/server tools | Dropped. | Not emitted. |
 | Anthropic tool with `input_schema` and no non-function `type` | Preserved as normal function tool. | Emits ordinary Anthropic client tool. |
 | Anthropic function tool with `defer_loading=true` | Preserved as a normal function; `defer_loading` is lost. | Emits ordinary Anthropic tool without `defer_loading`. |
 | Anthropic server tools such as web search, web fetch, code execution, tool search | Dropped because they do not have `input_schema`. | Not emitted from normalized tools. |
@@ -81,8 +82,10 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | Chat thinking content | Providers use different non-standard fields for reasoning text. | Chat message/response conversion reads and writes `thinking`, `reasoning`, and `reasoning_content`. Streams also read/write all three delta fields. |
 | Chat reasoning effort | Providers use both top-level `reasoning_effort` and `reasoning.effort`. | Chat request normalization reads both; denormalization emits both. |
 | OpenAI Responses tool search history | Tool search call/output can appear in historical `input[]`. | `tool_search_call` and `tool_search_output` are logged with `console.warn` and dropped. The following `function_call` remains normal. |
+| OpenAI Responses namespace history | Historical Responses `function_call` / `custom_tool_call` items and streamed output items can carry `namespace`. | MCP namespace names are folded into qualified names like `mcp__server__tool` during normalization and are split back to `namespace` + local `name` when denormalizing back to Responses. |
 | OpenAI storage defaults | Non-passthrough OpenAI requests should not use server-side stored item references. | Proxy request forwarding sets `store=false` for OpenAI Chat and Responses. |
 | Responses custom tool input | Responses custom tools are not the same as function tools. | Custom input is wrapped into function arguments when normalizing to common function-style tools, and unwrapped when denormalizing back to Responses custom. |
+| Responses namespace tool calls | Responses `function_call`/`custom_tool_call` items can carry a separate `namespace`. | MCP namespace calls are normalized to qualified names like `mcp__server__tool` so non-namespace targets can still route the call, and are split back into `namespace` + local `name` when denormalizing back to Responses. |
 | Documents to Chat | Chat does not have the same document part model. | Documents degrade to text descriptions in Chat user/tool contexts. |
 
 ## Unsupported or Erroring Cases
@@ -173,6 +176,5 @@ Anthropic content blocks that may still error outside `_tool_result` handling in
 | Source response | Behavior |
 | --- | --- |
 | OpenAI Chat | Text/refusal, tool calls, and `thinking`/`reasoning`/`reasoning_content` are normalized. Other provider-specific fields are ignored. |
-| OpenAI Responses | `message`, `function_call`, `custom_tool_call`, and `reasoning` output items are normalized. Other output item types are currently ignored, not errored. |
+| OpenAI Responses | `message`, `function_call`, `custom_tool_call`, and `reasoning` output items are normalized. MCP namespace tool calls are folded to qualified names during normalization, including streamed output items, and split back when denormalizing to Responses. Other output item types are currently ignored, not errored. |
 | Anthropic Messages | `text`, `thinking`, `redacted_thinking`, `tool_use`, and `server_tool_use` are normalized. Other response content blocks are currently ignored, not errored. |
-

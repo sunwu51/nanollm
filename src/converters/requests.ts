@@ -16,16 +16,21 @@ import {
   collapseText,
   createResponsesCustomToolSchema,
   fail,
+  isOpenAIResponsesMcpNamespace,
+  joinOpenAIResponsesNamespacePath,
   makeDataUrl,
   normalizeReasoningEffortFromBudget,
   parseDataUrl,
   parseJson,
+  qualifyOpenAIResponsesToolName,
   refusal,
   requireTextOnly,
+  splitQualifiedOpenAIResponsesToolName,
   text,
+  unwrapResponsesCustomToolInput,
   wrapResponsesCustomToolInput,
 } from "./shared.js";
-import { markResponsesCustomToolName } from "../request-context.js";
+import { isResponsesCustomToolName, markResponsesCustomToolName } from "../request-context.js";
 
 export function normalizeOpenAIChatRequest(request: OpenAIChatRequest): NormalizedRequest {
   const tools = request.tools?.flatMap((tool) => {
@@ -79,10 +84,7 @@ export function normalizeOpenAIResponsesRequest(request: OpenAIResponsesRequest)
     else messages.push(...normalizeOpenAIResponsesInput(request.instructions as any[]));
   }
   if (request.input !== undefined) messages.push(...normalizeOpenAIResponsesInput(typeof request.input === "string" ? request.input : (request.input as any[])));
-  const tools = request.tools?.flatMap((tool) => {
-    const normalized = normalizeOpenAIResponsesTool(tool as any);
-    return normalized ? [normalized] : [];
-  });
+  const tools = request.tools?.flatMap((tool) => normalizeOpenAIResponsesTool(tool as any));
   const normalizedToolChoice = request.tool_choice ? normalizeOpenAIResponsesToolChoice(request.tool_choice as any) : undefined;
 
   return {
@@ -294,11 +296,7 @@ export function denormalizeToOpenAIResponsesRequest(request: NormalizedRequest):
       ? { effort: (request.reasoningEffort ?? normalizeReasoningEffortFromBudget(request.thinkingBudgetTokens)) as never }
       : undefined,
     text: request.responseFormat || request.textVerbosity ? { format: request.responseFormat ? denormalizeOpenAIResponsesFormat(request.responseFormat) : undefined, verbosity: request.textVerbosity ?? undefined } : undefined,
-    tools: request.tools?.map((tool) =>
-      tool.kind === "function"
-        ? { type: "function", name: tool.name, description: tool.description ?? undefined, parameters: tool.inputSchema, strict: tool.strict ?? undefined }
-        : { type: "custom", name: tool.name, description: tool.description ?? undefined, format: tool.format as never },
-    ) as OpenAIResponsesRequest["tools"],
+    tools: denormalizeOpenAIResponsesTools(request.tools),
     tool_choice: denormalizeOpenAIResponsesToolChoice(request.toolChoice),
   };
 }
@@ -435,8 +433,18 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
         parts: [...thinkingFromSummary, ...thinkingFromContent, ...redactedThinking],
       }];
     }
-    if (itemType === "function_call") return [{ role: "assistant", parts: [], toolCalls: [{ kind: "function", id: item.call_id, name: item.name, payload: item.arguments }] }];
-    if (itemType === "custom_tool_call") return [{ role: "assistant", parts: [], toolCalls: [{ kind: "function", id: item.call_id, name: item.name, payload: normalizeCustomToolInputToFunctionArguments(item.input) }] }];
+    if (itemType === "function_call") {
+      return [{
+        role: "assistant",
+        parts: [],
+        toolCalls: [{ kind: "function", id: item.call_id, name: qualifyOpenAIResponsesToolName(item.name, item.namespace), payload: item.arguments }],
+      }];
+    }
+    if (itemType === "custom_tool_call") {
+      const name = qualifyOpenAIResponsesToolName(item.name, item.namespace);
+      markResponsesCustomToolName(name);
+      return [{ role: "assistant", parts: [], toolCalls: [{ kind: "function", id: item.call_id, name, payload: normalizeCustomToolInputToFunctionArguments(item.input) }] }];
+    }
     if (itemType === "function_call_output" || itemType === "custom_tool_call_output") {
       return [{ role: "tool", toolCallId: item.call_id, parts: normalizeOpenAIResponsesToolOutput(item.output) }];
     }
@@ -492,19 +500,27 @@ function normalizeOpenAIResponsesToolOutput(output: any): NormalizedMessage["par
   });
 }
 
-function normalizeOpenAIResponsesTool(tool: any): NormalizedTool | undefined {
-  if (tool.type === "function") return { kind: "function", name: tool.name, description: tool.description, inputSchema: tool.parameters ?? { type: "object" }, strict: tool.strict ?? null };
+function normalizeOpenAIResponsesTool(tool: any, namespace?: string): NormalizedTool[] {
+  if (tool.type === "namespace") {
+    const qualifiedNamespace = joinOpenAIResponsesNamespacePath(tool.name, namespace);
+    if (!isOpenAIResponsesMcpNamespace(qualifiedNamespace)) return [];
+    return (tool.tools ?? []).flatMap((child: any) => normalizeOpenAIResponsesTool(child, qualifiedNamespace));
+  }
+
+  const name = qualifyOpenAIResponsesToolName(tool.name, namespace);
+
+  if (tool.type === "function") return [{ kind: "function", name, description: tool.description, inputSchema: tool.parameters ?? { type: "object" }, strict: tool.strict ?? null }];
   if (tool.type === "custom") {
-    markResponsesCustomToolName(tool.name);
-    return {
+    markResponsesCustomToolName(name);
+    return [{
       kind: "function",
-      name: tool.name,
+      name,
       description: tool.description,
       inputSchema: createResponsesCustomToolSchema(tool.format),
       strict: null,
-    };
+    }];
   }
-  return undefined;
+  return [];
 }
 
 function normalizeOpenAIResponsesToolChoice(choice: any): NormalizedToolChoice | undefined {
@@ -678,7 +694,7 @@ function denormalizeOpenAIChatMessage(message: NormalizedMessage, imageEnabled: 
         // DeepSeek-compatible string-only chat mode may reject assistant history
         // without a reasoning_content field, so keep an empty placeholder when
         // model.image is false and there is no preserved thinking text.
-        ...(!imageEnabled && !thinking ? { reasoning_content: "" } : {}),
+        ...(!imageEnabled && !thinking ? { reasoning_content: "", reasoning: "", thinking: "" } : {}),
         tool_calls: toolCalls?.length ? toolCalls : null,
       }];
     }
@@ -804,11 +820,26 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
           return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
         });
       
-      const toolCallItems = message.toolCalls?.map((toolCall) =>
-        toolCall.kind === "function"
-          ? { type: "function_call", call_id: toolCall.id, name: toolCall.name, arguments: toolCall.payload }
-          : { type: "custom_tool_call", call_id: toolCall.id, name: toolCall.name, input: toolCall.payload }
-      ) ?? [];
+      const toolCallItems = message.toolCalls?.map((toolCall) => {
+        const { name, namespace } = splitQualifiedOpenAIResponsesToolName(toolCall.name);
+        const isCustom = toolCall.kind === "custom" || (toolCall.kind === "function" && isResponsesCustomToolName(toolCall.name));
+
+        return isCustom
+          ? {
+              type: "custom_tool_call",
+              call_id: toolCall.id,
+              name,
+              ...(namespace ? { namespace } : {}),
+              input: toolCall.kind === "custom" ? toolCall.payload : unwrapResponsesCustomToolInput(toolCall.payload),
+            }
+          : {
+              type: "function_call",
+              call_id: toolCall.id,
+              name,
+              ...(namespace ? { namespace } : {}),
+              arguments: toolCall.payload,
+            };
+      }) ?? [];
       
       return [
         ...reasoningItems,
@@ -1049,6 +1080,42 @@ function denormalizeOpenAIChatResponseFormat(format: NormalizedRequest["response
 function denormalizeOpenAIResponsesFormat(format: NonNullable<NormalizedRequest["responseFormat"]>) {
   if (format.type === "text" || format.type === "json_object") return { type: format.type };
   return { type: "json_schema" as const, name: format.name, description: format.description, schema: format.schema, strict: format.strict ?? undefined };
+}
+
+function denormalizeOpenAIResponsesTools(tools: NormalizedTool[] | undefined): OpenAIResponsesRequest["tools"] {
+  if (!tools?.length) return undefined;
+
+  const denormalizedTools: any[] = [];
+  const namespaceTools = new Map<string, { type: "namespace"; name: string; description: string; tools: any[] }>();
+
+  for (const tool of tools) {
+    const { name, namespace } = splitQualifiedOpenAIResponsesToolName(tool.name);
+    const denormalizedTool =
+      tool.kind === "function"
+        ? { type: "function", name, description: tool.description ?? undefined, parameters: tool.inputSchema, strict: tool.strict ?? undefined }
+        : { type: "custom", name, description: tool.description ?? undefined, format: tool.format as never };
+
+    if (!namespace) {
+      denormalizedTools.push(denormalizedTool);
+      continue;
+    }
+
+    let namespaceTool = namespaceTools.get(namespace);
+    if (!namespaceTool) {
+      namespaceTool = {
+        type: "namespace",
+        name: namespace,
+        description: "",
+        tools: [],
+      };
+      namespaceTools.set(namespace, namespaceTool);
+      denormalizedTools.push(namespaceTool);
+    }
+
+    namespaceTool.tools.push(denormalizedTool);
+  }
+
+  return denormalizedTools as OpenAIResponsesRequest["tools"];
 }
 
 function denormalizeOpenAIChatToolChoice(choice: NormalizedToolChoice | undefined): OpenAIChatRequest["tool_choice"] {
