@@ -197,6 +197,28 @@ function denormalizeOpenAIChatMessages(messages: NormalizedMessage[], imageEnabl
     const merged: any[] = [];
     for (const message of denormalized) {
       const previous = merged.at(-1);
+      if (previous?.role === "assistant" && message?.role === "assistant") {
+        if (previous.content === null && message.content !== null) {
+          previous.content = message.content;
+        } else if (previous.content !== null && message.content !== null) {
+          previous.content = [previous.content, message.content].filter(Boolean).join("\n");
+        }
+        if (message.tool_calls?.length) {
+          previous.tool_calls = [...(previous.tool_calls ?? []), ...message.tool_calls];
+        }
+        const prevThinking = previous.thinking || previous.reasoning || previous.reasoning_content || "";
+        const msgThinking = message.thinking || message.reasoning || message.reasoning_content || "";
+        const mergedThinking = [prevThinking, msgThinking].filter(Boolean).join("\n");
+        if (mergedThinking) {
+          previous.thinking = mergedThinking;
+          previous.reasoning = mergedThinking;
+          previous.reasoning_content = mergedThinking;
+        }
+        if (message.refusal && !previous.refusal) {
+          previous.refusal = message.refusal;
+        }
+        continue;
+      }
       if (previous?.role === "user" && message?.role === "user" && typeof previous.content === "string" && typeof message.content === "string") {
         previous.content = [previous.content, message.content].filter(Boolean).join("\n");
         continue;
@@ -959,7 +981,27 @@ function reorderMessagesForAnthropicToolResults(messages: NormalizedMessage[]): 
     const pendingToolResultIds = getAnthropicPendingToolResultIds(message);
     if (pendingToolResultIds.size === 0) continue;
 
-    for (let nextIndex = index + 1; nextIndex < messages.length; nextIndex += 1) {
+    // Collect consecutive assistants that also have tool calls so their
+    // results land after the entire assistant group instead of splitting it.
+    let groupEnd = index;
+    for (let nextIdx = index + 1; nextIdx < messages.length; nextIdx += 1) {
+      if (used[nextIdx]) continue;
+      const nextMsg = messages[nextIdx];
+      if (nextMsg.role !== "assistant") break;
+      if (nextMsg.toolCalls) {
+        for (const tc of nextMsg.toolCalls) {
+          if (tc.kind === "function") {
+            pendingToolResultIds.add(tc.id);
+            if (tc.id.endsWith(":legacy")) pendingToolResultIds.add(tc.name);
+          }
+        }
+      }
+      used[nextIdx] = true;
+      reordered.push(nextMsg);
+      groupEnd = nextIdx;
+    }
+
+    for (let nextIndex = groupEnd + 1; nextIndex < messages.length; nextIndex += 1) {
       if (used[nextIndex]) continue;
       const candidate = messages[nextIndex];
       const candidateToolResultId = getAnthropicToolResultId(candidate);
@@ -993,7 +1035,20 @@ function reorderMessagesForOpenAIChatToolResults(messages: NormalizedMessage[]):
     const pendingToolResultIds = getOpenAIChatPendingToolResultIds(message);
     if (pendingToolResultIds.size === 0) continue;
 
-    for (let nextIndex = index + 1; nextIndex < messages.length; nextIndex += 1) {
+    // Collect consecutive assistants that also have tool calls so their
+    // results land after the entire assistant group instead of splitting it.
+    let groupEnd = index;
+    for (let nextIdx = index + 1; nextIdx < messages.length; nextIdx += 1) {
+      if (used[nextIdx]) continue;
+      const nextMsg = messages[nextIdx];
+      if (nextMsg.role !== "assistant") break;
+            if (nextMsg.toolCalls) { for (const tc of nextMsg.toolCalls) pendingToolResultIds.add(tc.id); }
+      used[nextIdx] = true;
+      reordered.push(nextMsg);
+      groupEnd = nextIdx;
+    }
+
+    for (let nextIndex = groupEnd + 1; nextIndex < messages.length; nextIndex += 1) {
       if (used[nextIndex]) continue;
       const candidate = messages[nextIndex];
       const candidateToolResultId = getOpenAIChatToolResultId(candidate);

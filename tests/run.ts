@@ -464,15 +464,15 @@ run("responses anthropic conversion makes tool_use and tool_result adjacent", ()
     ],
   } as any);
 
+  // consecutive assistants group: tool_use + intermediate text merge into one
+  assert.equal(result.messages.length, 2);
   assert.equal(result.messages[0].role, "assistant");
-  assert.equal(((result.messages[0].content ?? []) as Array<{ type: string }>)[0].type, "tool_use");
+  const contentArr = (result.messages[0].content ?? []) as Array<{ type: string; text?: string }>;
+  assert.equal(contentArr[0].type, "tool_use");
+  assert.equal(contentArr[1].type, "text");
+  assert.equal(contentArr[1].text, "intermediate note");
   assert.equal(result.messages[1].role, "user");
   assert.equal(((result.messages[1].content ?? []) as Array<{ type: string }>)[0].type, "tool_result");
-  assert.equal(result.messages[2].role, "assistant");
-  assert.equal(((result.messages[2].content ?? []) as Array<{ type: string; text?: string }>)[0].type, "text");
-  assert.equal(((result.messages[2].content ?? []) as Array<{ type: string; text?: string }>)[0].text, "intermediate note");
-  assert.equal(result.messages[3].role, "user");
-  assert.equal(result.messages[3].content, "go on");
 });
 
 run("responses anthropic conversion appends empty user turn when input ends with assistant", () => {
@@ -2145,6 +2145,103 @@ run("chat high reasoning maps to anthropic adaptive thinking with explicit max_t
   assert.equal(anthropic.max_tokens, 5000);
   assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
 });
+
+
+run("chat image=false merges consecutive assistants with tool calls into one", () => {
+  const chat = responsesRequestToChatParams({
+    model: "gpt-5",
+    image: false,
+    input: [
+      { type: "reasoning", summary: [{ type: "summary_text", text: "think" }], content: null, encrypted_content: null },
+      { type: "function_call", call_id: "call_a", name: "foo", arguments: "{}" },
+      { type: "function_call", call_id: "call_b", name: "bar", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_a", output: "res_a" },
+      { type: "function_call_output", call_id: "call_b", output: "res_b" },
+    ],
+  } as any);
+
+  assert.equal(chat.messages.length, 3);
+  const assistant = chat.messages[0] as any;
+  assert.equal(assistant.role, "assistant");
+  assert.equal(assistant.thinking, "think");
+  assert.equal(assistant.tool_calls.length, 2);
+  assert.equal(assistant.tool_calls[0].function.name, "foo");
+  assert.equal(assistant.tool_calls[1].function.name, "bar");
+  assert.equal(chat.messages[1].role, "tool");
+  assert.equal(chat.messages[2].role, "tool");
+});
+
+run("chat image=true merges consecutive assistants with tool calls into one", () => {
+  const chat = responsesRequestToChatParams({
+    model: "gpt-5",
+    image: true,
+    input: [
+      { type: "reasoning", summary: [{ type: "summary_text", text: "think" }], content: null, encrypted_content: null },
+      { type: "function_call", call_id: "call_a", name: "foo", arguments: "{}" },
+      { type: "function_call", call_id: "call_b", name: "bar", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_a", output: "res_a" },
+      { type: "function_call_output", call_id: "call_b", output: "res_b" },
+    ],
+  } as any);
+
+  assert.equal(chat.messages.length, 3);
+  const assistant = chat.messages[0] as any;
+  assert.equal(assistant.role, "assistant");
+  assert.equal(assistant.tool_calls.length, 2);
+  assert.equal(chat.messages[1].role, "tool");
+  assert.equal(chat.messages[2].role, "tool");
+});
+
+run("responses anthropic conversion batches consecutive assistants with tool calls", () => {
+  const result = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5",
+    input: [
+      { type: "reasoning", summary: [{ type: "summary_text", text: "think" }], content: null, encrypted_content: null },
+      { type: "function_call", call_id: "call_a", name: "foo", arguments: "{}" },
+      { type: "function_call", call_id: "call_b", name: "bar", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_a", output: "res_a" },
+      { type: "function_call_output", call_id: "call_b", output: "res_b" },
+    ],
+  } as any);
+
+  // assistant(thinking, tool_use foo, tool_use bar) + user(tool_result a, tool_result b)
+  assert.equal(result.messages.length, 2);
+  assert.equal(result.messages[0].role, "assistant");
+  const assistantContent = result.messages[0].content as Array<{ type: string }>;
+  assert.equal(assistantContent.length, 3); // thinking, tool_use foo, tool_use bar
+  assert.equal(assistantContent[0].type, "thinking");
+  assert.equal(assistantContent[1].type, "tool_use");
+  assert.equal(assistantContent[2].type, "tool_use");
+  assert.equal(result.messages[1].role, "user");
+  const userContent = result.messages[1].content as Array<{ type: string }>;
+  assert.equal(userContent.length, 2); // tool_result a, tool_result b
+  assert.equal(userContent[0].type, "tool_result");
+  assert.equal(userContent[1].type, "tool_result");
+});
+
+run("chat image=false reorder does not split consecutive assistant groups", () => {
+  // Two assistants both with tool calls, followed by both results
+  const chat = responsesRequestToChatParams({
+    model: "gpt-5",
+    image: false,
+    input: [
+      { type: "function_call", call_id: "call_1", name: "fn1", arguments: "{}" },
+      { type: "function_call", call_id: "call_2", name: "fn2", arguments: "{}" },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "intermediate text" }] },
+      { type: "function_call_output", call_id: "call_1", output: "ok1" },
+      { type: "function_call_output", call_id: "call_2", output: "ok2" },
+    ],
+  } as any);
+
+  // Should merge into: assistant(fn1, fn2, intermediate text) -> tool(ok1) -> tool(ok2)
+  assert.equal(chat.messages.length, 3);
+  assert.equal(chat.messages[0].role, "assistant");
+  assert.equal((chat.messages[0] as any).tool_calls.length, 2);
+  assert.equal((chat.messages[0] as any).content, "intermediate text");
+  assert.equal(chat.messages[1].role, "tool");
+  assert.equal(chat.messages[2].role, "tool");
+});
+
 
 run("config uses default ttfb_timeout when server section is omitted", () => {
   const configPath = writeTempConfig(`
