@@ -308,6 +308,13 @@ const SCRIPT = String.raw`
         return k >= 100 ? Math.round(k) + "K" : k.toFixed(1) + "K";
       }
 
+      function formatSpeed(tokensPerSec) {
+        if (typeof tokensPerSec !== "number" || !Number.isFinite(tokensPerSec) || tokensPerSec <= 0) return "-";
+        if (tokensPerSec >= 100) return Math.round(tokensPerSec) + " tok/s";
+        if (tokensPerSec >= 10) return tokensPerSec.toFixed(1) + " tok/s";
+        return tokensPerSec.toFixed(2) + " tok/s";
+      }
+
       function formatRate(cell) {
         return cell.totalRequests === 0 ? "-" : cell.successRate.toFixed(1) + "%";
       }
@@ -332,6 +339,7 @@ const SCRIPT = String.raw`
           ["Input", formatToken(cell.nonCacheInputTokens)],
           ["Cache", formatToken(cell.cacheReadInputTokens)],
           ["Output", formatToken(cell.outputTokens)],
+          ["平均速度", formatSpeed(cell.avgTokenSpeed)],
         ];
         for (const [label, value] of entries) {
           const dt = document.createElement("dt");
@@ -390,11 +398,13 @@ const SCRIPT = String.raw`
           acc.nonCacheInputTokens += cell.nonCacheInputTokens || 0;
           acc.cacheReadInputTokens += cell.cacheReadInputTokens || 0;
           acc.outputTokens += cell.outputTokens || 0;
+          acc.totalStreamMs += cell.totalStreamMs || 0;
           return acc;
         }, {
           nonCacheInputTokens: 0,
           cacheReadInputTokens: 0,
           outputTokens: 0,
+          totalStreamMs: 0,
         });
       }
 
@@ -427,10 +437,14 @@ const SCRIPT = String.raw`
           main.textContent = model.name;
           const usage = document.createElement("div");
           usage.className = "name-usage";
+          const aggregateSpeed = usageSummary.totalStreamMs > 0
+            ? usageSummary.outputTokens / (usageSummary.totalStreamMs / 1000)
+            : null;
           usage.textContent =
             "Input " + formatToken(usageSummary.nonCacheInputTokens) +
             " | Cache " + formatToken(usageSummary.cacheReadInputTokens) +
-            " | Output " + formatToken(usageSummary.outputTokens);
+            " | Output " + formatToken(usageSummary.outputTokens) +
+            " | " + formatSpeed(aggregateSpeed);
           name.appendChild(main);
           name.appendChild(usage);
 

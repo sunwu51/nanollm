@@ -761,11 +761,22 @@ function denormalizeOpenAIChatToolResultMessage(message: NormalizedMessage, iden
   if (imageEnabled && message.parts.some((part) => part.type === "image_url")) {
     return [{ role: "user", content: [{ type: "text", text: `Tool result for ${identifier}` }, ...message.parts.map((part) => denormalizeOpenAIChatUserPart(part, true))] }];
   }
-  return [{ role: "user", content: denormalizeOpenAIChatToolFallbackParts(message.parts, identifier) }];
-}
-
-function denormalizeOpenAIChatToolFallbackParts(parts: NormalizedMessage["parts"], identifier: string): string {
-  return [`Tool result for ${identifier}`, ...parts.map((part) => stringifyOpenAIChatPart(part, "Chat tool result fallback")).filter(Boolean)].join("\n");
+  // image=false fallback: keep tool/function role, drop multimedia content to avoid
+  // huge base64 data URLs inflating context and breaking strict API role gateways.
+  const textContent = message.parts
+    .filter((part) => part.type === "text" || part.type === "refusal")
+    .map((part) => (part as { type: "text" | "refusal"; text: string }).text)
+    .join("\n");
+  const tag = (ptype: string) =>
+    ptype === "image_url" ? "image" :
+    ptype === "input_audio" ? "audio" :
+    ptype === "document_url" || ptype === "document_base64" ? "file" : ptype;
+  const omittedTypes = [...new Set(message.parts.filter((p) => p.type !== "text" && p.type !== "refusal").map((p) => tag(p.type)))];
+  const omittedNote = omittedTypes.length > 0 ? `\n[${omittedTypes.join(", ")} content omitted - not supported by current model]` : "";
+  const content = (textContent + omittedNote) || `Tool result for ${identifier}: [multimedia content omitted - not supported by current model]`;
+  return legacyFunctionName
+    ? [{ role: "function", name: legacyFunctionName, content }]
+    : [{ role: "tool", tool_call_id: message.toolCallId ?? "", content }];
 }
 
 function denormalizeOpenAIChatUserPart(part: NormalizedMessage["parts"][number], preserveImages: boolean): any {
