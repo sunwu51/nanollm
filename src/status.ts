@@ -11,6 +11,8 @@ export interface RequestMetrics {
   ttfbSamples: number;
   totalDurationMs: number;
   durationSamples: number;
+  totalStreamMs: number;
+  streamSamples: number;
   nonCacheInputTokens: number;
   cacheReadInputTokens: number;
   outputTokens: number;
@@ -21,6 +23,7 @@ export interface StatusCell extends RequestMetrics {
   successRate: number;
   avgTtfbMs: number | null;
   avgDurationMs: number | null;
+  avgTokenSpeed: number | null;
 }
 
 type BucketMap = Map<number, RequestMetrics>;
@@ -33,6 +36,8 @@ function createEmptyMetrics(): RequestMetrics {
     ttfbSamples: 0,
     totalDurationMs: 0,
     durationSamples: 0,
+    totalStreamMs: 0,
+    streamSamples: 0,
     nonCacheInputTokens: 0,
     cacheReadInputTokens: 0,
     outputTokens: 0,
@@ -87,7 +92,14 @@ export class StatusStore {
     this.getBucket(modelName, timestamp).totalRequests += 1;
   }
 
-  recordSuccess(modelName: string, durationMs: number, ttfbMs?: number, usage?: NormalizedUsage, timestamp = Date.now()) {
+  recordSuccess(
+    modelName: string,
+    durationMs: number,
+    ttfbMs?: number,
+    usage?: NormalizedUsage,
+    timestamp = Date.now(),
+    streamDurationMs?: number,
+  ) {
     const metrics = this.getBucket(modelName, timestamp);
     metrics.successRequests += 1;
     metrics.totalDurationMs += durationMs;
@@ -96,6 +108,10 @@ export class StatusStore {
     if (typeof ttfbMs === "number" && Number.isFinite(ttfbMs)) {
       metrics.totalTtfbMs += ttfbMs;
       metrics.ttfbSamples += 1;
+    }
+    if (typeof streamDurationMs === "number" && Number.isFinite(streamDurationMs) && streamDurationMs > 0) {
+      metrics.totalStreamMs += streamDurationMs;
+      metrics.streamSamples += 1;
     }
   }
 
@@ -122,12 +138,17 @@ export class StatusStore {
     return this.listBuckets(now).map((bucketStart) => {
       const metrics = buckets?.get(bucketStart) ?? createEmptyMetrics();
       const successRate = metrics.totalRequests === 0 ? 0 : (metrics.successRequests / metrics.totalRequests) * 100;
+      let avgTokenSpeed: number | null = null;
+      if (metrics.totalStreamMs > 0 && metrics.outputTokens > 0) {
+        avgTokenSpeed = metrics.outputTokens / (metrics.totalStreamMs / 1000);
+      }
       return {
         bucketStart,
         ...metrics,
         successRate,
         avgTtfbMs: metrics.ttfbSamples > 0 ? metrics.totalTtfbMs / metrics.ttfbSamples : null,
         avgDurationMs: metrics.durationSamples > 0 ? metrics.totalDurationMs / metrics.durationSamples : null,
+        avgTokenSpeed,
       };
     });
   }

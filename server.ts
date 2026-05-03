@@ -663,7 +663,7 @@ function buildStreamReadable(
   function settleSuccess(usage?: import("./src/converters/shared.js").NormalizedUsage) {
     if (successRecorded) return;
     successRecorded = true;
-    statusStore.recordSuccess(modelName, Date.now() - timing.startedAt, timing.ttfbMs, usage, timing.startedAt);
+    const totalDuration = Date.now() - timing.startedAt; const streamDuration = totalDuration - timing.ttfbMs; statusStore.recordSuccess(modelName, totalDuration, timing.ttfbMs, usage, timing.startedAt, streamDuration);
   }
 
   return new ReadableStream({
@@ -772,7 +772,7 @@ function buildPipeStreamAndCache(
   function settleSuccess(usage?: import("./src/converters/shared.js").NormalizedUsage) {
     if (successRecorded) return;
     successRecorded = true;
-    statusStore.recordSuccess(modelName, Date.now() - timing.startedAt, timing.ttfbMs, usage, timing.startedAt);
+    const totalDuration = Date.now() - timing.startedAt; const streamDuration = totalDuration - timing.ttfbMs; statusStore.recordSuccess(modelName, totalDuration, timing.ttfbMs, usage, timing.startedAt, streamDuration);
   }
 
   return new ReadableStream({
