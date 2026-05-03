@@ -130,7 +130,7 @@ const STYLE = /* css */ String.raw`
       }
       .header, .row {
         display: grid;
-        grid-template-columns: 180px 1fr;
+        grid-template-columns: 260px 1fr;
         gap: 12px;
         align-items: center;
       }
@@ -170,7 +170,6 @@ const STYLE = /* css */ String.raw`
         display: flex;
         flex-direction: column;
         gap: 4px;
-        word-break: break-all;
       }
       .name-main {
         font-size: 14px;
@@ -241,7 +240,7 @@ const STYLE = /* css */ String.raw`
       }
       @media (max-width: 900px) {
         .header, .row {
-          grid-template-columns: 120px 1fr;
+          grid-template-columns: 160px 1fr;
         }
         .toolbar {
           align-items: flex-start;
@@ -256,7 +255,7 @@ const STYLE = /* css */ String.raw`
           border-radius: 14px;
         }
         .header, .row {
-          grid-template-columns: 100px 1fr;
+          grid-template-columns: 130px 1fr;
         }
         .range-buttons {
           width: 100%;

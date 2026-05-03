@@ -437,13 +437,15 @@ const SCRIPT = /* js */ String.raw`
         statusEl.textContent = text || "";
       }
 
-      function focusPendingTarget() {
+      function focusPendingTarget({ scrollToFocus = true } = {}) {
         if (!pendingFocusTarget) return;
         const target = document.querySelector("[data-focus-id=\"" + pendingFocusTarget + "\"]");
         if (!target) return;
         pendingFocusTarget = null;
         requestAnimationFrame(() => {
-          target.scrollIntoView({ behavior: "smooth", block: "center" });
+          if (scrollToFocus) {
+            target.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
           target.focus({ preventScroll: true });
         });
       }
@@ -718,7 +720,7 @@ const SCRIPT = /* js */ String.raw`
               }
               markDirty(true);
               pendingFocusTarget = "model-name-" + model._id;
-              renderAll();
+              renderAll({ preserveScroll: true, scrollToFocus: false });
             },
           });
           bindField(grid, "provider", {
@@ -815,7 +817,7 @@ const SCRIPT = /* js */ String.raw`
               group.name = value;
               markDirty(true);
               pendingFocusTarget = "fallback-name-" + group._id;
-              renderAll();
+              renderAll({ preserveScroll: true, scrollToFocus: false });
             },
           });
           card.appendChild(grid);
@@ -955,12 +957,18 @@ const SCRIPT = /* js */ String.raw`
         });
       }
 
-      function renderAll() {
+      function renderAll({ preserveScroll = false, scrollToFocus = true } = {}) {
+        const scrollX = window.scrollX;
+        const scrollY = window.scrollY;
         renderSnapshotMeta();
         renderGlobalFields();
         renderModels();
         renderFallbackGroups();
-        focusPendingTarget();
+        if (preserveScroll) window.scrollTo(scrollX, scrollY);
+        focusPendingTarget({ scrollToFocus });
+        if (preserveScroll) {
+          requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
+        }
       }
 
       async function refreshFromServer() {
