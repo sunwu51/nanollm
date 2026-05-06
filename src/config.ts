@@ -13,6 +13,7 @@ export interface ModelConfig {
   model: string;
   image?: boolean;
   ttfb_timeout?: number;
+  proxy?: string;
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
 }
@@ -38,6 +39,12 @@ export interface MaterializeConfigOptions {
   port?: number;
   ttfb_timeout?: number;
   recordMaxSize?: number;
+}
+
+export interface ResolvedModelMatch {
+  model: ModelConfig;
+  captured: string;
+  wildcard: boolean;
 }
 
 export function getPublicModelNames(config: ServerConfig): string[] {
@@ -92,6 +99,26 @@ function normalizePositiveInteger(value: unknown, fieldName: string): number | u
   return normalized;
 }
 
+function normalizeProxyUrl(value: unknown, fieldName: string): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+
+  const proxy = String(value).trim();
+  if (!proxy) return undefined;
+
+  let url: URL;
+  try {
+    url = new URL(proxy);
+  } catch {
+    throw new Error(`'${fieldName}' must be a valid URL`);
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`'${fieldName}' must use http:// or https://`);
+  }
+
+  return proxy;
+}
+
 function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): ModelConfig {
   const headers =
     model.headers && typeof model.headers === "object"
@@ -103,14 +130,28 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
       : undefined;
   const ttfb_timeout = normalizeTimeout(model.ttfb_timeout, `models.${model.name || "<unknown>"}.ttfb_timeout`) ?? defaultTTFBTimeout;
   const image = model.image === undefined ? true : !!model.image;
+  const proxy = normalizeProxyUrl(model.proxy, `models.${model.name || "<unknown>"}.proxy`);
 
   return {
     ...model,
     image,
+    proxy,
     ...(ttfb_timeout !== undefined ? { ttfb_timeout } : {}),
     ...(headers ? { headers } : {}),
     ...(body ? { body } : {}),
   };
+}
+
+function getWildcardPrefix(name: string): string | undefined {
+  if (!name.endsWith("*")) return undefined;
+  return name.slice(0, -1);
+}
+
+function assertValidModelNamePattern(name: string) {
+  const firstWildcard = name.indexOf("*");
+  if (firstWildcard !== -1 && firstWildcard !== name.length - 1) {
+    throw new Error(`Model '${name}' has invalid wildcard name. '*' must appear only once and at the end`);
+  }
 }
 
 function parseDocument(rawText: string, options?: { resolveEnv?: boolean }): ParsedConfigDocument {
@@ -166,6 +207,31 @@ export function resolveModel(config: ServerConfig, name: string): ModelConfig | 
   return config.models.find((m) => m.name === name);
 }
 
+export function resolveModelForRequest(config: ServerConfig, name: string): ResolvedModelMatch | undefined {
+  const exact = resolveModel(config, name);
+  if (exact) return { model: exact, captured: "", wildcard: false };
+
+  let best: { model: ModelConfig; prefix: string } | undefined;
+  for (const model of config.models) {
+    const prefix = getWildcardPrefix(model.name);
+    if (prefix === undefined || !name.startsWith(prefix)) continue;
+    if (!best || prefix.length > best.prefix.length) {
+      best = { model, prefix };
+    }
+  }
+
+  if (!best) return undefined;
+  const captured = name.slice(best.prefix.length);
+  return {
+    model: {
+      ...best.model,
+      model: best.model.model.replaceAll("*", captured),
+    },
+    captured,
+    wildcard: true,
+  };
+}
+
 export function resolveFallbackModels(config: ServerConfig, name: string): string[] {
   if (name in config.fallback) return config.fallback[name];
   return [name];
@@ -176,6 +242,7 @@ function validateFallback(models: ModelConfig[], fallback: Record<string, string
   const duplicateNames = new Set<string>();
 
   for (const model of models) {
+    assertValidModelNamePattern(model.name);
     if (duplicateNames.has(model.name)) {
       throw new Error(`Duplicate model name '${model.name}'`);
     }

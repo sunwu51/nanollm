@@ -1,18 +1,19 @@
 // @ts-nocheck
 import "dotenv/config";
-import { existsSync, renameSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { randomUUID } from "node:crypto";
 import type { ModelConfig, ServerConfig } from "./src/config.js";
-import { getPublicModelNames, parseConfigText, parseSourceConfigDocument, resolveFallbackModels, resolveModel } from "./src/config.js";
+import { getPublicModelNames, parseConfigText, parseSourceConfigDocument, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/config.js";
 import { ConfigManager } from "./src/config-manager.js";
 import { getUpstreamURL } from "./src/proxy.js";
 import { forwardRequest, forwardStreamRequest, passthroughRequest, passthroughStreamRequest } from "./src/proxy.js";
 import { sortFallbackGroupMembers } from "./src/fallback.js";
-import { StatusStore } from "./src/status.js";
+import { SqliteStatusStore, StatusStore, type StatusStoreLike } from "./src/status.js";
 import { renderStatusPage } from "./src/status-page.js";
 import { renderRecordPage } from "./src/record-page.js";
 import { renderAdminConfigPage } from "./src/admin-config-page.js";
@@ -35,12 +36,15 @@ import {
   appendRecordedClientResponseBody,
   beginRecordedRequest,
   configureRecording,
+  finalizeRecordedRequest,
+  flushRecording,
   getRecordedRequest,
   getRecordSummary,
   startRecording,
   setRecordedClientResponseBody,
   setRecordedClientResponseMeta,
   setRecordedRequestError,
+  useSqliteRecordStore,
 } from "./src/record.js";
 import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
@@ -79,9 +83,54 @@ function resolveConfigPath(argv: string[]): string {
   );
 }
 
-const configPath = resolveConfigPath(process.argv.slice(2));
+type StorageMode = "memory" | "sqlite";
+
+function resolveStorageMode(argv: string[]): StorageMode {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    let value: string | undefined;
+    if (arg === "--storage") {
+      value = argv[index + 1];
+      if (!value) throw new Error("Missing value for --storage");
+    } else if (arg.startsWith("--storage=")) {
+      value = arg.slice("--storage=".length);
+      if (!value) throw new Error("Missing value for --storage");
+    }
+    if (value !== undefined) {
+      if (value === "memory" || value === "sqlite") return value;
+      throw new Error(`Invalid --storage value '${value}'. Expected 'memory' or 'sqlite'.`);
+    }
+  }
+  return "memory";
+}
+
+async function openSqliteDatabase(dbPath: string) {
+  mkdirSync(dirname(dbPath), { recursive: true });
+  try {
+    const sqlite = await import("node:sqlite");
+    const db = new sqlite.DatabaseSync(dbPath);
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA busy_timeout = 5000;
+    `);
+    return db;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to initialize SQLite storage. Use --storage memory or run nanollm with a Node.js version that supports node:sqlite. Cause: ${message}`);
+  }
+}
+
+const startupArgs = process.argv.slice(2);
+const configPath = resolveConfigPath(startupArgs);
+const storageMode = resolveStorageMode(startupArgs);
+const sqlitePath = join(homedir(), ".nanollm", "nanollm.sqlite3");
+const sqliteDb = storageMode === "sqlite" ? await openSqliteDatabase(sqlitePath) : undefined;
 const configManager = new ConfigManager(configPath);
 const startupSnapshot = configManager.getActiveSnapshot();
+if (sqliteDb) {
+  useSqliteRecordStore(sqliteDb);
+}
 startRecording({ maxSize: startupSnapshot.effectiveConfig.record.max_size });
 configManager.onUpdate(({ snapshot }, source) => {
   configureRecording({ maxSize: snapshot.effectiveConfig.record.max_size });
@@ -166,7 +215,7 @@ type AdminConfigForm = {
 
 const FAILURE_WINDOW_MS = 5 * 60 * 1000;
 const modelFailures = new Map<string, number[]>();
-const statusStore = new StatusStore();
+const statusStore: StatusStoreLike = sqliteDb ? new SqliteStatusStore(sqliteDb) : new StatusStore();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
 
@@ -376,13 +425,14 @@ function orange(message: string): string {
 function getCandidateModels(config: ServerConfig, primaryModel: string): ModelConfig[] {
   const now = Date.now();
   const isFallbackGroup = primaryModel in config.fallback;
-  const candidateNames = isFallbackGroup
-    ? sortFallbackGroupMembers(resolveFallbackModels(config, primaryModel), (name) => getModelFailureCount(name, now))
-    : resolveFallbackModels(config, primaryModel);
+  if (isFallbackGroup) {
+    return sortFallbackGroupMembers(resolveFallbackModels(config, primaryModel), (name) => getModelFailureCount(name, now))
+      .map((name) => resolveModel(config, name))
+      .filter((model): model is ModelConfig => Boolean(model));
+  }
 
-  return candidateNames
-    .map((name) => resolveModel(config, name))
-    .filter((model): model is ModelConfig => Boolean(model));
+  const match = resolveModelForRequest(config, primaryModel);
+  return match ? [match.model] : [];
 }
 
 async function executeModelRequest(
@@ -501,17 +551,18 @@ function createRoute(incomingFormat: StreamFormat) {
       setRecordedRequestError({ message: "Missing 'model' in request body" });
       setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
       setRecordedClientResponseBody({ body: { error: "Missing 'model' in request body" } });
+      finalizeRecordedRequest({});
       return response;
     }
 
-    const requestedModel = resolveModel(config, modelName);
-    const requestedFallbackGroup = config.fallback[modelName];
-    if (!requestedModel && !requestedFallbackGroup) {
+    const candidateModels = getCandidateModels(config, modelName);
+    if (candidateModels.length === 0) {
       const errorBody = { error: `Model '${modelName}' not found in config`, available: getPublicModelNames(config) };
       const response = c.json(errorBody, 404);
       setRecordedRequestError({ message: errorBody.error });
       setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
       setRecordedClientResponseBody({ body: errorBody });
+      finalizeRecordedRequest({});
       return response;
     }
 
@@ -520,7 +571,6 @@ function createRoute(incomingFormat: StreamFormat) {
       rawBody.input = resolveItemReferences(rawBody.input);
     }
 
-    const candidateModels = getCandidateModels(config, modelName);
     let lastError: (Error & { status?: number; upstream?: string; cause?: unknown }) | undefined;
 
     try {
@@ -578,6 +628,7 @@ function createRoute(incomingFormat: StreamFormat) {
           const response = c.json(result.json);
           setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
           setRecordedClientResponseBody({ body: result.json });
+          finalizeRecordedRequest({});
           return response;
         } catch (error) {
           const err = error as Error & { status?: number; upstream?: string; cause?: unknown };
@@ -611,6 +662,7 @@ function createRoute(incomingFormat: StreamFormat) {
       const response = c.json(errorBody, status);
       setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
       setRecordedClientResponseBody({ body: errorBody });
+      finalizeRecordedRequest({});
       return response;
     }
 
@@ -618,6 +670,7 @@ function createRoute(incomingFormat: StreamFormat) {
     const response = c.json({ error: "Request failed" }, 500);
     setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
     setRecordedClientResponseBody({ body: { error: "Request failed" } });
+    finalizeRecordedRequest({});
     return response;
   };
 }
@@ -657,6 +710,7 @@ function buildStreamReadable(
   let cancelled = false;
   let finished = false;
   let successRecorded = false;
+  let recordFinalized = false;
   const cachedRequestId = getRequestId();
   let cancelPromise: Promise<void> | undefined;
 
@@ -664,6 +718,12 @@ function buildStreamReadable(
     if (successRecorded) return;
     successRecorded = true;
     const totalDuration = Date.now() - timing.startedAt; const streamDuration = totalDuration - timing.ttfbMs; statusStore.recordSuccess(modelName, totalDuration, timing.ttfbMs, usage, timing.startedAt, streamDuration);
+  }
+
+  function finalizeRecord() {
+    if (recordFinalized) return;
+    recordFinalized = true;
+    finalizeRecordedRequest({});
   }
 
   return new ReadableStream({
@@ -682,6 +742,7 @@ function buildStreamReadable(
             }
             const usage = usageCollector.finish();
             settleSuccess(usage);
+            finalizeRecord();
             console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms`));
             controller.close();
             return;
@@ -703,6 +764,7 @@ function buildStreamReadable(
         if (shouldIgnoreStreamReadError(error, { cancelled, completed })) {
           if (completed) {
             settleSuccess(usageCollector.getLatestUsage());
+            finalizeRecord();
             console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (reader released after completion)`));
             try {
               controller.close();
@@ -711,6 +773,7 @@ function buildStreamReadable(
           return;
         }
         statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
+        finalizeRecord();
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);
       }
@@ -720,8 +783,10 @@ function buildStreamReadable(
       cancelled = true;
       if (usageCollector.hasCompleted()) {
         settleSuccess(usageCollector.getLatestUsage());
+        finalizeRecord();
         console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (client closed after completion)`, cachedRequestId));
       } else {
+        finalizeRecord();
         console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`, cachedRequestId));
       }
       cancelPromise = reader.cancel(reason).catch((error) => {
@@ -755,6 +820,7 @@ function buildPipeStreamAndCache(
   let cancelled = false;
   let finished = false;
   let successRecorded = false;
+  let recordFinalized = false;
   const cachedRequestId = getRequestId();
   let cancelPromise: Promise<void> | undefined;
 
@@ -773,6 +839,12 @@ function buildPipeStreamAndCache(
     if (successRecorded) return;
     successRecorded = true;
     const totalDuration = Date.now() - timing.startedAt; const streamDuration = totalDuration - timing.ttfbMs; statusStore.recordSuccess(modelName, totalDuration, timing.ttfbMs, usage, timing.startedAt, streamDuration);
+  }
+
+  function finalizeRecord() {
+    if (recordFinalized) return;
+    recordFinalized = true;
+    finalizeRecordedRequest({});
   }
 
   return new ReadableStream({
@@ -803,6 +875,7 @@ function buildPipeStreamAndCache(
             cacheResponseItems(outputItems);
             const usage = usageCollector.finish();
             settleSuccess(usage);
+            finalizeRecord();
             console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms`));
             controller.close();
             return;
@@ -832,6 +905,7 @@ function buildPipeStreamAndCache(
         if (shouldIgnoreStreamReadError(error, { cancelled, completed })) {
           if (completed) {
             settleSuccess(usageCollector.getLatestUsage());
+            finalizeRecord();
             console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (reader released after completion)`));
             try {
               controller.close();
@@ -840,6 +914,7 @@ function buildPipeStreamAndCache(
           return;
         }
         statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
+        finalizeRecord();
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);
       }
@@ -849,8 +924,10 @@ function buildPipeStreamAndCache(
       cancelled = true;
       if (usageCollector.hasCompleted()) {
         settleSuccess(usageCollector.getLatestUsage());
+        finalizeRecord();
         console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (client closed after completion)`, cachedRequestId));
       } else {
+        finalizeRecord();
         console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`, cachedRequestId));
       }
       cancelPromise = reader.cancel(reason).catch((error) => {
@@ -982,6 +1059,7 @@ app.post("/v1/messages", createRoute("anthropic"));
 const startupConfig = startupSnapshot.effectiveConfig;
 const server = serve({ fetch: app.fetch, port: startupConfig.port }, (info) => {
   console.log(`nanollm gateway listening on http://localhost:${info.port}`);
+  console.log(`Storage: ${storageMode}${sqliteDb ? ` (${sqlitePath})` : ""}`);
   console.log(`Models: ${startupConfig.models.map((m) => m.name).join(", ") || "(none)"}`);
   console.log(
     `Fallback groups: ${
@@ -1001,6 +1079,8 @@ server.once("error", (error: Error & { code?: string }) => {
 
 server.once("close", () => {
   configManager.dispose();
+  flushRecording();
+  sqliteDb?.close();
 });
 
 export { server };

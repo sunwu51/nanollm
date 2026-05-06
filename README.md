@@ -43,6 +43,7 @@ models:
     model: glm5.1
     image: true # optional, default true; only effective for openai-chat provider
     ttfb_timeout: 3000 # optional, overrides server.ttfb_timeout
+    proxy: http://127.0.0.1:7890 # optional, overrides HTTPS_PROXY/HTTP_PROXY for this model
     headers:
       user-agent: nanollm
     body:
@@ -78,6 +79,83 @@ gpt-5.4
 ```
 这样5个模型，其中`gpt-5.4`是兜底分组名，当使用这个模型的时候，会在下属列表的模型中寻找可用的模型，尝试顺序为按`max(0, 最近5min失败次数-1)`升序；如果分数相同，则保持配置里的原始顺序。
 
+### 模型级 HTTP proxy
+
+`models[*].proxy` 可以为单个模型配置请求下游供应商时使用的 HTTP proxy URL：
+
+```yaml
+models:
+  - name: claude-sonnet
+    provider: anthropic
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY
+    model: claude-sonnet-4-6
+    proxy: http://127.0.0.1:7890
+```
+
+代理优先级为：
+
+1. `models[*].proxy`
+2. `HTTPS_PROXY`
+3. `HTTP_PROXY`
+4. 直连
+
+当 `proxy` 为空字符串或未配置时，会继续回退到环境变量；当前支持 `http://` 和 `https://` 代理 URL。
+
+### 模型名通配符 `*`
+
+`models[*].name` 支持后缀通配写法，可以把一类未显式配置的模型名路由到同一个上游配置：
+
+```yaml
+models:
+  - name: gpt-*
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY
+    model: openai/gpt-*
+
+  - name: gpt-5.5-a
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY
+    model: openai/gpt-5.5
+
+  - name: "*"
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY
+    model: fallback-model
+
+fallback:
+  gpt-5.5:
+    - gpt-5.5-a
+```
+
+规则：
+
+- `*` 必须只出现一次，并且只能放在结尾。合法例子：`gpt-*`、`claude-*`、`*`；非法例子：`gpt-*-x`、`g*p*t`、`gpt**`。
+- 匹配优先级是：精确 fallback 分组名 > 精确 model 名 > 通配 model 名。
+- 如果多个通配 model 都能匹配，选择 `*` 前缀最长的那个；前缀长度相同则按 `models` 配置顺序。
+- 单独的 `*` 可以匹配任意请求模型名，适合作为最后兜底。
+- `/v1/models` 会直接展示配置中的通配名称，例如 `gpt-*` 和 `*`。
+
+以上面配置为例：
+
+- 请求 `gpt-5.5`：优先命中 fallback 分组 `gpt-5.5`。
+- 请求 `gpt-5.5-a`：命中同名 model `gpt-5.5-a`。
+- 请求 `gpt-5.6`：没有同名分组或同名 model，于是命中 `gpt-*`。
+- 请求 `llama-4`：命中最后的 `*`。
+
+通配命中时，下游 `model` 字段里的 `*` 会被替换为请求中被 `models[*].name` 捕获的部分。例如：
+
+- `name: gpt-*`
+- 请求模型名：`gpt-5.6`
+- 捕获部分：`5.6`
+- `model: openai/gpt-*`
+- 实际发给上游的 `model`：`openai/gpt-5.6`
+
+如果下游 `model` 中没有 `*`，则始终使用固定模型名；如果下游 `model` 中有多个 `*`，会全部替换为同一个捕获部分。
+
 ### `openai-chat` 的图片兼容选项
 
 `models[*].image` 目前只对 `provider: openai-chat` 生效，主要用于兼容不同 OpenAI-compatible chat 服务对图片输入的支持差异。默认值为 `true`。
@@ -110,6 +188,13 @@ gpt-5.4
 npx nanollm --config /path/to/config.yaml
 ```
 
+如果希望 `/status` 和 `/record` 跨进程重启保留最近数据，可以启用 SQLite 存储：
+```bash
+npx nanollm --config /path/to/config.yaml --storage sqlite
+```
+
+不传 `--storage` 时默认使用 `memory`，行为与旧版本一致。SQLite 文件固定保存在 `~/.nanollm/nanollm.sqlite3`。
+
 如果当前目录就有 `config.yaml`，也可以直接运行：
 ```bash
 npx nanollm
@@ -140,4 +225,4 @@ npx nanollm
 
 提供了`http://localhost:3000/record`的采样记录页面，可以查看请求记录，对debug非常有用（默认只保留最新10次请求，可通过`record.max_size`配置修改）。
 
-上述数据都只存在内存中，进程结束即消失，作为一个超轻量工具，没有任何持久化存储。
+默认情况下，上述数据都只存在内存中，进程结束即消失。使用 `--storage sqlite` 启动后，`/status` 会在 SQLite 中保留最近 1 个月的稀疏 5 分钟统计 bucket（页面仍只展示最近 6 小时），`/record` 会持久化最近 `record.max_size` 条请求记录。

@@ -517,11 +517,7 @@ const SCRIPT = String.raw`
       const requestIdOptionsEl = document.getElementById("${REQUEST_ID_DATALIST_ID}");
 
       function normalizeRequestIdInput(value) {
-        return value
-          .trim()
-          .replace(/^.*requestId=/i, "")
-          .replace(/^[\s\[("']+/, "")
-          .replace(/[\s,\])"']+$/, "");
+        return value.trim();
       }
 
       function setRequestIdOptions(summary) {
@@ -1565,7 +1561,7 @@ function RecordPage({ summary }: { summary: RecordSummary }) {
         <div class="toolbar">
           <div>
             <label for="request-id">requestId</label>
-            <input id="request-id" name="requestId" list={REQUEST_ID_DATALIST_ID} placeholder="例如 6dfae2" />
+            <input id="request-id" name="requestId" list={REQUEST_ID_DATALIST_ID} placeholder="例如 6dfae2ab-1234-5678-9abc-def012345678" />
             <datalist id={REQUEST_ID_DATALIST_ID}></datalist>
           </div>
           <div class="actions">

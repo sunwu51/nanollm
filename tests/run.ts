@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   anthropicMessageRequestToChatParams,
@@ -19,12 +20,12 @@ import {
   responsesResponseToAnthropicMessage,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
-import { getPublicModelNames, loadConfig, resolveFallbackModels } from "../src/config.js";
+import { getPublicModelNames, loadConfig, resolveFallbackModels, resolveModelForRequest } from "../src/config.js";
 import { renderAdminConfigPage } from "../src/admin-config-page.js";
 import { ConfigManager } from "../src/config-manager.js";
 import { sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
-import { passthroughRequest, passthroughStreamRequest } from "../src/proxy.js";
+import { forwardRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
 import { renderRecordPage } from "../src/record-page.js";
 import { handleServerStartupError } from "../src/startup-error.js";
 import {
@@ -33,6 +34,7 @@ import {
   beginRecordedRequest,
   configureRecording,
   ensureRecordedAttempt,
+  finalizeRecordedRequest,
   getRecordedRequest,
   getRecordSummary,
   setRecordedAttemptResponseBody,
@@ -42,9 +44,11 @@ import {
   setRecordedRequestError,
   startRecording,
   stopRecording,
+  useMemoryRecordStore,
+  useSqliteRecordStore,
 } from "../src/record.js";
 import { runWithRequestId } from "../src/request-context.js";
-import { StatusStore, getHealthTone } from "../src/status.js";
+import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/status.js";
 import { shouldIgnoreStreamReadError } from "../src/stream-errors.js";
 
 function run(name: string, fn: () => void) {
@@ -1617,7 +1621,7 @@ run("anthropic image tool_result becomes chat user multimodal fallback when imag
   assert.equal(fallback.content[1].image_url?.url, "https://example.com/tool.png");
 });
 
-run("anthropic image tool_result becomes chat user string fallback when image is disabled", () => {
+run("anthropic image tool_result stays chat tool string fallback when image is disabled", () => {
   const result = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -1640,10 +1644,10 @@ run("anthropic image tool_result becomes chat user string fallback when image is
     ],
   } as any);
 
-  const fallback = result.messages[1] as { role: string; content: string };
-  assert.equal(fallback.role, "user");
-  assert.match(fallback.content, /Tool result for call_img/);
-  assert.match(fallback.content, /Attached image: https:\/\/example\.com\/tool\.png/);
+  const fallback = result.messages[1] as { role: string; tool_call_id: string; content: string };
+  assert.equal(fallback.role, "tool");
+  assert.equal(fallback.tool_call_id, "call_img");
+  assert.match(fallback.content, /\[image content omitted - not supported by current model\]/);
 });
 
 run("chat tool result round-trip through anthropic preserves tool id", () => {
@@ -2284,6 +2288,99 @@ models:
   }
 });
 
+run("config normalizes model proxy url", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+    proxy: " http://127.0.0.1:7890 "
+  - name: beta
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-beta
+    proxy: ""
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.equal(config.models[0].proxy, "http://127.0.0.1:7890");
+    assert.equal(config.models[1].proxy, undefined);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+for (const invalidProxy of ["not-a-url", "socks://127.0.0.1:1080"]) {
+  runThrows(`config rejects invalid model proxy ${invalidProxy}`, () => {
+    const configPath = writeTempConfig(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+    proxy: "${invalidProxy}"
+`);
+
+    try {
+      loadConfig(configPath);
+    } finally {
+      rmSync(dirname(configPath), { recursive: true, force: true });
+    }
+  }, invalidProxy === "not-a-url" ? "'models.alpha.proxy' must be a valid URL" : "'models.alpha.proxy' must use http:// or https://");
+}
+
+run("model proxy has higher priority than environment proxy", () => {
+  const previousHTTPSProxy = process.env.HTTPS_PROXY;
+  const previousHTTPProxy = process.env.HTTP_PROXY;
+
+  try {
+    process.env.HTTPS_PROXY = "http://env-https-proxy.example:8080";
+    process.env.HTTP_PROXY = "http://env-http-proxy.example:8080";
+
+    assert.equal(resolveProxyUrl({
+      name: "alpha",
+      provider: "openai-chat",
+      base_url: "https://example.com/v1",
+      api_key: "test-key",
+      model: "upstream-alpha",
+      proxy: "http://model-proxy.example:7890",
+    }), "http://model-proxy.example:7890");
+
+    assert.equal(resolveProxyUrl({
+      name: "beta",
+      provider: "openai-chat",
+      base_url: "https://example.com/v1",
+      api_key: "test-key",
+      model: "upstream-beta",
+    }), "http://env-https-proxy.example:8080");
+
+    delete process.env.HTTPS_PROXY;
+    assert.equal(resolveProxyUrl({
+      name: "gamma",
+      provider: "openai-chat",
+      base_url: "https://example.com/v1",
+      api_key: "test-key",
+      model: "upstream-gamma",
+    }), "http://env-http-proxy.example:8080");
+  } finally {
+    if (previousHTTPSProxy === undefined) {
+      delete process.env.HTTPS_PROXY;
+    } else {
+      process.env.HTTPS_PROXY = previousHTTPSProxy;
+    }
+    if (previousHTTPProxy === undefined) {
+      delete process.env.HTTP_PROXY;
+    } else {
+      process.env.HTTP_PROXY = previousHTTPProxy;
+    }
+  }
+});
+
 run("config applies server-level ttfb_timeout and model override", () => {
   const configPath = writeTempConfig(`
 server:
@@ -2396,6 +2493,131 @@ fallback:
     const config = loadConfig(configPath);
     assert.deepEqual(resolveFallbackModels(config, "group-a"), ["alpha", "beta"]);
     assert.deepEqual(resolveFallbackModels(config, "group-b"), ["beta", "gamma"]);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+run("config accepts suffix wildcard model names and exposes them publicly", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: gpt-*
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: openai/gpt-*
+  - name: claude-*
+    provider: anthropic
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: anthropic/claude-*
+  - name: "*"
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: catchall
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.deepEqual(getPublicModelNames(config), ["gpt-*", "claude-*", "*"]);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+for (const invalidName of ["gpt-*-x", "g*p*t", "gpt**"]) {
+  runThrows(`config rejects invalid wildcard model name ${invalidName}`, () => {
+    const configPath = writeTempConfig(`
+models:
+  - name: "${invalidName}"
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+`);
+
+    try {
+      loadConfig(configPath);
+    } finally {
+      rmSync(dirname(configPath), { recursive: true, force: true });
+    }
+  }, `Model '${invalidName}' has invalid wildcard name. '*' must appear only once and at the end`);
+}
+
+run("model request resolution prefers exact names before wildcard fallbacks", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: gpt-*
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: openai/gpt-*
+  - name: gpt-5.5-a
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: exact-a
+  - name: group-member
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: exact-group
+fallback:
+  gpt-5.5:
+    - group-member
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.deepEqual(resolveFallbackModels(config, "gpt-5.5"), ["group-member"]);
+
+    const exact = resolveModelForRequest(config, "gpt-5.5-a");
+    assert.equal(exact?.model.name, "gpt-5.5-a");
+    assert.equal(exact?.model.model, "exact-a");
+    assert.equal(exact?.wildcard, false);
+
+    const wildcard = resolveModelForRequest(config, "gpt-5.6");
+    assert.equal(wildcard?.model.name, "gpt-*");
+    assert.equal(wildcard?.model.model, "openai/gpt-5.6");
+    assert.equal(wildcard?.captured, "5.6");
+    assert.equal(wildcard?.wildcard, true);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+run("model request resolution uses the longest wildcard prefix and replaces all downstream wildcards", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: gpt-*
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: openai/gpt-*
+  - name: gpt-5.*
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: mirror/*/*
+  - name: "*"
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: catchall-*
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    const match = resolveModelForRequest(config, "gpt-5.6");
+    assert.equal(match?.model.name, "gpt-5.*");
+    assert.equal(match?.captured, "6");
+    assert.equal(match?.model.model, "mirror/6/6");
+
+    const catchall = resolveModelForRequest(config, "llama");
+    assert.equal(catchall?.model.name, "*");
+    assert.equal(catchall?.captured, "llama");
+    assert.equal(catchall?.model.model, "catchall-llama");
   } finally {
     rmSync(dirname(configPath), { recursive: true, force: true });
   }
@@ -2734,6 +2956,84 @@ await runAsync("stream request only enforces ttfb_timeout until response starts"
   });
 });
 
+await runAsync("wildcard downstream model replacement is used by passthrough requests", async () => {
+  let upstreamBody: any;
+  await withHTTPServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ id: "resp_1", usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+    });
+  }, async (baseURL) => {
+    const configPath = writeTempConfig(`
+models:
+  - name: gpt-*
+    provider: openai-chat
+    base_url: ${baseURL}
+    api_key: test-key
+    model: openai/gpt-*
+`);
+
+    try {
+      const config = loadConfig(configPath);
+      const match = resolveModelForRequest(config, "gpt-5.6");
+      assert.ok(match);
+      await passthroughRequest(match.model, {
+        model: "gpt-5.6",
+        messages: [{ role: "user", content: "hello" }],
+      });
+      assert.equal(upstreamBody.model, "openai/gpt-5.6");
+    } finally {
+      rmSync(dirname(configPath), { recursive: true, force: true });
+    }
+  });
+});
+
+await runAsync("wildcard downstream model replacement is used by converted requests", async () => {
+  let upstreamBody: any;
+  await withHTTPServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl_1",
+        created: 1,
+        model: upstreamBody.model,
+        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      }));
+    });
+  }, async (baseURL) => {
+    const configPath = writeTempConfig(`
+models:
+  - name: gpt-*
+    provider: openai-chat
+    base_url: ${baseURL}
+    api_key: test-key
+    model: openai/gpt-*
+`);
+
+    try {
+      const config = loadConfig(configPath);
+      const match = resolveModelForRequest(config, "gpt-5.6");
+      assert.ok(match);
+      await forwardRequest(match.model, {
+        model: "gpt-5.6",
+        sourceFormat: "openai-responses",
+        stream: false,
+        messages: [{ role: "user", parts: [{ type: "text", text: "hello" }] }],
+      });
+      assert.equal(upstreamBody.model, "openai/gpt-5.6");
+    } finally {
+      rmSync(dirname(configPath), { recursive: true, force: true });
+    }
+  });
+});
+
 run("status store aggregates success rate and averages by five-minute bucket", () => {
   const store = new StatusStore();
   const bucketStart = Date.UTC(2026, 3, 19, 4, 0, 0);
@@ -2774,6 +3074,48 @@ run("status store keeps only the last 6 hours of buckets", () => {
   assert.equal(series.length, 72);
   assert.equal(series.some((cell) => cell.bucketStart === expired && cell.totalRequests > 0), false);
   assert.equal(series.at(-1)?.totalRequests, 1);
+});
+
+run("sqlite status store persists sparse buckets for a month while UI series stays at 6 hours", () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-status-"));
+  const db = new DatabaseSync(join(dir, "status.sqlite3"));
+  try {
+    const now = Date.UTC(2026, 3, 30, 12, 0, 0);
+    const visibleBucket = now - 5 * 60 * 1000;
+    const retainedButHidden = now - 7 * 60 * 60 * 1000;
+    const expired = now - 31 * 24 * 60 * 60 * 1000;
+    const store = new SqliteStatusStore(db);
+
+    store.recordAttempt("alpha", visibleBucket);
+    store.recordSuccess("alpha", 120, 40, {
+      nonCacheInputTokens: 1200,
+      cacheReadInputTokens: 300,
+      outputTokens: 450,
+    }, visibleBucket, 9000);
+    store.recordAttempt("alpha", retainedButHidden);
+    store.recordSuccess("alpha", 200, 50, undefined, retainedButHidden);
+    store.recordAttempt("alpha", expired);
+
+    const restarted = new SqliteStatusStore(db);
+    const visibleCell = restarted.getModelSeries("alpha", now).find((cell) => cell.bucketStart === visibleBucket);
+    assert.ok(visibleCell);
+    assert.equal(visibleCell.totalRequests, 1);
+    assert.equal(visibleCell.successRequests, 1);
+    assert.equal(visibleCell.avgTtfbMs, 40);
+    assert.equal(visibleCell.avgDurationMs, 120);
+    assert.equal(visibleCell.outputTokens, 450);
+    assert.equal(visibleCell.avgTokenSpeed, 50);
+    assert.equal(restarted.getModelSeries("alpha", now).some((cell) => cell.bucketStart === retainedButHidden && cell.totalRequests > 0), false);
+    assert.equal(restarted.hasBucket("alpha", retainedButHidden), true);
+    assert.equal(restarted.hasBucket("alpha", expired), false);
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS count FROM status_buckets WHERE model_name = 'alpha'").get() as { count: number }).count,
+      2,
+    );
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 run("record store resets on start and supports full request id lookup", () => {
@@ -2821,8 +3163,8 @@ run("record store resets on start and supports full request id lookup", () => {
 
   const record = getRecordedRequest(requestId);
   assert.ok(record);
-  assert.equal(getRecordedRequest("abcdef")?.requestId, requestId);
-  assert.equal(getRecordedRequest("requestId=abcdef")?.requestId, requestId);
+  assert.equal(getRecordedRequest(requestId)?.requestId, requestId);
+  assert.equal(getRecordedRequest("abcdef"), undefined);
   assert.equal(record?.clientRequest.headers.Authorization, "[REDACTED]");
   assert.equal(record?.attempts[0].request.headers?.Authorization, "[REDACTED]");
   assert.equal(record?.clientRequest.model, "alpha");
@@ -2883,7 +3225,7 @@ run("record store only captures the first 10 requests by default", () => {
   }
   assert.equal(getRecordSummary().capturedCount, 10);
   assert.equal(getRecordSummary().size, 10);
-  assert.equal(getRecordedRequest("000000"), undefined);
+  assert.equal(getRecordedRequest("000000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"), undefined);
   stopRecording();
 });
 
@@ -2900,8 +3242,75 @@ run("record store allows overriding max size when starting", () => {
   }
   assert.equal(getRecordSummary().capturedCount, 100);
   assert.equal(getRecordSummary().size, 100);
-  assert.equal(getRecordedRequest("000000"), undefined);
+  assert.equal(getRecordedRequest("000000-ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee"), undefined);
   stopRecording();
+});
+
+run("sqlite record store persists records and trims when max size shrinks", () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-record-"));
+  const dbPath = join(dir, "record.sqlite3");
+  let db = new DatabaseSync(dbPath);
+  try {
+    useSqliteRecordStore(db);
+    startRecording({ maxSize: 3 });
+    const requestId = "abcdef12-3456-7890-abcd-ef1234567890";
+    beginRecordedRequest({
+      requestId,
+      path: "/v1/chat/completions",
+      headers: { Authorization: "Bearer top-secret", "User-Agent": "opencode/1.0" },
+      body: { model: "alpha", messages: [{ role: "user", content: "hello" }] },
+      stream: true,
+    });
+    ensureRecordedAttempt({
+      requestId,
+      index: 1,
+      provider: "openai-chat",
+      modelName: "fallback-alpha",
+      url: "https://example.com/v1/chat/completions",
+      requestHeaders: { Authorization: "Bearer upstream-secret" },
+      requestBody: JSON.stringify({ model: "upstream-alpha", stream: true }),
+    });
+    appendRecordedAttemptResponseBody({ requestId, index: 1, chunk: "data: one\n\n" });
+    setRecordedClientResponseMeta({ requestId, status: 200, headers: { "Content-Type": "text/event-stream" } });
+    appendRecordedClientResponseBody({ requestId, chunk: "data: client\n\n" });
+    finalizeRecordedRequest({ requestId });
+
+    stopRecording();
+    db.close();
+    db = new DatabaseSync(dbPath);
+    useSqliteRecordStore(db);
+    startRecording({ maxSize: 3 });
+    const record = getRecordedRequest(requestId);
+    assert.ok(record);
+    assert.equal(record?.clientRequest.headers.Authorization, "[REDACTED]");
+    assert.equal(record?.attempts[0].request.headers?.Authorization, "[REDACTED]");
+    assert.equal(record?.clientRequest.source, "opencode");
+    assert.equal(record?.clientRequest.status, "success");
+    assert.equal(record?.clientRequest.actualModel, "fallback-alpha");
+    assert.equal(record?.attempts[0].response.body, "data: one\n\n");
+    assert.equal(record?.clientResponse.body, "data: client\n\n");
+    assert.equal(getRecordSummary().recentKeys[0]?.actualModel, "fallback-alpha");
+
+    for (let index = 0; index < 3; index += 1) {
+      beginRecordedRequest({
+        requestId: `${String(index).padStart(6, "0")}-bbbb-cccc-dddd-eeeeeeeeeeee`,
+        path: "/v1/responses",
+        headers: {},
+        body: { model: `m${index}` },
+        stream: false,
+      });
+    }
+    assert.equal(getRecordSummary().size, 3);
+    assert.equal(getRecordedRequest(requestId), undefined);
+    configureRecording({ maxSize: 2 });
+    const summaryAfterResize = getRecordSummary();
+    assert.equal(summaryAfterResize.size, 2);
+    assert.equal(summaryAfterResize.recentKeys.length, 2);
+  } finally {
+    useMemoryRecordStore();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 run("record page renders query UI and JSON tree viewer", () => {
@@ -2910,7 +3319,7 @@ run("record page renders query UI and JSON tree viewer", () => {
     capturedCount: 3,
     limit: 100,
     sessionStartedAt: Date.UTC(2026, 3, 20, 10, 0, 0),
-    recentKeys: [{ key: "abcdef", requestId: "abcdef12-3456", path: "/v1/chat/completions", model: "claude-sonnet-4-6", actualModel: "claude-sonnet-4-6-lite", source: "claudecode", status: "success", createdAt: Date.UTC(2026, 3, 20, 10, 0, 1) }],
+    recentKeys: [{ key: "abcdef12-3456", requestId: "abcdef12-3456", path: "/v1/chat/completions", model: "claude-sonnet-4-6", actualModel: "claude-sonnet-4-6-lite", source: "claudecode", status: "success", createdAt: Date.UTC(2026, 3, 20, 10, 0, 1) }],
   });
   assert.match(html, /Request Record/);
   assert.match(html, /fetch\("\/record\/summary"/);
@@ -2934,7 +3343,7 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.doesNotMatch(html, /recording-border/);
   assert.match(html, /classList\.toggle\("recording", true\)/);
   assert.match(html, /list="request-id-options"/);
-  assert.match(html, /placeholder="例如 6dfae2"/);
+  assert.match(html, /placeholder="例如 6dfae2ab-1234-5678-9abc-def012345678"/);
   assert.match(html, /grid-template-columns: 1fr/);
   assert.match(html, /recent-key/);
   assert.match(html, /recent-toggle/);
@@ -3147,7 +3556,7 @@ run("record store can hot-update max_size without clearing all captured entries"
   const summaryAfter = getRecordSummary();
   assert.equal(summaryAfter.limit, 1);
   assert.equal(summaryAfter.size, 1);
-  assert.deepEqual(summaryAfter.recentKeys.map((item) => item.key), ["333333"]);
+  assert.deepEqual(summaryAfter.recentKeys.map((item) => item.key), ["333333ff-1234-5678-9abc-def012345678"]);
   stopRecording();
 });
 

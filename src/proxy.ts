@@ -131,6 +131,10 @@ function getForwardHeaders(config: ModelConfig, options?: UpstreamRequestOptions
   };
 }
 
+export function resolveProxyUrl(config: ModelConfig): string | undefined {
+  return config.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+}
+
 async function upstreamFetch(
   config: ModelConfig,
   body: string,
@@ -138,7 +142,7 @@ async function upstreamFetch(
   options?: UpstreamRequestOptions,
 ): Promise<{ response: Response; timing: UpstreamTiming }> {
   const url = getUpstreamURL(config);
-  const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  const proxyUrl = resolveProxyUrl(config);
   const timeoutMs = config.ttfb_timeout;
   const abortController = timeoutMs !== undefined ? new AbortController() : undefined;
   let timeoutHandle: NodeJS.Timeout | undefined;

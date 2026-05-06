@@ -460,7 +460,7 @@ const SCRIPT = String.raw`
         }
 
         RANGE_META_EL.textContent =
-          "当前展示最近 " + hours + " 小时，内存中最多保留最近 6 小时，每 5 秒自动刷新一次。";
+          "当前展示最近 " + hours + " 小时，每 5 秒自动刷新一次。";
         for (const button of RANGE_BUTTONS_EL.querySelectorAll(".range-button")) {
           button.classList.toggle("active", Number(button.dataset.hours) === currentHours);
         }
