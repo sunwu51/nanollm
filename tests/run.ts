@@ -4107,7 +4107,21 @@ run("admin page relies on server cookie auth instead of client-side token storag
     version: 1,
     configPath: "C:/tmp/config.yaml",
     effectiveConfig: { port: 3000, models: [], fallback: {}, record: { max_size: 10 } },
-    form: { server: { port: "3000", ttfb_timeout: "5000" }, record: { max_size: "10" }, models: [], fallbackGroups: [] },
+    form: {
+      server: { port: "3000", ttfb_timeout: "5000" },
+      record: { max_size: "10" },
+      models: [
+        {
+          name: "alpha",
+          provider: "openai-chat",
+          base_url: "https://example.com/v1",
+          api_key: "test-key",
+          model: "upstream-alpha",
+          extras: { image: false, headers: { "X-Test": "ok" } },
+        },
+      ],
+      fallbackGroups: [],
+    },
   } as any);
   assert.match(html, /fetch\("\/admin\/config\/data"/);
   assert.match(html, /fetch\("\/admin\/config\/apply"/);
@@ -4116,6 +4130,15 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.doesNotMatch(html, /AUTH_TOKEN_KEY = "nanollmAuthToken"/);
   assert.doesNotMatch(html, /sessionStorage\.setItem\(/);
   assert.doesNotMatch(html, /buildAuthedPath/);
+  assert.match(html, /高级字段/);
+  assert.match(html, /展开高级字段/);
+  assert.match(html, /收起高级字段/);
+  assert.match(html, /_advancedExpanded/);
+  assert.match(html, /function parseAdvancedJson/);
+  assert.match(html, /RESERVED_MODEL_EXTRA_KEYS/);
+  assert.match(html, /不能覆盖 name\/provider\/base_url\/api_key\/model/);
+  assert.match(html, /"image":false/);
+  assert.match(html, /"X-Test":"ok"/);
 });
 
 run("record page stream parser keeps data-like text inside JSON payloads", () => {

@@ -218,6 +218,23 @@ const STYLE = /* css */ String.raw`
       .field.span-3 {
         grid-column: span 3;
       }
+      textarea.advanced-json {
+        min-height: 160px;
+        resize: vertical;
+        font-family: "Consolas", "SFMono-Regular", "Menlo", monospace;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      .advanced-wrap {
+        display: grid;
+        gap: 10px;
+      }
+      .advanced-toggle {
+        justify-self: start;
+      }
+      .helper.error {
+        color: var(--danger);
+      }
       label {
         font-size: 13px;
         font-weight: 600;
@@ -373,6 +390,7 @@ const STYLE = /* css */ String.raw`
 const SCRIPT = /* js */ String.raw`
       const INITIAL_PAYLOAD = __INITIAL_PAYLOAD__;
       const PROVIDERS = ["openai-chat", "openai-responses", "anthropic", "openai-image"];
+      const RESERVED_MODEL_EXTRA_KEYS = new Set(["name", "provider", "base_url", "api_key", "model"]);
       let saving = false;
       let dirty = false;
       let localIdCounter = 0;
@@ -404,7 +422,10 @@ const SCRIPT = /* js */ String.raw`
             ...model,
             _id: nextId("model"),
             _expanded: false,
+            _advancedExpanded: false,
             extras: model.extras || {},
+            _advancedJsonText: formatAdvancedJson(model.extras || {}),
+            _extrasError: "",
           })),
           fallbackGroups: (form.fallbackGroups || []).map((group) => ({
             ...group,
@@ -469,14 +490,50 @@ const SCRIPT = /* js */ String.raw`
         items.splice(toIndex, 0, item);
       }
 
+      function getModelLabel(model, index) {
+        return (model.name || "").trim() || "模型 " + (index + 1);
+      }
+
+      function formatAdvancedJson(extras) {
+        const value = extras && typeof extras === "object" && !Array.isArray(extras) ? extras : {};
+        return JSON.stringify(value, null, 2);
+      }
+
+      function parseAdvancedJson(text, modelLabel) {
+        const trimmed = (text || "").trim();
+        let parsed;
+        try {
+          parsed = trimmed ? JSON.parse(trimmed) : {};
+        } catch (error) {
+          throw new Error(modelLabel + " 的高级字段不是有效 JSON：" + (error instanceof Error ? error.message : String(error)));
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error(modelLabel + " 的高级字段必须是 JSON 对象。");
+        }
+        const reservedKeys = Object.keys(parsed).filter((key) => RESERVED_MODEL_EXTRA_KEYS.has(key));
+        if (reservedKeys.length > 0) {
+          throw new Error(modelLabel + " 的高级字段不能覆盖基础字段：" + reservedKeys.join(", "));
+        }
+        return parsed;
+      }
+
+      function validateAdvancedFields() {
+        formState.models.forEach((model, index) => {
+          const text = model._advancedJsonText ?? formatAdvancedJson(model.extras);
+          model.extras = parseAdvancedJson(text, getModelLabel(model, index));
+          model._extrasError = "";
+        });
+      }
+
       function dehydrateForm() {
+        validateAdvancedFields();
         return {
           rootExtras: formState.rootExtras || {},
           serverExtras: formState.serverExtras || {},
           recordExtras: formState.recordExtras || {},
           server: { ...formState.server },
           record: { ...formState.record },
-          models: formState.models.map(({ _id, _expanded, ...model }) => ({
+          models: formState.models.map(({ _id, _expanded, _advancedExpanded, _advancedJsonText, _extrasError, ...model }) => ({
             ...model,
             extras: model.extras || {},
           })),
@@ -582,6 +639,61 @@ const SCRIPT = /* js */ String.raw`
           helper.textContent = options.helper;
           field.appendChild(helper);
         }
+        container.appendChild(field);
+      }
+
+      function bindAdvancedJsonField(container, model, index) {
+        const field = document.createElement("div");
+        field.className = "field span-2";
+        const label = document.createElement("label");
+        label.textContent = "高级字段";
+
+        const wrap = document.createElement("div");
+        wrap.className = "advanced-wrap";
+
+        const toggle = createActionButton(model._advancedExpanded ? "收起高级字段" : "展开高级字段", "secondary advanced-toggle", () => {
+          model._advancedExpanded = !model._advancedExpanded;
+          renderAll({ preserveScroll: true, scrollToFocus: false });
+        });
+        const count = Object.keys(model.extras || {}).length;
+        const summary = document.createElement("div");
+        summary.className = "helper";
+        summary.textContent = count > 0 ? "当前有 " + count + " 个高级字段，保存时会展开到模型 YAML 中。" : "当前没有高级字段。";
+
+        const textarea = document.createElement("textarea");
+        textarea.className = "advanced-json";
+        textarea.spellcheck = false;
+        textarea.value = model._advancedJsonText ?? formatAdvancedJson(model.extras);
+        textarea.placeholder = '{\n  "image": false,\n  "headers": {},\n  "body": {}\n}';
+        textarea.hidden = !model._advancedExpanded;
+
+        const helper = document.createElement("div");
+        helper.className = "helper";
+        helper.textContent = "输入 JSON 对象。保存时会展开到该模型 YAML 中，不能覆盖 name/provider/base_url/api_key/model。";
+        helper.hidden = !model._advancedExpanded;
+
+        textarea.addEventListener("input", (event) => {
+          const value = event.target.value;
+          model._advancedJsonText = value;
+          try {
+            model.extras = parseAdvancedJson(value, getModelLabel(model, index));
+            model._extrasError = "";
+            helper.className = "helper";
+            helper.textContent = "输入 JSON 对象。保存时会展开到该模型 YAML 中，不能覆盖 name/provider/base_url/api_key/model。";
+          } catch (error) {
+            model._extrasError = error instanceof Error ? error.message : String(error);
+            helper.className = "helper error";
+            helper.textContent = model._extrasError;
+          }
+          markDirty(true);
+        });
+
+        field.appendChild(label);
+        wrap.appendChild(toggle);
+        wrap.appendChild(summary);
+        wrap.appendChild(textarea);
+        wrap.appendChild(helper);
+        field.appendChild(wrap);
         container.appendChild(field);
       }
 
@@ -757,14 +869,8 @@ const SCRIPT = /* js */ String.raw`
               markDirty(true);
             },
           });
+          bindAdvancedJsonField(grid, model, index);
           body.appendChild(grid);
-
-          if (model.extras && Object.keys(model.extras).length > 0) {
-            const helper = document.createElement("div");
-            helper.className = "helper";
-            helper.textContent = "这个模型还有未在表单中展开的高级字段，保存时会自动保留。";
-            body.appendChild(helper);
-          }
 
           card.appendChild(body);
 
@@ -1006,11 +1112,19 @@ const SCRIPT = /* js */ String.raw`
         setSaving(true);
         setStatus("warn", "正在保存并应用配置...");
         try {
+          let config;
+          try {
+            config = dehydrateForm();
+          } catch (error) {
+            setStatus("error", error instanceof Error ? error.message : "高级字段 JSON 校验失败");
+            renderAll({ preserveScroll: true, scrollToFocus: false });
+            return;
+          }
           const response = await fetch("/admin/config/apply", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              config: dehydrateForm(),
+              config,
               baseVersion: currentSnapshot.version,
             }),
           });
@@ -1058,6 +1172,9 @@ const SCRIPT = /* js */ String.raw`
           api_key: "",
           model: "",
           extras: {},
+          _advancedExpanded: false,
+          _advancedJsonText: "{}",
+          _extrasError: "",
         });
         pendingFocusTarget = "model-name-" + id;
         markDirty(true);
