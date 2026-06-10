@@ -20,6 +20,7 @@ import { renderStatusPage } from "./src/status-page.js";
 import { renderRecordPage } from "./src/record-page.js";
 import { renderAdminConfigPage } from "./src/admin-config-page.js";
 import { getHTTPLogLevel, shouldEmitLog } from "./src/http-log.js";
+import { buildJsonResponse, buildNonStreamResponse } from "./src/response-compression.js";
 import {
   normalizeOpenAIChatRequest,
   normalizeOpenAIResponsesRequest,
@@ -759,7 +760,7 @@ function createRoute(incomingFormat: StreamFormat) {
 
           statusStore.recordSuccess(modelConfig.name, Date.now() - requestStartedAt, result.timing.ttfbMs, result.usage, requestStartedAt);
           cacheResponseItems((result.json as any)?.output);
-          const response = c.json(result.json);
+          const response = buildJsonResponse(c.req.raw.headers, result.json);
           setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
           setRecordedClientResponseBody({ body: result.json });
           finalizeRecordedRequest({});
@@ -887,7 +888,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
               responseHeaders[key] = value;
             }
           }
-          const response = new Response(result.responseText, { status: result.status, headers: responseHeaders });
+          const response = buildNonStreamResponse(c.req.raw.headers, result.responseText, { status: result.status, headers: responseHeaders });
           setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
           setRecordedClientResponseBody({ body: result.body });
           finalizeRecordedRequest({});

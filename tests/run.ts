@@ -4,6 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import { Hono } from "hono";
 
 import {
@@ -28,6 +29,7 @@ import { ConfigManager } from "../src/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
 import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
+import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/response-compression.js";
 import { renderRecordPage } from "../src/record-page.js";
 import { renderStatusPage } from "../src/status-page.js";
 import { handleServerStartupError } from "../src/startup-error.js";
@@ -4275,6 +4277,36 @@ run("reader release errors are ignored only for cancelled or completed streams",
   assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: true, completed: false }), true);
   assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: false, completed: false }), false);
   assert.equal(shouldIgnoreStreamReadError(new Error("socket hang up"), { cancelled: false, completed: true }), false);
+});
+
+await runAsync("non-stream response compression gzips large responses when accept-encoding is absent", async () => {
+  const body = "a".repeat(RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1);
+  const response = buildNonStreamResponse(new Headers(), body, { headers: { "Content-Type": "application/json" } });
+  const bytes = Buffer.from(await response.arrayBuffer());
+
+  assert.equal(response.headers.get("content-encoding"), "gzip");
+  assert.equal(response.headers.get("vary"), "Accept-Encoding");
+  assert.equal(gunzipSync(bytes).toString("utf8"), body);
+});
+
+await runAsync("non-stream response compression prefers brotli when accepted", async () => {
+  const body = "b".repeat(RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1);
+  const response = buildNonStreamResponse(new Headers({ "Accept-Encoding": "gzip, br" }), body);
+  const bytes = Buffer.from(await response.arrayBuffer());
+
+  assert.equal(response.headers.get("content-encoding"), "br");
+  assert.equal(brotliDecompressSync(bytes).toString("utf8"), body);
+});
+
+await runAsync("non-stream response compression skips small and unsupported responses", async () => {
+  const small = buildNonStreamResponse(new Headers({ "Accept-Encoding": "gzip" }), "ok");
+  assert.equal(small.headers.get("content-encoding"), null);
+  assert.equal(await small.text(), "ok");
+
+  const body = "c".repeat(RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1);
+  const unsupported = buildNonStreamResponse(new Headers({ "Accept-Encoding": "identity" }), body);
+  assert.equal(unsupported.headers.get("content-encoding"), null);
+  assert.equal(await unsupported.text(), body);
 });
 
 await runAsync("passthrough request records upstream request and response", async () => {
