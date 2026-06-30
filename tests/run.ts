@@ -55,6 +55,7 @@ import {
 import { runWithRequestId } from "../src/request-context.js";
 import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/status.js";
 import { shouldIgnoreStreamReadError } from "../src/stream-errors.js";
+import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/usage.js";
 
 function run(name: string, fn: () => void) {
   try {
@@ -3793,6 +3794,149 @@ run("sqlite status store persists sparse buckets for a month while UI series sta
   }
 });
 
+run("usage store aggregates daily attempts, success usage, and failures", () => {
+  const store = new UsageStore();
+  const timestamp = new Date(2026, 5, 30, 10, 30, 0).getTime();
+  const day = formatLocalDay(timestamp);
+
+  store.recordAttempt("alpha", timestamp);
+  store.recordSuccess("alpha", 120, {
+    nonCacheInputTokens: 100,
+    cacheReadInputTokens: 25,
+    outputTokens: 40,
+  }, timestamp);
+  store.recordAttempt("alpha", timestamp + 1000);
+  store.recordFailure("alpha", 80, timestamp + 1000);
+  store.recordAttempt("beta", timestamp);
+  store.recordSuccess("beta", 50, {
+    nonCacheInputTokens: 5,
+    cacheReadInputTokens: 0,
+    outputTokens: 7,
+    totalTokens: 20,
+  }, timestamp);
+
+  const all = store.listDays({ start: day, end: day })[0];
+  assert.equal(all.totalRequests, 3);
+  assert.equal(all.successRequests, 2);
+  assert.equal(all.failureRequests, 1);
+  assert.equal(all.totalDurationMs, 250);
+  assert.equal(all.nonCacheInputTokens, 105);
+  assert.equal(all.cacheReadInputTokens, 25);
+  assert.equal(all.outputTokens, 47);
+  assert.equal(all.totalTokens, 185);
+
+  const alpha = store.listDays({ start: day, end: day, modelName: "alpha" })[0];
+  assert.equal(alpha.totalRequests, 2);
+  assert.equal(alpha.successRequests, 1);
+  assert.equal(alpha.failureRequests, 1);
+  assert.equal(alpha.totalTokens, 165);
+});
+
+run("sqlite usage store persists daily aggregates and supports dense range queries", () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-usage-"));
+  const db = new DatabaseSync(join(dir, "usage.sqlite3"));
+  try {
+    const timestamp = new Date(2026, 0, 2, 9, 0, 0).getTime();
+    const day = formatLocalDay(timestamp);
+    const store = new SqliteUsageStore(db);
+
+    store.recordAttempt("alpha", timestamp);
+    store.recordSuccess("alpha", 100, {
+      nonCacheInputTokens: 10,
+      cacheReadInputTokens: 2,
+      outputTokens: 3,
+    }, timestamp);
+    store.recordAttempt("alpha", timestamp + 2000);
+    store.recordFailure("alpha", 40, timestamp + 2000);
+
+    const restarted = new SqliteUsageStore(db);
+    const cell = restarted.getModelDay("alpha", day);
+    assert.ok(cell);
+    assert.equal(cell.totalRequests, 2);
+    assert.equal(cell.successRequests, 1);
+    assert.equal(cell.failureRequests, 1);
+    assert.equal(cell.totalTokens, 15);
+
+    const range = restarted.listDays({ start: "2026-01-01", end: "2026-01-03", modelName: "alpha" });
+    assert.equal(range.length, 3);
+    assert.equal(range[0].day, "2026-01-01");
+    assert.equal(range[0].totalRequests, 0);
+    assert.equal(range[1].day, "2026-01-02");
+    assert.equal(range[1].totalRequests, 2);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+run("sqlite usage store backfills old daily data from status buckets once", () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-usage-backfill-"));
+  const db = new DatabaseSync(join(dir, "usage.sqlite3"));
+  try {
+    db.exec(`
+      CREATE TABLE status_buckets (
+        model_name TEXT NOT NULL,
+        bucket_start INTEGER NOT NULL,
+        total_requests INTEGER NOT NULL DEFAULT 0,
+        success_requests INTEGER NOT NULL DEFAULT 0,
+        total_ttfb_ms REAL NOT NULL DEFAULT 0,
+        ttfb_samples INTEGER NOT NULL DEFAULT 0,
+        total_duration_ms REAL NOT NULL DEFAULT 0,
+        duration_samples INTEGER NOT NULL DEFAULT 0,
+        total_stream_ms REAL NOT NULL DEFAULT 0,
+        stream_samples INTEGER NOT NULL DEFAULT 0,
+        non_cache_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (model_name, bucket_start)
+      )
+    `);
+    const dayOneMorning = new Date(2026, 0, 2, 9, 0, 0).getTime();
+    const dayOneAfternoon = new Date(2026, 0, 2, 16, 0, 0).getTime();
+    const dayTwo = new Date(2026, 0, 3, 10, 0, 0).getTime();
+    const insertBucket = db.prepare(`
+      INSERT INTO status_buckets (
+        model_name,
+        bucket_start,
+        total_requests,
+        success_requests,
+        total_duration_ms,
+        duration_samples,
+        non_cache_input_tokens,
+        cache_read_input_tokens,
+        output_tokens
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertBucket.run("alpha", dayOneMorning, 2, 1, 300, 2, 10, 2, 3);
+    insertBucket.run("alpha", dayOneAfternoon, 1, 1, 100, 1, 7, 0, 5);
+    insertBucket.run("beta", dayTwo, 3, 2, 600, 3, 20, 4, 6);
+
+    const store = new SqliteUsageStore(db);
+    const alpha = store.getModelDay("alpha", "2026-01-02");
+    assert.ok(alpha);
+    assert.equal(alpha.totalRequests, 3);
+    assert.equal(alpha.successRequests, 2);
+    assert.equal(alpha.failureRequests, 1);
+    assert.equal(alpha.totalDurationMs, 400);
+    assert.equal(alpha.totalTokens, 27);
+
+    const beta = store.getModelDay("beta", "2026-01-03");
+    assert.ok(beta);
+    assert.equal(beta.totalRequests, 3);
+    assert.equal(beta.successRequests, 2);
+    assert.equal(beta.failureRequests, 1);
+    assert.equal(beta.totalTokens, 30);
+
+    new SqliteUsageStore(db);
+    const alphaAfterRestart = store.getModelDay("alpha", "2026-01-02");
+    assert.equal(alphaAfterRestart?.totalRequests, 3);
+    assert.equal(alphaAfterRestart?.totalTokens, 27);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 run("record store resets on start and supports full request id lookup", () => {
   startRecording();
   const requestId = "abcdef12-3456-7890-abcd-ef1234567890";
@@ -3991,6 +4135,54 @@ run("sqlite record store persists records and trims when max size shrinks", () =
 run("status page renders fallback group priority panel without top hint text", () => {
   const store = new StatusStore();
   const bucketStarts = store.listBuckets();
+  const usagePayload = {
+    refreshedAt: Date.UTC(2026, 5, 30, 12, 0, 0),
+    start: "2026-01-01",
+    end: "2026-01-03",
+    selectedYear: 2026,
+    selectedRange: "year" as const,
+    availableYears: [2026, 2025],
+    selectedModel: "alpha",
+    models: ["alpha", "beta"],
+    days: [
+      {
+        day: "2026-01-01",
+        totalRequests: 1,
+        successRequests: 1,
+        failureRequests: 0,
+        totalDurationMs: 100,
+        durationSamples: 1,
+        nonCacheInputTokens: 10,
+        cacheReadInputTokens: 2,
+        outputTokens: 3,
+        totalTokens: 15,
+      },
+      {
+        day: "2026-01-02",
+        totalRequests: 0,
+        successRequests: 0,
+        failureRequests: 0,
+        totalDurationMs: 0,
+        durationSamples: 0,
+        nonCacheInputTokens: 0,
+        cacheReadInputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+      },
+      {
+        day: "2026-01-03",
+        totalRequests: 2,
+        successRequests: 1,
+        failureRequests: 1,
+        totalDurationMs: 220,
+        durationSamples: 2,
+        nonCacheInputTokens: 20,
+        cacheReadInputTokens: 4,
+        outputTokens: 6,
+        totalTokens: 30,
+      },
+    ],
+  };
   const html = renderStatusPage({
     availableWindows: [1, 3, 6],
     defaultWindowHours: 1,
@@ -4003,8 +4195,16 @@ run("status page renders fallback group priority panel without top hint text", (
     fallbackGroups: [
       { name: "group-a", members: ["beta", "alpha"] },
     ],
+    usage: usagePayload,
   });
 
+  assert.match(html, /Usage in selected time range/);
+  assert.match(html, /Persistent usage history requires --storage sqlite/);
+  assert.match(html, /id="usage-range"/);
+  assert.match(html, /Selected year/);
+  assert.match(html, /Requests/);
+  assert.match(html, /Cached/);
+  assert.match(html, /\/status\?range=year&amp;year=2025&amp;model=alpha/);
   assert.match(html, /Fallback Groups/);
   assert.match(html, /id="groups"/);
   assert.match(html, /id="range-total"/);

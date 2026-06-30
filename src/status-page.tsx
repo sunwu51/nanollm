@@ -1,5 +1,6 @@
 import { renderToString } from "hono/jsx/dom/server";
 import type { StatusCell } from "./status.js";
+import { USAGE_SCRIPT, USAGE_STYLE, UsageSection, type UsagePagePayload } from "./usage-page.js";
 
 function serializeForScript(value: unknown): string {
   return JSON.stringify(value)
@@ -26,9 +27,11 @@ export interface StatusPagePayload {
   bucketStarts: number[];
   models: StatusPageModel[];
   fallbackGroups: StatusPageFallbackGroup[];
+  usage: UsagePagePayload;
 }
 
 const STYLE = /* css */ String.raw`
+${USAGE_STYLE}
       :root {
         color-scheme: light;
         --bg: #f5f1e8;
@@ -54,6 +57,9 @@ const STYLE = /* css */ String.raw`
       }
       .page {
         padding: 20px;
+      }
+      .usage-top {
+        margin-bottom: 18px;
       }
       .layout {
         display: grid;
@@ -135,7 +141,7 @@ const STYLE = /* css */ String.raw`
         color: var(--text);
         font-weight: 700;
       }
-      .legend {
+      .health-legend {
         display: flex;
         gap: 12px;
         flex-wrap: wrap;
@@ -143,7 +149,7 @@ const STYLE = /* css */ String.raw`
         color: var(--muted);
         font-size: 13px;
       }
-      .legend span {
+      .health-legend span {
         display: inline-flex;
         align-items: center;
         gap: 6px;
@@ -379,6 +385,7 @@ const STYLE = /* css */ String.raw`
 
 const SCRIPT = String.raw`
       const STATUS_DATA = __INITIAL_PAYLOAD__;
+      ${USAGE_SCRIPT.replace("const USAGE_DATA = __INITIAL_USAGE_PAYLOAD__;", "const USAGE_DATA = STATUS_DATA.usage;")}
       const TICKS_EL = document.getElementById("ticks");
       const ROWS_EL = document.getElementById("rows");
       const RANGE_BUTTONS_EL = document.getElementById("range-buttons");
@@ -699,6 +706,9 @@ function StatusPage({ payload }: { payload: StatusPagePayload }) {
       </head>
       <body>
     <main class="page">
+      <div class="usage-top">
+        <UsageSection payload={{ ...payload.usage, basePath: "/status" }} />
+      </div>
       <div class="layout">
         <section class="panel health-panel">
           <h1>Model Health</h1>
@@ -706,7 +716,7 @@ function StatusPage({ payload }: { payload: StatusPagePayload }) {
             <div class="range-buttons" id="range-buttons"></div>
             <div class="range-total" id="range-total" aria-label="当前时间范围总用量"></div>
           </div>
-          <div class="legend">
+          <div class="health-legend">
             <span><i class="dot green"></i>100%</span>
             <span><i class="dot lightgreen"></i>80%+</span>
             <span><i class="dot orange"></i>50%+</span>
