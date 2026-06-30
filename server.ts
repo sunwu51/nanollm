@@ -17,9 +17,11 @@ import { forwardRequest, forwardStreamRequest, passthroughRawRequest, passthroug
 import { FallbackFailureTracker, sortFallbackGroupMembers } from "./src/fallback.js";
 import { SqliteStatusStore, StatusStore, type StatusStoreLike } from "./src/status.js";
 import { renderStatusPage } from "./src/status-page.js";
+import { SqliteUsageStore, UsageStore, addLocalDays, formatLocalDay, getUsageYears, parseLocalDay, type UsageStoreLike } from "./src/usage.js";
 import { renderRecordPage } from "./src/record-page.js";
 import { renderAdminConfigPage } from "./src/admin-config-page.js";
 import { getHTTPLogLevel, shouldEmitLog } from "./src/http-log.js";
+import { buildJsonResponse, buildNonStreamResponse } from "./src/response-compression.js";
 import {
   normalizeOpenAIChatRequest,
   normalizeOpenAIResponsesRequest,
@@ -246,6 +248,7 @@ type AdminConfigForm = {
 
 const fallbackFailureTracker = new FallbackFailureTracker();
 const statusStore: StatusStoreLike = sqliteDb ? new SqliteStatusStore(sqliteDb) : new StatusStore();
+const usageStore: UsageStoreLike = sqliteDb ? new SqliteUsageStore(sqliteDb) : new UsageStore();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
 
@@ -497,6 +500,28 @@ function getCandidateModels(config: ServerConfig, primaryModel: string): ModelCo
   return match ? [match.model] : [];
 }
 
+function recordModelAttempt(modelName: string, timestamp: number) {
+  statusStore.recordAttempt(modelName, timestamp);
+  usageStore.recordAttempt(modelName, timestamp);
+}
+
+function recordModelSuccess(
+  modelName: string,
+  durationMs: number,
+  ttfbMs?: number,
+  usage?: import("./src/converters/shared.js").NormalizedUsage,
+  timestamp = Date.now(),
+  streamDurationMs?: number,
+) {
+  statusStore.recordSuccess(modelName, durationMs, ttfbMs, usage, timestamp, streamDurationMs);
+  usageStore.recordSuccess(modelName, durationMs, usage, timestamp);
+}
+
+function recordModelFailure(modelName: string, durationMs?: number, timestamp = Date.now()) {
+  statusStore.recordFailure(modelName, durationMs, timestamp);
+  usageStore.recordFailure(modelName, durationMs, timestamp);
+}
+
 async function executeModelRequest(
   modelConfig: ModelConfig,
   incomingFormat: StreamFormat,
@@ -616,7 +641,7 @@ async function replayRecordedRequest(record: NonNullable<ReturnType<typeof getRe
   };
 }
 
-function buildStatusPayload(config: ServerConfig) {
+function buildStatusPayload(config: ServerConfig, c?: Context) {
   const availableWindows = [1, 3, 6];
   const now = Date.now();
   return {
@@ -632,6 +657,63 @@ function buildStatusPayload(config: ServerConfig) {
       name,
       members: sortFallbackGroupMembers(members, (memberName) => fallbackFailureTracker.getFailureCount(memberName, now)),
     })),
+    usage: buildUsagePayload(c, config, { basePath: "/status", now }),
+  };
+}
+
+function toUsageYear(value: unknown, now = Date.now()): number {
+  const currentYear = new Date(now).getFullYear();
+  const year = typeof value === "string" && /^\d{4}$/.test(value) ? Number(value) : currentYear;
+  if (!Number.isInteger(year) || year < 2000 || year > currentYear + 1) return currentYear;
+  return year;
+}
+
+function buildUsageRange(year: number, now = Date.now()) {
+  const currentYear = new Date(now).getFullYear();
+  const start = `${year}-01-01`;
+  const end = year === currentYear ? formatLocalDay(now) : `${year}-12-31`;
+  return { start, end };
+}
+
+function normalizeUsageRangeMode(value: unknown): "7d" | "30d" | "year" {
+  return value === "7d" || value === "30d" ? value : "year";
+}
+
+function buildRecentUsageRange(days: number, now = Date.now()) {
+  const end = formatLocalDay(now);
+  const start = addLocalDays(end, -(days - 1));
+  return { start, end };
+}
+
+function normalizeUsageDayRange(rawStart: unknown, rawEnd: unknown, year: number, rangeMode: "7d" | "30d" | "year", now = Date.now()) {
+  if (rangeMode === "7d") return buildRecentUsageRange(7, now);
+  if (rangeMode === "30d") return buildRecentUsageRange(30, now);
+  const defaultRange = buildUsageRange(year, now);
+  const start = typeof rawStart === "string" && parseLocalDay(rawStart) ? rawStart : defaultRange.start;
+  const end = typeof rawEnd === "string" && parseLocalDay(rawEnd) ? rawEnd : defaultRange.end;
+  return start <= end ? { start, end } : defaultRange;
+}
+
+function buildUsagePayload(c: Context | undefined, config: ServerConfig, options?: { basePath?: string; now?: number }) {
+  const now = options?.now ?? Date.now();
+  const selectedRange = normalizeUsageRangeMode(c?.req.query("range"));
+  const selectedYear = selectedRange === "year" ? toUsageYear(c?.req.query("year"), now) : null;
+  const queryYear = selectedYear ?? new Date(now).getFullYear();
+  const range = normalizeUsageDayRange(c?.req.query("start"), c?.req.query("end"), queryYear, selectedRange, now);
+  const modelQuery = c?.req.query("model") || undefined;
+  const modelNames = config.models.map((model) => model.name);
+  const selectedModel = modelQuery && modelNames.includes(modelQuery) ? modelQuery : undefined;
+
+  return {
+    refreshedAt: now,
+    ...range,
+    selectedYear,
+    selectedRange,
+    availableYears: getUsageYears(now),
+    selectedModel: selectedModel ?? null,
+    models: modelNames,
+    basePath: options?.basePath,
+    days: usageStore.listDays({ ...range, modelName: selectedModel }),
   };
 }
 
@@ -710,7 +792,7 @@ function createRoute(incomingFormat: StreamFormat) {
     try {
       for (const [candidateIndex, modelConfig] of candidateModels.entries()) {
         const requestStartedAt = Date.now();
-        statusStore.recordAttempt(modelConfig.name, requestStartedAt);
+        recordModelAttempt(modelConfig.name, requestStartedAt);
         console.log(
           withRequestId(
             `[REQUEST] model=${modelName} path=${c.req.path} target=${getUpstreamURL(modelConfig)} candidate=${modelConfig.name}`,
@@ -757,9 +839,9 @@ function createRoute(incomingFormat: StreamFormat) {
             return response;
           }
 
-          statusStore.recordSuccess(modelConfig.name, Date.now() - requestStartedAt, result.timing.ttfbMs, result.usage, requestStartedAt);
+          recordModelSuccess(modelConfig.name, Date.now() - requestStartedAt, result.timing.ttfbMs, result.usage, requestStartedAt);
           cacheResponseItems((result.json as any)?.output);
-          const response = c.json(result.json);
+          const response = buildJsonResponse(c.req.raw.headers, result.json);
           setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
           setRecordedClientResponseBody({ body: result.json });
           finalizeRecordedRequest({});
@@ -767,7 +849,7 @@ function createRoute(incomingFormat: StreamFormat) {
         } catch (error) {
           const err = error as Error & { status?: number; upstream?: string; cause?: unknown };
           fallbackFailureTracker.recordFailure(modelConfig.name, requestStartedAt);
-          statusStore.recordFailure(modelConfig.name, Date.now() - requestStartedAt, requestStartedAt);
+          recordModelFailure(modelConfig.name, Date.now() - requestStartedAt, requestStartedAt);
           lastError = err;
           console.warn(
             orange(
@@ -853,7 +935,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
     try {
       for (const [candidateIndex, modelConfig] of candidateModels.entries()) {
         const requestStartedAt = Date.now();
-        statusStore.recordAttempt(modelConfig.name, requestStartedAt);
+        recordModelAttempt(modelConfig.name, requestStartedAt);
         console.log(
           withRequestId(
             `[REQUEST] model=${modelName} path=${c.req.path} target=${getUpstreamURL(modelConfig)} candidate=${modelConfig.name}`,
@@ -879,7 +961,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
               recordedRequestBody: recordedBody,
             },
           );
-          statusStore.recordSuccess(modelConfig.name, Date.now() - requestStartedAt, result.timing.ttfbMs, undefined, requestStartedAt);
+          recordModelSuccess(modelConfig.name, Date.now() - requestStartedAt, result.timing.ttfbMs, undefined, requestStartedAt);
 
           const responseHeaders: Record<string, string> = {};
           for (const [key, value] of result.headers.entries()) {
@@ -887,7 +969,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
               responseHeaders[key] = value;
             }
           }
-          const response = new Response(result.responseText, { status: result.status, headers: responseHeaders });
+          const response = buildNonStreamResponse(c.req.raw.headers, result.responseText, { status: result.status, headers: responseHeaders });
           setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
           setRecordedClientResponseBody({ body: result.body });
           finalizeRecordedRequest({});
@@ -895,7 +977,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
         } catch (error) {
           const err = error as Error & { status?: number; upstream?: string; cause?: unknown };
           fallbackFailureTracker.recordFailure(modelConfig.name, requestStartedAt);
-          statusStore.recordFailure(modelConfig.name, Date.now() - requestStartedAt, requestStartedAt);
+          recordModelFailure(modelConfig.name, Date.now() - requestStartedAt, requestStartedAt);
           lastError = err;
           console.warn(
             orange(
@@ -981,7 +1063,7 @@ function buildStreamReadable(
   function settleSuccess(usage?: import("./src/converters/shared.js").NormalizedUsage) {
     if (successRecorded) return;
     successRecorded = true;
-    const totalDuration = Date.now() - timing.startedAt; const streamDuration = totalDuration - timing.ttfbMs; statusStore.recordSuccess(modelName, totalDuration, timing.ttfbMs, usage, timing.startedAt, streamDuration);
+    const totalDuration = Date.now() - timing.startedAt; const streamDuration = totalDuration - timing.ttfbMs; recordModelSuccess(modelName, totalDuration, timing.ttfbMs, usage, timing.startedAt, streamDuration);
   }
 
   function finalizeRecord() {
@@ -1036,7 +1118,7 @@ function buildStreamReadable(
           }
           return;
         }
-        statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
+        recordModelFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
         finalizeRecord();
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);
@@ -1102,7 +1184,7 @@ function buildPipeStreamAndCache(
   function settleSuccess(usage?: import("./src/converters/shared.js").NormalizedUsage) {
     if (successRecorded) return;
     successRecorded = true;
-    const totalDuration = Date.now() - timing.startedAt; const streamDuration = totalDuration - timing.ttfbMs; statusStore.recordSuccess(modelName, totalDuration, timing.ttfbMs, usage, timing.startedAt, streamDuration);
+    const totalDuration = Date.now() - timing.startedAt; const streamDuration = totalDuration - timing.ttfbMs; recordModelSuccess(modelName, totalDuration, timing.ttfbMs, usage, timing.startedAt, streamDuration);
   }
 
   function finalizeRecord() {
@@ -1177,7 +1259,7 @@ function buildPipeStreamAndCache(
           }
           return;
         }
-        statusStore.recordFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
+        recordModelFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
         finalizeRecord();
         console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
         controller.error(error);
@@ -1231,8 +1313,8 @@ app.get("/", (c) => {
 
 app.get("/health", (c) => c.json({ ok: true }));
 
-app.get("/status", (c) => c.html(renderStatusPage(buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig))));
-app.get("/status/data", (c) => c.json(buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig)));
+app.get("/status", (c) => c.html(renderStatusPage(buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c))));
+app.get("/status/data", (c) => c.json(buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c)));
 app.get("/record", (c) => c.html(renderRecordPage(getRecordSummary())));
 app.get("/record/summary", (c) => c.json(getRecordSummary()));
 app.get("/record/:requestId", (c) => {

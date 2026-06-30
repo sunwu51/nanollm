@@ -4,6 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import { Hono } from "hono";
 
 import {
@@ -28,6 +29,7 @@ import { ConfigManager } from "../src/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
 import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
+import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/response-compression.js";
 import { renderRecordPage } from "../src/record-page.js";
 import { renderStatusPage } from "../src/status-page.js";
 import { handleServerStartupError } from "../src/startup-error.js";
@@ -53,6 +55,7 @@ import {
 import { runWithRequestId } from "../src/request-context.js";
 import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/status.js";
 import { shouldIgnoreStreamReadError } from "../src/stream-errors.js";
+import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/usage.js";
 
 function run(name: string, fn: () => void) {
   try {
@@ -3791,6 +3794,149 @@ run("sqlite status store persists sparse buckets for a month while UI series sta
   }
 });
 
+run("usage store aggregates daily attempts, success usage, and failures", () => {
+  const store = new UsageStore();
+  const timestamp = new Date(2026, 5, 30, 10, 30, 0).getTime();
+  const day = formatLocalDay(timestamp);
+
+  store.recordAttempt("alpha", timestamp);
+  store.recordSuccess("alpha", 120, {
+    nonCacheInputTokens: 100,
+    cacheReadInputTokens: 25,
+    outputTokens: 40,
+  }, timestamp);
+  store.recordAttempt("alpha", timestamp + 1000);
+  store.recordFailure("alpha", 80, timestamp + 1000);
+  store.recordAttempt("beta", timestamp);
+  store.recordSuccess("beta", 50, {
+    nonCacheInputTokens: 5,
+    cacheReadInputTokens: 0,
+    outputTokens: 7,
+    totalTokens: 20,
+  }, timestamp);
+
+  const all = store.listDays({ start: day, end: day })[0];
+  assert.equal(all.totalRequests, 3);
+  assert.equal(all.successRequests, 2);
+  assert.equal(all.failureRequests, 1);
+  assert.equal(all.totalDurationMs, 250);
+  assert.equal(all.nonCacheInputTokens, 105);
+  assert.equal(all.cacheReadInputTokens, 25);
+  assert.equal(all.outputTokens, 47);
+  assert.equal(all.totalTokens, 185);
+
+  const alpha = store.listDays({ start: day, end: day, modelName: "alpha" })[0];
+  assert.equal(alpha.totalRequests, 2);
+  assert.equal(alpha.successRequests, 1);
+  assert.equal(alpha.failureRequests, 1);
+  assert.equal(alpha.totalTokens, 165);
+});
+
+run("sqlite usage store persists daily aggregates and supports dense range queries", () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-usage-"));
+  const db = new DatabaseSync(join(dir, "usage.sqlite3"));
+  try {
+    const timestamp = new Date(2026, 0, 2, 9, 0, 0).getTime();
+    const day = formatLocalDay(timestamp);
+    const store = new SqliteUsageStore(db);
+
+    store.recordAttempt("alpha", timestamp);
+    store.recordSuccess("alpha", 100, {
+      nonCacheInputTokens: 10,
+      cacheReadInputTokens: 2,
+      outputTokens: 3,
+    }, timestamp);
+    store.recordAttempt("alpha", timestamp + 2000);
+    store.recordFailure("alpha", 40, timestamp + 2000);
+
+    const restarted = new SqliteUsageStore(db);
+    const cell = restarted.getModelDay("alpha", day);
+    assert.ok(cell);
+    assert.equal(cell.totalRequests, 2);
+    assert.equal(cell.successRequests, 1);
+    assert.equal(cell.failureRequests, 1);
+    assert.equal(cell.totalTokens, 15);
+
+    const range = restarted.listDays({ start: "2026-01-01", end: "2026-01-03", modelName: "alpha" });
+    assert.equal(range.length, 3);
+    assert.equal(range[0].day, "2026-01-01");
+    assert.equal(range[0].totalRequests, 0);
+    assert.equal(range[1].day, "2026-01-02");
+    assert.equal(range[1].totalRequests, 2);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+run("sqlite usage store backfills old daily data from status buckets once", () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-usage-backfill-"));
+  const db = new DatabaseSync(join(dir, "usage.sqlite3"));
+  try {
+    db.exec(`
+      CREATE TABLE status_buckets (
+        model_name TEXT NOT NULL,
+        bucket_start INTEGER NOT NULL,
+        total_requests INTEGER NOT NULL DEFAULT 0,
+        success_requests INTEGER NOT NULL DEFAULT 0,
+        total_ttfb_ms REAL NOT NULL DEFAULT 0,
+        ttfb_samples INTEGER NOT NULL DEFAULT 0,
+        total_duration_ms REAL NOT NULL DEFAULT 0,
+        duration_samples INTEGER NOT NULL DEFAULT 0,
+        total_stream_ms REAL NOT NULL DEFAULT 0,
+        stream_samples INTEGER NOT NULL DEFAULT 0,
+        non_cache_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (model_name, bucket_start)
+      )
+    `);
+    const dayOneMorning = new Date(2026, 0, 2, 9, 0, 0).getTime();
+    const dayOneAfternoon = new Date(2026, 0, 2, 16, 0, 0).getTime();
+    const dayTwo = new Date(2026, 0, 3, 10, 0, 0).getTime();
+    const insertBucket = db.prepare(`
+      INSERT INTO status_buckets (
+        model_name,
+        bucket_start,
+        total_requests,
+        success_requests,
+        total_duration_ms,
+        duration_samples,
+        non_cache_input_tokens,
+        cache_read_input_tokens,
+        output_tokens
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertBucket.run("alpha", dayOneMorning, 2, 1, 300, 2, 10, 2, 3);
+    insertBucket.run("alpha", dayOneAfternoon, 1, 1, 100, 1, 7, 0, 5);
+    insertBucket.run("beta", dayTwo, 3, 2, 600, 3, 20, 4, 6);
+
+    const store = new SqliteUsageStore(db);
+    const alpha = store.getModelDay("alpha", "2026-01-02");
+    assert.ok(alpha);
+    assert.equal(alpha.totalRequests, 3);
+    assert.equal(alpha.successRequests, 2);
+    assert.equal(alpha.failureRequests, 1);
+    assert.equal(alpha.totalDurationMs, 400);
+    assert.equal(alpha.totalTokens, 27);
+
+    const beta = store.getModelDay("beta", "2026-01-03");
+    assert.ok(beta);
+    assert.equal(beta.totalRequests, 3);
+    assert.equal(beta.successRequests, 2);
+    assert.equal(beta.failureRequests, 1);
+    assert.equal(beta.totalTokens, 30);
+
+    new SqliteUsageStore(db);
+    const alphaAfterRestart = store.getModelDay("alpha", "2026-01-02");
+    assert.equal(alphaAfterRestart?.totalRequests, 3);
+    assert.equal(alphaAfterRestart?.totalTokens, 27);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 run("record store resets on start and supports full request id lookup", () => {
   startRecording();
   const requestId = "abcdef12-3456-7890-abcd-ef1234567890";
@@ -3989,6 +4135,54 @@ run("sqlite record store persists records and trims when max size shrinks", () =
 run("status page renders fallback group priority panel without top hint text", () => {
   const store = new StatusStore();
   const bucketStarts = store.listBuckets();
+  const usagePayload = {
+    refreshedAt: Date.UTC(2026, 5, 30, 12, 0, 0),
+    start: "2026-01-01",
+    end: "2026-01-03",
+    selectedYear: 2026,
+    selectedRange: "year" as const,
+    availableYears: [2026, 2025],
+    selectedModel: "alpha",
+    models: ["alpha", "beta"],
+    days: [
+      {
+        day: "2026-01-01",
+        totalRequests: 1,
+        successRequests: 1,
+        failureRequests: 0,
+        totalDurationMs: 100,
+        durationSamples: 1,
+        nonCacheInputTokens: 10,
+        cacheReadInputTokens: 2,
+        outputTokens: 3,
+        totalTokens: 15,
+      },
+      {
+        day: "2026-01-02",
+        totalRequests: 0,
+        successRequests: 0,
+        failureRequests: 0,
+        totalDurationMs: 0,
+        durationSamples: 0,
+        nonCacheInputTokens: 0,
+        cacheReadInputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+      },
+      {
+        day: "2026-01-03",
+        totalRequests: 2,
+        successRequests: 1,
+        failureRequests: 1,
+        totalDurationMs: 220,
+        durationSamples: 2,
+        nonCacheInputTokens: 20,
+        cacheReadInputTokens: 4,
+        outputTokens: 6,
+        totalTokens: 30,
+      },
+    ],
+  };
   const html = renderStatusPage({
     availableWindows: [1, 3, 6],
     defaultWindowHours: 1,
@@ -4001,8 +4195,16 @@ run("status page renders fallback group priority panel without top hint text", (
     fallbackGroups: [
       { name: "group-a", members: ["beta", "alpha"] },
     ],
+    usage: usagePayload,
   });
 
+  assert.match(html, /Usage in selected time range/);
+  assert.match(html, /Persistent usage history requires --storage sqlite/);
+  assert.match(html, /id="usage-range"/);
+  assert.match(html, /Selected year/);
+  assert.match(html, /Requests/);
+  assert.match(html, /Cached/);
+  assert.match(html, /\/status\?range=year&amp;year=2025&amp;model=alpha/);
   assert.match(html, /Fallback Groups/);
   assert.match(html, /id="groups"/);
   assert.match(html, /id="range-total"/);
@@ -4107,7 +4309,21 @@ run("admin page relies on server cookie auth instead of client-side token storag
     version: 1,
     configPath: "C:/tmp/config.yaml",
     effectiveConfig: { port: 3000, models: [], fallback: {}, record: { max_size: 10 } },
-    form: { server: { port: "3000", ttfb_timeout: "5000" }, record: { max_size: "10" }, models: [], fallbackGroups: [] },
+    form: {
+      server: { port: "3000", ttfb_timeout: "5000" },
+      record: { max_size: "10" },
+      models: [
+        {
+          name: "alpha",
+          provider: "openai-chat",
+          base_url: "https://example.com/v1",
+          api_key: "test-key",
+          model: "upstream-alpha",
+          extras: { image: false, headers: { "X-Test": "ok" } },
+        },
+      ],
+      fallbackGroups: [],
+    },
   } as any);
   assert.match(html, /fetch\("\/admin\/config\/data"/);
   assert.match(html, /fetch\("\/admin\/config\/apply"/);
@@ -4116,6 +4332,15 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.doesNotMatch(html, /AUTH_TOKEN_KEY = "nanollmAuthToken"/);
   assert.doesNotMatch(html, /sessionStorage\.setItem\(/);
   assert.doesNotMatch(html, /buildAuthedPath/);
+  assert.match(html, /高级字段/);
+  assert.match(html, /展开高级字段/);
+  assert.match(html, /收起高级字段/);
+  assert.match(html, /_advancedExpanded/);
+  assert.match(html, /function parseAdvancedJson/);
+  assert.match(html, /RESERVED_MODEL_EXTRA_KEYS/);
+  assert.match(html, /不能覆盖 name\/provider\/base_url\/api_key\/model/);
+  assert.match(html, /"image":false/);
+  assert.match(html, /"X-Test":"ok"/);
 });
 
 run("record page stream parser keeps data-like text inside JSON payloads", () => {
@@ -4252,6 +4477,36 @@ run("reader release errors are ignored only for cancelled or completed streams",
   assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: true, completed: false }), true);
   assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: false, completed: false }), false);
   assert.equal(shouldIgnoreStreamReadError(new Error("socket hang up"), { cancelled: false, completed: true }), false);
+});
+
+await runAsync("non-stream response compression gzips large responses when accept-encoding is absent", async () => {
+  const body = "a".repeat(RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1);
+  const response = buildNonStreamResponse(new Headers(), body, { headers: { "Content-Type": "application/json" } });
+  const bytes = Buffer.from(await response.arrayBuffer());
+
+  assert.equal(response.headers.get("content-encoding"), "gzip");
+  assert.equal(response.headers.get("vary"), "Accept-Encoding");
+  assert.equal(gunzipSync(bytes).toString("utf8"), body);
+});
+
+await runAsync("non-stream response compression prefers brotli when accepted", async () => {
+  const body = "b".repeat(RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1);
+  const response = buildNonStreamResponse(new Headers({ "Accept-Encoding": "gzip, br" }), body);
+  const bytes = Buffer.from(await response.arrayBuffer());
+
+  assert.equal(response.headers.get("content-encoding"), "br");
+  assert.equal(brotliDecompressSync(bytes).toString("utf8"), body);
+});
+
+await runAsync("non-stream response compression skips small and unsupported responses", async () => {
+  const small = buildNonStreamResponse(new Headers({ "Accept-Encoding": "gzip" }), "ok");
+  assert.equal(small.headers.get("content-encoding"), null);
+  assert.equal(await small.text(), "ok");
+
+  const body = "c".repeat(RESPONSE_COMPRESSION_THRESHOLD_BYTES + 1);
+  const unsupported = buildNonStreamResponse(new Headers({ "Accept-Encoding": "identity" }), body);
+  assert.equal(unsupported.headers.get("content-encoding"), null);
+  assert.equal(await unsupported.text(), body);
 });
 
 await runAsync("passthrough request records upstream request and response", async () => {

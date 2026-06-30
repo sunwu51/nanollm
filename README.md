@@ -3,7 +3,7 @@
 一个类似`litellm`的llm模型代理服务，主打一个轻量和本地化，适合个人本地聚合多个模型的场景。
 
 支持的功能：
-- 1 可以配置`chat/completions`(下面称chat), `responses`和`messages`三种接口（暂不支持google接口）的模型供应商，并且同时对外暴露这三种接口，带`/v1`前缀。
+- 1 可以配置`chat/completions`(下面称chat)、`responses`、`messages`三种文本接口，以及 OpenAI 图片`images/generations`和`images/edits`接口（暂不支持google接口）的模型供应商，并且同时对外暴露这些接口，带`/v1`前缀。
 - 2 可以配置修改请求中的`headers`和`body`，传自定义数据，其中`body`支持深度合并。
 - 3 可以配置兜底方案，设置兜底分组，如果调用的模型下游接口失败，并且在某个分组中，则会尝试分组其他模型。
 - 4 支持配置文件热更新和本地管理页：`models`、`fallback`、`server.ttfb_timeout`、`record.max_size` 保存后立即生效，`server.port` 和 `server.auth.token` 写回后需重启进程。
@@ -67,6 +67,13 @@ models:
     model: claude-sonnet-4-6
     ignore_invalid_history: true # optional, default true; Anthropic转换时丢弃空signature的thinking历史
 
+  - name: gpt-image-1
+    # OpenAI 图片接口规范（images/generations、images/edits）
+    provider: openai-image
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY4
+    model: gpt-image-1
+
 fallback:
   gpt-5.4:
     - gpt-5.4-a
@@ -84,9 +91,10 @@ gpt-5.4-a
 gpt-5.4-b
 glm5.1
 claude-sonnet-4-6
+gpt-image-1
 gpt-5.4
 ```
-这样5个模型，其中`gpt-5.4`是兜底分组名，当使用这个模型的时候，会在下属列表的模型中寻找可用的模型，尝试顺序为按`max(0, 最近5min失败次数-1)`升序；如果分数相同，则保持配置里的原始顺序。
+这样6个模型，其中`gpt-5.4`是兜底分组名，当使用这个模型的时候，会在下属列表的模型中寻找可用的模型，尝试顺序为按`max(0, 最近5min失败次数-1)`升序；如果分数相同，则保持配置里的原始顺序。
 
 ### Bearer Key 认证
 
@@ -158,6 +166,29 @@ models:
     model: claude-sonnet-4-6
     ignore_invalid_history: false
 ```
+
+### OpenAI 图片接口
+
+`provider: openai-image` 用于代理 OpenAI 图片接口，对外暴露两个入口：
+
+- `POST /v1/images/generations` — 图片生成
+- `POST /v1/images/edits` — 图片编辑（支持 `multipart/form-data` 上传）
+
+请求会按原始内容透传给上游，nanollm 不做协议转换，只负责注入鉴权、改写 `headers`、路由和兜底。上游路径会根据入口拼成 `${base_url}/images/generations` 或 `${base_url}/images/edits`。
+
+```yaml
+models:
+  - name: gpt-image-1
+    provider: openai-image
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY
+    model: gpt-image-1
+```
+
+注意：
+
+- 图片接口只能命中 `provider: openai-image` 的模型；如果请求的模型（或 fallback 分组里的候选模型）不是该 provider，会返回 `cannot handle image requests` 错误。
+- 图片请求同样参与 fallback 兜底和 `/status` 健康统计，行为与文本接口一致。
 
 ### 模型级 HTTP proxy
 
