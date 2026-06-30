@@ -4,6 +4,7 @@ set -euo pipefail
 CONFIG_DIR="${RAILWAY_VOLUME_MOUNT_PATH:-/data}"
 CONFIG_PATH="${CONFIG_PATH:-$CONFIG_DIR/config.yaml}"
 STORAGE_MODE="${NANOLLM_STORAGE:-sqlite}"
+MAX_OLD_SPACE_SIZE="${NANOLLM_MAX_OLD_SPACE_SIZE:-700}"
 
 mkdir -p "$(dirname "$CONFIG_PATH")"
 
@@ -25,4 +26,4 @@ EOF
   echo "Initialized nanollm config at $CONFIG_PATH"
 fi
 
-HOME="$CONFIG_DIR" node dist/server.js --config "$CONFIG_PATH" --storage "$STORAGE_MODE"
+HOME="$CONFIG_DIR" node --max-old-space-size="$MAX_OLD_SPACE_SIZE" dist/server.js --config "$CONFIG_PATH" --storage "$STORAGE_MODE"

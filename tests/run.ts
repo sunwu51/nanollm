@@ -29,6 +29,7 @@ import { ConfigManager } from "../src/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
 import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
+import { cacheResponseItems, resolveItemReferences } from "../src/response-cache.js";
 import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/response-compression.js";
 import { renderRecordPage } from "../src/record-page.js";
 import { renderStatusPage } from "../src/status-page.js";
@@ -4477,6 +4478,39 @@ run("reader release errors are ignored only for cancelled or completed streams",
   assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: true, completed: false }), true);
   assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: false, completed: false }), false);
   assert.equal(shouldIgnoreStreamReadError(new Error("socket hang up"), { cancelled: false, completed: true }), false);
+});
+
+run("response item cache evicts oldest entries after 500 items", () => {
+  cacheResponseItems(
+    Array.from({ length: 501 }, (_, index) => ({
+      id: `cache_item_${index}`,
+      type: "message",
+      content: [{ type: "output_text", text: `item ${index}` }],
+    })),
+  );
+
+  assert.deepEqual(resolveItemReferences([{ type: "item_reference", id: "cache_item_0" }]), []);
+  assert.deepEqual(resolveItemReferences([{ type: "item_reference", id: "cache_item_500" }]), [
+    {
+      id: "cache_item_500",
+      type: "message",
+      content: [{ type: "output_text", text: "item 500" }],
+    },
+  ]);
+});
+
+run("response item cache expires entries after one hour", () => {
+  const originalNow = Date.now;
+  try {
+    Date.now = () => 1_000;
+    cacheResponseItems([{ id: "cache_ttl_item", type: "message", content: [{ type: "output_text", text: "cached" }] }]);
+    assert.equal(resolveItemReferences([{ type: "item_reference", id: "cache_ttl_item" }]).length, 1);
+
+    Date.now = () => 1_000 + 60 * 60 * 1000 + 1;
+    assert.deepEqual(resolveItemReferences([{ type: "item_reference", id: "cache_ttl_item" }]), []);
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 await runAsync("non-stream response compression gzips large responses when accept-encoding is absent", async () => {
