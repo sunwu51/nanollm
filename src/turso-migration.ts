@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const MIGRATION_STATE_TABLE = "nanollm_migration_state";
+const COPY_BATCH_SIZE = 25;
 
 export interface TursoAutoMigrationConfig {
   sourcePath: string;
@@ -22,6 +23,12 @@ export function resolveTursoAutoMigrationConfig(env: NodeJS.ProcessEnv = process
 
 function quoteIdent(value: string): string {
   return `"${value.replace(/"/g, "\"\"")}"`;
+}
+
+function makeCreateStatementIdempotent(sql: string): string {
+  return sql
+    .replace(/^CREATE\s+TABLE\s+/i, "CREATE TABLE IF NOT EXISTS ")
+    .replace(/^CREATE\s+(UNIQUE\s+)?INDEX\s+/i, (_match, unique: string | undefined) => `CREATE ${unique ?? ""}INDEX IF NOT EXISTS `);
 }
 
 async function listSchemaObjects(client: Client, type: "table" | "index") {
@@ -49,23 +56,27 @@ async function copyTable(source: Client, target: Client, tableName: string) {
   const columns = await listColumns(source, tableName);
   if (columns.length === 0) return 0;
 
-  const rows = (await source.execute(`SELECT * FROM ${quoteIdent(tableName)}`)).rows;
-  if (rows.length === 0) return 0;
-
   const columnSql = columns.map(quoteIdent).join(", ");
   const placeholders = columns.map(() => "?").join(", ");
   const insertSql = `INSERT OR REPLACE INTO ${quoteIdent(tableName)} (${columnSql}) VALUES (${placeholders})`;
-  const batchSize = 100;
+  let copied = 0;
 
-  for (let index = 0; index < rows.length; index += batchSize) {
-    const chunk = rows.slice(index, index + batchSize).map((row) => ({
+  while (true) {
+    const rows = (await source.execute({
+      sql: `SELECT ${columnSql} FROM ${quoteIdent(tableName)} LIMIT ? OFFSET ?`,
+      args: [COPY_BATCH_SIZE, copied],
+    })).rows;
+    if (rows.length === 0) break;
+
+    const chunk = rows.map((row) => ({
       sql: insertSql,
       args: columns.map((column) => row[column] as string | number | bigint | ArrayBuffer | null),
     }));
     await target.batch(chunk, "write");
+    copied += rows.length;
   }
 
-  return rows.length;
+  return copied;
 }
 
 async function ensureMigrationStateTable(target: Client) {
@@ -97,7 +108,7 @@ export async function migrateSqliteFileToTurso(target: Client, sourcePath: strin
     const tables = await listSchemaObjects(source, "table");
     const indexes = await listSchemaObjects(source, "index");
     for (const table of tables) {
-      await target.executeMultiple(table.sql);
+      await target.executeMultiple(makeCreateStatementIdempotent(table.sql));
     }
 
     for (const table of tables) {
@@ -106,7 +117,7 @@ export async function migrateSqliteFileToTurso(target: Client, sourcePath: strin
     }
 
     for (const index of indexes) {
-      await target.executeMultiple(index.sql);
+      await target.executeMultiple(makeCreateStatementIdempotent(index.sql));
     }
   } finally {
     source.close();

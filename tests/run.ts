@@ -3999,33 +3999,49 @@ await runAsync("turso auto migration copies sqlite data only once per migration 
         response_status INTEGER,
         entry_json TEXT NOT NULL
       );
+      CREATE INDEX idx_records_created_at ON records(created_at);
     `);
-    await source.execute({
+    await target.executeMultiple(`
+      CREATE TABLE records (
+        key TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        model TEXT,
+        actual_model TEXT,
+        source TEXT NOT NULL,
+        status TEXT NOT NULL,
+        response_status INTEGER,
+        entry_json TEXT NOT NULL
+      );
+      CREATE INDEX idx_records_created_at ON records(created_at);
+    `);
+    await source.batch(Array.from({ length: 31 }, (_, index) => ({
       sql: `
-        INSERT INTO records (
-          key, request_id, created_at, path, model, actual_model, source, status, response_status, entry_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
+          INSERT INTO records (
+            key, request_id, created_at, path, model, actual_model, source, status, response_status, entry_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
       args: [
-        "k1",
-        "r1",
-        123,
+        `k${index}`,
+        `r${index}`,
+        123 + index,
         "/v1/responses",
         "alpha",
         "alpha",
         "codex",
         "success",
         200,
-        JSON.stringify({ requestId: "r1" }),
+        JSON.stringify({ requestId: `r${index}` }),
       ],
-    });
+    })), "write");
 
     const migrated = await autoMigrateSqliteFileToTurso(target, {
       sourcePath,
       migrationKey: "auto-import:test-source",
     });
     assert.equal(migrated, true);
-    assert.equal(Number((await target.execute("SELECT COUNT(*) AS count FROM records")).rows[0]?.count ?? 0), 1);
+    assert.equal(Number((await target.execute("SELECT COUNT(*) AS count FROM records")).rows[0]?.count ?? 0), 31);
 
     await source.execute({
       sql: `
@@ -4034,8 +4050,8 @@ await runAsync("turso auto migration copies sqlite data only once per migration 
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       args: [
-        "k2",
-        "r2",
+        "k-extra",
+        "r-extra",
         456,
         "/v1/chat/completions",
         "beta",
@@ -4043,7 +4059,7 @@ await runAsync("turso auto migration copies sqlite data only once per migration 
         "codex",
         "success",
         200,
-        JSON.stringify({ requestId: "r2" }),
+        JSON.stringify({ requestId: "r-extra" }),
       ],
     });
 
@@ -4052,7 +4068,7 @@ await runAsync("turso auto migration copies sqlite data only once per migration 
       migrationKey: "auto-import:test-source",
     });
     assert.equal(skipped, false);
-    assert.equal(Number((await target.execute("SELECT COUNT(*) AS count FROM records")).rows[0]?.count ?? 0), 1);
+    assert.equal(Number((await target.execute("SELECT COUNT(*) AS count FROM records")).rows[0]?.count ?? 0), 31);
   } finally {
     source.close();
     target.close();
