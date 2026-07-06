@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { createClient, type Client } from "@libsql/client";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import { Hono } from "hono";
 
@@ -57,6 +57,12 @@ import { runWithRequestId } from "../src/request-context.js";
 import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/status.js";
 import { shouldIgnoreStreamReadError } from "../src/stream-errors.js";
 import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/usage.js";
+import { openSqliteStorage } from "../src/sqlite.js";
+import { autoMigrateSqliteFileToTurso } from "../src/turso-migration.js";
+
+function createTestSqliteClient(path: string): Client {
+  return createClient({ url: `file:${path}`, intMode: "number", timeout: 5000 });
+}
 
 function run(name: string, fn: () => void) {
   try {
@@ -3706,7 +3712,7 @@ models:
   });
 });
 
-run("status store aggregates success rate and averages by five-minute bucket", () => {
+await runAsync("status store aggregates success rate and averages by five-minute bucket", async () => {
   const store = new StatusStore();
   const bucketStart = Date.UTC(2026, 3, 19, 4, 0, 0);
 
@@ -3719,7 +3725,7 @@ run("status store aggregates success rate and averages by five-minute bucket", (
   store.recordAttempt("alpha", bucketStart + 60_000);
   store.recordFailure("alpha", 300, bucketStart + 60_000);
 
-  const cell = store.getModelSeries("alpha", bucketStart + 60_000).at(-1);
+  const cell = (await store.getModelSeries("alpha", bucketStart + 60_000)).at(-1);
   assert.ok(cell);
   assert.equal(cell.totalRequests, 2);
   assert.equal(cell.successRequests, 1);
@@ -3732,7 +3738,7 @@ run("status store aggregates success rate and averages by five-minute bucket", (
   assert.equal(getHealthTone(cell.successRate, cell.totalRequests), "orange");
 });
 
-run("status store keeps only the last 6 hours of buckets", () => {
+await runAsync("status store keeps only the last 6 hours of buckets", async () => {
   const store = new StatusStore();
   const now = Date.UTC(2026, 3, 19, 23, 55, 0);
   const expired = now - (6 * 60 * 60 * 1000) - (5 * 60 * 1000);
@@ -3742,15 +3748,15 @@ run("status store keeps only the last 6 hours of buckets", () => {
   store.recordAttempt("alpha", now);
   store.recordSuccess("alpha", 200, 30, undefined, now);
 
-  const series = store.getModelSeries("alpha", now);
+  const series = await store.getModelSeries("alpha", now);
   assert.equal(series.length, 72);
   assert.equal(series.some((cell) => cell.bucketStart === expired && cell.totalRequests > 0), false);
   assert.equal(series.at(-1)?.totalRequests, 1);
 });
 
-run("sqlite status store persists sparse buckets for a month while UI series stays at 6 hours", () => {
+await runAsync("sqlite status store persists sparse buckets for a month while UI series stays at 6 hours", async () => {
   const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-status-"));
-  const db = new DatabaseSync(join(dir, "status.sqlite3"));
+  const db = createTestSqliteClient(join(dir, "status.sqlite3"));
   try {
     const now = Date.now();
     const fiveMinutesMs = 5 * 60 * 1000;
@@ -3774,7 +3780,8 @@ run("sqlite status store persists sparse buckets for a month while UI series sta
     store.recordAttempt("alpha", expiredTimestamp);
 
     const restarted = new SqliteStatusStore(db);
-    const visibleCell = restarted.getModelSeries("alpha", now).find((cell) => cell.bucketStart === visibleBucket);
+    const visibleSeries = await restarted.getModelSeries("alpha", now);
+    const visibleCell = visibleSeries.find((cell) => cell.bucketStart === visibleBucket);
     assert.ok(visibleCell);
     assert.equal(visibleCell.totalRequests, 1);
     assert.equal(visibleCell.successRequests, 1);
@@ -3782,11 +3789,11 @@ run("sqlite status store persists sparse buckets for a month while UI series sta
     assert.equal(visibleCell.avgDurationMs, 120);
     assert.equal(visibleCell.outputTokens, 450);
     assert.equal(visibleCell.avgTokenSpeed, 50);
-    assert.equal(restarted.getModelSeries("alpha", now).some((cell) => cell.bucketStart === retainedButHidden && cell.totalRequests > 0), false);
-    assert.equal(restarted.hasBucket("alpha", retainedButHidden), true);
-    assert.equal(restarted.hasBucket("alpha", expired), false);
+    assert.equal(visibleSeries.some((cell) => cell.bucketStart === retainedButHidden && cell.totalRequests > 0), false);
+    assert.equal(await restarted.hasBucket("alpha", retainedButHidden), true);
+    assert.equal(await restarted.hasBucket("alpha", expired), false);
     assert.equal(
-      (db.prepare("SELECT COUNT(*) AS count FROM status_buckets WHERE model_name = 'alpha'").get() as { count: number }).count,
+      Number((await db.execute("SELECT COUNT(*) AS count FROM status_buckets WHERE model_name = 'alpha'")).rows[0]?.count ?? 0),
       2,
     );
   } finally {
@@ -3795,7 +3802,7 @@ run("sqlite status store persists sparse buckets for a month while UI series sta
   }
 });
 
-run("usage store aggregates daily attempts, success usage, and failures", () => {
+await runAsync("usage store aggregates daily attempts, success usage, and failures", async () => {
   const store = new UsageStore();
   const timestamp = new Date(2026, 5, 30, 10, 30, 0).getTime();
   const day = formatLocalDay(timestamp);
@@ -3816,7 +3823,7 @@ run("usage store aggregates daily attempts, success usage, and failures", () => 
     totalTokens: 20,
   }, timestamp);
 
-  const all = store.listDays({ start: day, end: day })[0];
+  const all = (await store.listDays({ start: day, end: day }))[0];
   assert.equal(all.totalRequests, 3);
   assert.equal(all.successRequests, 2);
   assert.equal(all.failureRequests, 1);
@@ -3826,16 +3833,16 @@ run("usage store aggregates daily attempts, success usage, and failures", () => 
   assert.equal(all.outputTokens, 47);
   assert.equal(all.totalTokens, 185);
 
-  const alpha = store.listDays({ start: day, end: day, modelName: "alpha" })[0];
+  const alpha = (await store.listDays({ start: day, end: day, modelName: "alpha" }))[0];
   assert.equal(alpha.totalRequests, 2);
   assert.equal(alpha.successRequests, 1);
   assert.equal(alpha.failureRequests, 1);
   assert.equal(alpha.totalTokens, 165);
 });
 
-run("sqlite usage store persists daily aggregates and supports dense range queries", () => {
+await runAsync("sqlite usage store persists daily aggregates and supports dense range queries", async () => {
   const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-usage-"));
-  const db = new DatabaseSync(join(dir, "usage.sqlite3"));
+  const db = createTestSqliteClient(join(dir, "usage.sqlite3"));
   try {
     const timestamp = new Date(2026, 0, 2, 9, 0, 0).getTime();
     const day = formatLocalDay(timestamp);
@@ -3851,14 +3858,14 @@ run("sqlite usage store persists daily aggregates and supports dense range queri
     store.recordFailure("alpha", 40, timestamp + 2000);
 
     const restarted = new SqliteUsageStore(db);
-    const cell = restarted.getModelDay("alpha", day);
+    const cell = await restarted.getModelDay("alpha", day);
     assert.ok(cell);
     assert.equal(cell.totalRequests, 2);
     assert.equal(cell.successRequests, 1);
     assert.equal(cell.failureRequests, 1);
     assert.equal(cell.totalTokens, 15);
 
-    const range = restarted.listDays({ start: "2026-01-01", end: "2026-01-03", modelName: "alpha" });
+    const range = await restarted.listDays({ start: "2026-01-01", end: "2026-01-03", modelName: "alpha" });
     assert.equal(range.length, 3);
     assert.equal(range[0].day, "2026-01-01");
     assert.equal(range[0].totalRequests, 0);
@@ -3870,11 +3877,11 @@ run("sqlite usage store persists daily aggregates and supports dense range queri
   }
 });
 
-run("sqlite usage store backfills old daily data from status buckets once", () => {
+await runAsync("sqlite usage store backfills old daily aggregates from status buckets once", async () => {
   const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-usage-backfill-"));
-  const db = new DatabaseSync(join(dir, "usage.sqlite3"));
+  const db = createTestSqliteClient(join(dir, "usage.sqlite3"));
   try {
-    db.exec(`
+    await db.executeMultiple(`
       CREATE TABLE status_buckets (
         model_name TEXT NOT NULL,
         bucket_start INTEGER NOT NULL,
@@ -3895,25 +3902,59 @@ run("sqlite usage store backfills old daily data from status buckets once", () =
     const dayOneMorning = new Date(2026, 0, 2, 9, 0, 0).getTime();
     const dayOneAfternoon = new Date(2026, 0, 2, 16, 0, 0).getTime();
     const dayTwo = new Date(2026, 0, 3, 10, 0, 0).getTime();
-    const insertBucket = db.prepare(`
-      INSERT INTO status_buckets (
-        model_name,
-        bucket_start,
-        total_requests,
-        success_requests,
-        total_duration_ms,
-        duration_samples,
-        non_cache_input_tokens,
-        cache_read_input_tokens,
-        output_tokens
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    insertBucket.run("alpha", dayOneMorning, 2, 1, 300, 2, 10, 2, 3);
-    insertBucket.run("alpha", dayOneAfternoon, 1, 1, 100, 1, 7, 0, 5);
-    insertBucket.run("beta", dayTwo, 3, 2, 600, 3, 20, 4, 6);
+    await db.batch([
+      {
+        sql: `
+          INSERT INTO status_buckets (
+            model_name,
+            bucket_start,
+            total_requests,
+            success_requests,
+            total_duration_ms,
+            duration_samples,
+            non_cache_input_tokens,
+            cache_read_input_tokens,
+            output_tokens
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        args: ["alpha", dayOneMorning, 2, 1, 300, 2, 10, 2, 3],
+      },
+      {
+        sql: `
+          INSERT INTO status_buckets (
+            model_name,
+            bucket_start,
+            total_requests,
+            success_requests,
+            total_duration_ms,
+            duration_samples,
+            non_cache_input_tokens,
+            cache_read_input_tokens,
+            output_tokens
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        args: ["alpha", dayOneAfternoon, 1, 1, 100, 1, 7, 0, 5],
+      },
+      {
+        sql: `
+          INSERT INTO status_buckets (
+            model_name,
+            bucket_start,
+            total_requests,
+            success_requests,
+            total_duration_ms,
+            duration_samples,
+            non_cache_input_tokens,
+            cache_read_input_tokens,
+            output_tokens
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        args: ["beta", dayTwo, 3, 2, 600, 3, 20, 4, 6],
+      },
+    ], "write");
 
     const store = new SqliteUsageStore(db);
-    const alpha = store.getModelDay("alpha", "2026-01-02");
+    const alpha = await store.getModelDay("alpha", "2026-01-02");
     assert.ok(alpha);
     assert.equal(alpha.totalRequests, 3);
     assert.equal(alpha.successRequests, 2);
@@ -3921,7 +3962,7 @@ run("sqlite usage store backfills old daily data from status buckets once", () =
     assert.equal(alpha.totalDurationMs, 400);
     assert.equal(alpha.totalTokens, 27);
 
-    const beta = store.getModelDay("beta", "2026-01-03");
+    const beta = await store.getModelDay("beta", "2026-01-03");
     assert.ok(beta);
     assert.equal(beta.totalRequests, 3);
     assert.equal(beta.successRequests, 2);
@@ -3929,7 +3970,7 @@ run("sqlite usage store backfills old daily data from status buckets once", () =
     assert.equal(beta.totalTokens, 30);
 
     new SqliteUsageStore(db);
-    const alphaAfterRestart = store.getModelDay("alpha", "2026-01-02");
+    const alphaAfterRestart = await store.getModelDay("alpha", "2026-01-02");
     assert.equal(alphaAfterRestart?.totalRequests, 3);
     assert.equal(alphaAfterRestart?.totalTokens, 27);
   } finally {
@@ -3938,8 +3979,89 @@ run("sqlite usage store backfills old daily data from status buckets once", () =
   }
 });
 
-run("record store resets on start and supports full request id lookup", () => {
-  startRecording();
+await runAsync("turso auto migration copies sqlite data only once per migration key", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-turso-auto-migrate-"));
+  const sourcePath = join(dir, "source.sqlite3");
+  const targetPath = join(dir, "target.sqlite3");
+  const source = createTestSqliteClient(sourcePath);
+  const target = createTestSqliteClient(targetPath);
+  try {
+    await source.executeMultiple(`
+      CREATE TABLE records (
+        key TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        model TEXT,
+        actual_model TEXT,
+        source TEXT NOT NULL,
+        status TEXT NOT NULL,
+        response_status INTEGER,
+        entry_json TEXT NOT NULL
+      );
+    `);
+    await source.execute({
+      sql: `
+        INSERT INTO records (
+          key, request_id, created_at, path, model, actual_model, source, status, response_status, entry_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      args: [
+        "k1",
+        "r1",
+        123,
+        "/v1/responses",
+        "alpha",
+        "alpha",
+        "codex",
+        "success",
+        200,
+        JSON.stringify({ requestId: "r1" }),
+      ],
+    });
+
+    const migrated = await autoMigrateSqliteFileToTurso(target, {
+      sourcePath,
+      migrationKey: "auto-import:test-source",
+    });
+    assert.equal(migrated, true);
+    assert.equal(Number((await target.execute("SELECT COUNT(*) AS count FROM records")).rows[0]?.count ?? 0), 1);
+
+    await source.execute({
+      sql: `
+        INSERT INTO records (
+          key, request_id, created_at, path, model, actual_model, source, status, response_status, entry_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      args: [
+        "k2",
+        "r2",
+        456,
+        "/v1/chat/completions",
+        "beta",
+        "beta",
+        "codex",
+        "success",
+        200,
+        JSON.stringify({ requestId: "r2" }),
+      ],
+    });
+
+    const skipped = await autoMigrateSqliteFileToTurso(target, {
+      sourcePath,
+      migrationKey: "auto-import:test-source",
+    });
+    assert.equal(skipped, false);
+    assert.equal(Number((await target.execute("SELECT COUNT(*) AS count FROM records")).rows[0]?.count ?? 0), 1);
+  } finally {
+    source.close();
+    target.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await runAsync("record store resets on start and supports full request id lookup", async () => {
+  await startRecording();
   const requestId = "abcdef12-3456-7890-abcd-ef1234567890";
   assert.equal(
     beginRecordedRequest({
@@ -3981,10 +4103,10 @@ run("record store resets on start and supports full request id lookup", () => {
     body: { id: "chatcmpl_1", choices: [] },
   });
 
-  const record = getRecordedRequest(requestId);
+  const record = await getRecordedRequest(requestId);
   assert.ok(record);
-  assert.equal(getRecordedRequest(requestId)?.requestId, requestId);
-  assert.equal(getRecordedRequest("abcdef"), undefined);
+  assert.equal((await getRecordedRequest(requestId))?.requestId, requestId);
+  assert.equal(await getRecordedRequest("abcdef"), undefined);
   assert.equal(record?.clientRequest.headers.Authorization, "[REDACTED]");
   assert.equal(record?.attempts[0].request.headers?.Authorization, "[REDACTED]");
   assert.equal(record?.clientRequest.model, "alpha");
@@ -3994,17 +4116,17 @@ run("record store resets on start and supports full request id lookup", () => {
   assert.deepEqual(record?.attempts[0].request.body, { model: "upstream-alpha", stream: false });
   assert.deepEqual(record?.attempts[0].response.body, { id: "chatcmpl_1", choices: [] });
 
-  const summary = getRecordSummary();
+  const summary = await getRecordSummary();
   assert.equal(summary.recentKeys[0]?.model, "alpha");
   assert.equal(summary.recentKeys[0]?.actualModel, "alpha");
   assert.equal(summary.recentKeys[0]?.source, "claudecode");
   assert.equal(summary.recentKeys[0]?.status, "success");
 
-  stopRecording();
+  await stopRecording();
 });
 
-run("record summary keeps fallback actual model and failure status", () => {
-  startRecording();
+await runAsync("record summary keeps fallback actual model and failure status", async () => {
+  await startRecording();
   const requestId = "fedcba98-7654-3210-abcd-ef1234567890";
   beginRecordedRequest({
     requestId,
@@ -4024,16 +4146,16 @@ run("record summary keeps fallback actual model and failure status", () => {
   });
   setRecordedRequestError({ requestId, message: "boom" });
 
-  const summary = getRecordSummary();
+  const summary = await getRecordSummary();
   assert.equal(summary.recentKeys[0]?.model, "group-model");
   assert.equal(summary.recentKeys[0]?.actualModel, "fallback-alpha");
   assert.equal(summary.recentKeys[0]?.source, "codex");
   assert.equal(summary.recentKeys[0]?.status, "failure");
-  stopRecording();
+  await stopRecording();
 });
 
-run("record store only captures the first 10 requests by default", () => {
-  startRecording();
+await runAsync("record store only captures the first 10 requests by default", async () => {
+  await startRecording();
   for (let index = 0; index < 11; index += 1) {
     beginRecordedRequest({
       requestId: `${String(index).padStart(6, "0")}-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`,
@@ -4043,14 +4165,14 @@ run("record store only captures the first 10 requests by default", () => {
       stream: false,
     });
   }
-  assert.equal(getRecordSummary().capturedCount, 10);
-  assert.equal(getRecordSummary().size, 10);
-  assert.equal(getRecordedRequest("000000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"), undefined);
-  stopRecording();
+  assert.equal((await getRecordSummary()).capturedCount, 10);
+  assert.equal((await getRecordSummary()).size, 10);
+  assert.equal(await getRecordedRequest("000000-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"), undefined);
+  await stopRecording();
 });
 
-run("record store allows overriding max size when starting", () => {
-  startRecording({ maxSize: 100 });
+await runAsync("record store allows overriding max size when starting", async () => {
+  await startRecording({ maxSize: 100 });
   for (let index = 0; index < 101; index += 1) {
     beginRecordedRequest({
       requestId: `${String(index).padStart(6, "0")}-ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee`,
@@ -4060,19 +4182,19 @@ run("record store allows overriding max size when starting", () => {
       stream: false,
     });
   }
-  assert.equal(getRecordSummary().capturedCount, 100);
-  assert.equal(getRecordSummary().size, 100);
-  assert.equal(getRecordedRequest("000000-ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee"), undefined);
-  stopRecording();
+  assert.equal((await getRecordSummary()).capturedCount, 100);
+  assert.equal((await getRecordSummary()).size, 100);
+  assert.equal(await getRecordedRequest("000000-ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee"), undefined);
+  await stopRecording();
 });
 
-run("sqlite record store persists records and trims when max size shrinks", () => {
+await runAsync("sqlite record store persists records and trims when max size shrinks", async () => {
   const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-record-"));
   const dbPath = join(dir, "record.sqlite3");
-  let db = new DatabaseSync(dbPath);
+  let db = createTestSqliteClient(dbPath);
   try {
     useSqliteRecordStore(db);
-    startRecording({ maxSize: 3 });
+    await startRecording({ maxSize: 3 });
     const requestId = "abcdef12-3456-7890-abcd-ef1234567890";
     beginRecordedRequest({
       requestId,
@@ -4095,12 +4217,12 @@ run("sqlite record store persists records and trims when max size shrinks", () =
     appendRecordedClientResponseBody({ requestId, chunk: "data: client\n\n" });
     finalizeRecordedRequest({ requestId });
 
-    stopRecording();
+    await stopRecording();
     db.close();
-    db = new DatabaseSync(dbPath);
+    db = createTestSqliteClient(dbPath);
     useSqliteRecordStore(db);
-    startRecording({ maxSize: 3 });
-    const record = getRecordedRequest(requestId);
+    await startRecording({ maxSize: 3 });
+    const record = await getRecordedRequest(requestId);
     assert.ok(record);
     assert.equal(record?.clientRequest.headers.Authorization, "[REDACTED]");
     assert.equal(record?.attempts[0].request.headers?.Authorization, "[REDACTED]");
@@ -4109,7 +4231,7 @@ run("sqlite record store persists records and trims when max size shrinks", () =
     assert.equal(record?.clientRequest.actualModel, "fallback-alpha");
     assert.equal(record?.attempts[0].response.body, "data: one\n\n");
     assert.equal(record?.clientResponse.body, "data: client\n\n");
-    assert.equal(getRecordSummary().recentKeys[0]?.actualModel, "fallback-alpha");
+    assert.equal((await getRecordSummary()).recentKeys[0]?.actualModel, "fallback-alpha");
 
     for (let index = 0; index < 3; index += 1) {
       beginRecordedRequest({
@@ -4120,10 +4242,10 @@ run("sqlite record store persists records and trims when max size shrinks", () =
         stream: false,
       });
     }
-    assert.equal(getRecordSummary().size, 3);
-    assert.equal(getRecordedRequest(requestId), undefined);
-    configureRecording({ maxSize: 2 });
-    const summaryAfterResize = getRecordSummary();
+    assert.equal((await getRecordSummary()).size, 3);
+    assert.equal(await getRecordedRequest(requestId), undefined);
+    await configureRecording({ maxSize: 2 });
+    const summaryAfterResize = await getRecordSummary();
     assert.equal(summaryAfterResize.size, 2);
     assert.equal(summaryAfterResize.recentKeys.length, 2);
   } finally {
@@ -4133,7 +4255,7 @@ run("sqlite record store persists records and trims when max size shrinks", () =
   }
 });
 
-run("status page renders fallback group priority panel without top hint text", () => {
+await runAsync("status page renders fallback group priority panel without top hint text", async () => {
   const store = new StatusStore();
   const bucketStarts = store.listBuckets();
   const usagePayload = {
@@ -4190,8 +4312,8 @@ run("status page renders fallback group priority panel without top hint text", (
     refreshedAt: Date.UTC(2026, 4, 15, 12, 10, 0),
     bucketStarts,
     models: [
-      { name: "alpha", series: store.getModelSeries("alpha") },
-      { name: "beta", series: store.getModelSeries("beta") },
+      { name: "alpha", series: await store.getModelSeries("alpha") },
+      { name: "beta", series: await store.getModelSeries("beta") },
     ],
     fallbackGroups: [
       { name: "group-a", members: ["beta", "alpha"] },
@@ -4544,7 +4666,7 @@ await runAsync("non-stream response compression skips small and unsupported resp
 });
 
 await runAsync("passthrough request records upstream request and response", async () => {
-  startRecording();
+  await startRecording();
   const requestId = "12345678-1234-5678-9abc-def012345678";
   await withHTTPServer(async (_req, res) => {
     res.writeHead(200, { "Content-Type": "application/json", "Set-Cookie": "secret=1" });
@@ -4576,18 +4698,18 @@ await runAsync("passthrough request records upstream request and response", asyn
     });
   });
 
-  const record = getRecordedRequest(requestId);
+  const record = await getRecordedRequest(requestId);
   assert.ok(record);
   assert.equal(record?.attempts[0].response.status, 200);
   assert.equal(record?.attempts[0].response.headers?.["content-type"], "application/json");
   assert.equal(record?.attempts[0].request.headers?.Authorization, "[REDACTED]");
   assert.deepEqual(record?.attempts[0].response.body, { id: "resp_1", usage: { prompt_tokens: 3, completion_tokens: 2 } });
   assert.deepEqual(record?.clientResponse.body, { id: "resp_1", usage: { prompt_tokens: 3, completion_tokens: 2 } });
-  stopRecording();
+  await stopRecording();
 });
 
 await runAsync("openai-image raw json generation request uses configured upstream model", async () => {
-  startRecording();
+  await startRecording();
   const requestId = "22345678-1234-5678-9abc-def012345678";
   let upstreamPath = "";
   let upstreamBody = "";
@@ -4633,17 +4755,17 @@ await runAsync("openai-image raw json generation request uses configured upstrea
   assert.equal(upstreamPath, "/images/generations");
   assert.equal(upstreamContentType, "application/json");
   assert.equal(upstreamBody, JSON.stringify({ model: "upstream-image", prompt: "draw a cat", size: "1024x1024" }));
-  const record = getRecordedRequest(requestId);
+  const record = await getRecordedRequest(requestId);
   assert.ok(record);
   assert.equal(record?.attempts[0].provider, "openai-image");
   assert.deepEqual(record?.attempts[0].request.body, { model: "upstream-image", prompt: "draw a cat", size: "1024x1024" });
   assert.deepEqual(record?.attempts[0].response.body, { created: 1, data: [{ b64_json: "abc" }] });
   assert.deepEqual(record?.clientResponse.body, { created: 1, data: [{ b64_json: "abc" }] });
-  stopRecording();
+  await stopRecording();
 });
 
 await runAsync("openai-image raw multipart edit request uses configured upstream model", async () => {
-  startRecording();
+  await startRecording();
   const requestId = "22345678-1234-5678-9abc-def012345679";
   let upstreamPath = "";
   let upstreamModel = "";
@@ -4707,14 +4829,14 @@ await runAsync("openai-image raw multipart edit request uses configured upstream
   assert.equal(upstreamModel, "upstream-image");
   assert.equal(upstreamPrompt, "edit a cat");
   assert.equal(upstreamFileName, "cat.png");
-  const record = getRecordedRequest(requestId);
+  const record = await getRecordedRequest(requestId);
   assert.ok(record);
   assert.deepEqual(record?.attempts[0].request.body, { model: "upstream-image", prompt: "edit a cat", image: { type: "file", name: "cat.png", mediaType: "image/png", size: 11 } });
-  stopRecording();
+  await stopRecording();
 });
 
-run("record helpers append streaming provider and client chunks as text", () => {
-  startRecording();
+await runAsync("record helpers append streaming provider and client chunks as text", async () => {
+  await startRecording();
   const requestId = "654321ff-1234-5678-9abc-def012345678";
   beginRecordedRequest({
     requestId,
@@ -4748,16 +4870,16 @@ run("record helpers append streaming provider and client chunks as text", () => 
   appendRecordedClientResponseBody({ requestId, chunk: "data: out-1\n\n" });
   appendRecordedClientResponseBody({ requestId, chunk: "data: out-2\n\n" });
 
-  const record = getRecordedRequest(requestId);
+  const record = await getRecordedRequest(requestId);
   assert.equal(record?.attempts[0].response.body, "data: raw-1\n\ndata: raw-2\n\n");
   assert.equal(record?.clientResponse.body, "data: out-1\n\ndata: out-2\n\n");
   assert.equal(record?.attempts[0].response.truncated, false);
   assert.equal(record?.clientResponse.truncated, false);
-  stopRecording();
+  await stopRecording();
 });
 
-run("record store can hot-update max_size without clearing all captured entries", () => {
-  startRecording({ maxSize: 3 });
+await runAsync("record store can hot-update max_size without clearing all captured entries", async () => {
+  await startRecording({ maxSize: 3 });
   beginRecordedRequest({
     requestId: "111111ff-1234-5678-9abc-def012345678",
     path: "/v1/chat/completions",
@@ -4780,20 +4902,20 @@ run("record store can hot-update max_size without clearing all captured entries"
     stream: false,
   });
 
-  const summaryBefore = getRecordSummary();
+  const summaryBefore = await getRecordSummary();
   assert.equal(summaryBefore.limit, 3);
   assert.equal(summaryBefore.size, 3);
 
-  configureRecording({ maxSize: 1 });
-  const summaryAfter = getRecordSummary();
+  await configureRecording({ maxSize: 1 });
+  const summaryAfter = await getRecordSummary();
   assert.equal(summaryAfter.limit, 1);
   assert.equal(summaryAfter.size, 1);
   assert.deepEqual(summaryAfter.recentKeys.map((item) => item.key), ["333333ff-1234-5678-9abc-def012345678"]);
-  stopRecording();
+  await stopRecording();
 });
 
-run("record store keeps long text bodies without appending truncated marker", () => {
-  startRecording();
+await runAsync("record store keeps long text bodies without appending truncated marker", async () => {
+  await startRecording();
   const requestId = "76543210-1234-5678-9abc-def012345678";
   beginRecordedRequest({
     requestId,
@@ -4816,14 +4938,14 @@ run("record store keeps long text bodies without appending truncated marker", ()
   appendRecordedAttemptResponseBody({ requestId, index: 1, chunk: longChunk });
   appendRecordedClientResponseBody({ requestId, chunk: longChunk });
 
-  const record = getRecordedRequest(requestId);
+  const record = await getRecordedRequest(requestId);
   assert.equal((record?.attempts[0].response.body as string).length, longChunk.length);
   assert.equal((record?.clientResponse.body as string).length, longChunk.length);
   assert.doesNotMatch(record?.attempts[0].response.body as string, /\.\.\.\[truncated\]$/);
   assert.doesNotMatch(record?.clientResponse.body as string, /\.\.\.\[truncated\]$/);
   assert.equal(record?.attempts[0].response.truncated, false);
   assert.equal(record?.clientResponse.truncated, false);
-  stopRecording();
+  await stopRecording();
 });
 
 run("admin page refreshes clean state after history restore", () => {

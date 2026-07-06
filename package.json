@@ -16,6 +16,7 @@
     "start": "tsx server.ts",
     "start:railway": "bash scripts/start-railway.sh",
     "dev": "tsx --watch server.ts",
+    "migrate:turso": "tsx scripts/migrate-sqlite-to-turso.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsc -p tsconfig.build.json && node .test-dist/tests/run.js",
     "converter:test": "tsc -p tsconfig.build.json && node .test-dist/src/converters/test.js"
@@ -32,6 +33,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
     "@hono/node-server": "^1.19.13",
+    "@libsql/client": "^0.17.4",
     "dotenv": "^17.3.1",
     "hono": "^4.12.12",
     "https-proxy-agent": "^8.0.0",

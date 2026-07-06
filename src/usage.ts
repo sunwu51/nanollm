@@ -1,4 +1,5 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { SqliteClient } from "./sqlite.js";
+import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
 import type { NormalizedUsage } from "./converters/shared.js";
 
 export interface UsageDayMetrics {
@@ -27,7 +28,7 @@ export interface UsageStoreLike {
   recordAttempt(modelName: string, timestamp?: number): void;
   recordSuccess(modelName: string, durationMs: number, usage?: NormalizedUsage, timestamp?: number): void;
   recordFailure(modelName: string, durationMs?: number, timestamp?: number): void;
-  listDays(query: UsageQuery): UsageDayCell[];
+  listDays(query: UsageQuery): Promise<UsageDayCell[]>;
 }
 
 function pad2(value: number): string {
@@ -155,7 +156,7 @@ export class UsageStore implements UsageStoreLike {
     }
   }
 
-  listDays(query: UsageQuery): UsageDayCell[] {
+  async listDays(query: UsageQuery): Promise<UsageDayCell[]> {
     const sparse = new Map<string, UsageDayMetrics>();
     const modelEntries = query.modelName
       ? [[query.modelName, this.modelDays.get(query.modelName) ?? new Map<string, UsageDayMetrics>()] as const]
@@ -183,8 +184,13 @@ export class UsageStore implements UsageStoreLike {
 }
 
 export class SqliteUsageStore implements UsageStoreLike {
-  constructor(private readonly db: DatabaseSync) {
-    this.db.exec(`
+  private readonly ready: Promise<void>;
+  constructor(private readonly db: SqliteClient) {
+    this.ready = this.initialize();
+  }
+
+  private async initialize() {
+    await this.db.executeMultiple(`
       CREATE TABLE IF NOT EXISTS usage_days (
         day TEXT NOT NULL,
         model_name TEXT NOT NULL,
@@ -202,12 +208,25 @@ export class SqliteUsageStore implements UsageStoreLike {
       CREATE INDEX IF NOT EXISTS idx_usage_days_day ON usage_days(day);
       CREATE INDEX IF NOT EXISTS idx_usage_days_model_day ON usage_days(model_name, day);
     `);
-    this.backfillFromStatusBuckets();
+    await this.backfillFromStatusBuckets();
   }
 
-  private addMetrics(modelName: string, timestamp: number, delta: Partial<UsageDayMetrics>) {
+  private enqueueWrite(task: () => Promise<void>) {
+    enqueueClientWrite(this.db, async () => {
+      await this.ready;
+      await task();
+    });
+  }
+
+  private async waitForWrites() {
+    await this.ready;
+    await waitForClientWrites(this.db);
+  }
+
+  private async addMetrics(modelName: string, timestamp: number, delta: Partial<UsageDayMetrics>) {
     const day = formatLocalDay(timestamp);
-    this.db.prepare(`
+    await this.db.execute({
+      sql: `
       INSERT INTO usage_days (
         day,
         model_name,
@@ -231,46 +250,50 @@ export class SqliteUsageStore implements UsageStoreLike {
         cache_read_input_tokens = cache_read_input_tokens + excluded.cache_read_input_tokens,
         output_tokens = output_tokens + excluded.output_tokens,
         total_tokens = total_tokens + excluded.total_tokens
-    `).run(
-      day,
-      modelName,
-      delta.totalRequests ?? 0,
-      delta.successRequests ?? 0,
-      delta.failureRequests ?? 0,
-      delta.totalDurationMs ?? 0,
-      delta.durationSamples ?? 0,
-      delta.nonCacheInputTokens ?? 0,
-      delta.cacheReadInputTokens ?? 0,
-      delta.outputTokens ?? 0,
-      delta.totalTokens ?? 0,
-    );
+    `,
+      args: [
+        day,
+        modelName,
+        delta.totalRequests ?? 0,
+        delta.successRequests ?? 0,
+        delta.failureRequests ?? 0,
+        delta.totalDurationMs ?? 0,
+        delta.durationSamples ?? 0,
+        delta.nonCacheInputTokens ?? 0,
+        delta.cacheReadInputTokens ?? 0,
+        delta.outputTokens ?? 0,
+        delta.totalTokens ?? 0,
+      ],
+    });
   }
 
   recordAttempt(modelName: string, timestamp = Date.now()) {
-    this.addMetrics(modelName, timestamp, { totalRequests: 1 });
+    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, { totalRequests: 1 }));
   }
 
   recordSuccess(modelName: string, durationMs: number, usage?: NormalizedUsage, timestamp = Date.now()) {
-    this.addMetrics(modelName, timestamp, {
+    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, {
       successRequests: 1,
       totalDurationMs: durationMs,
       durationSamples: 1,
       ...buildTokenDelta(usage),
-    });
+    }));
   }
 
   recordFailure(modelName: string, durationMs?: number, timestamp = Date.now()) {
-    this.addMetrics(modelName, timestamp, {
+    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, {
       failureRequests: 1,
       ...(typeof durationMs === "number" && Number.isFinite(durationMs)
         ? { totalDurationMs: durationMs, durationSamples: 1 }
         : {}),
-    });
+    }));
   }
 
-  listDays(query: UsageQuery): UsageDayCell[] {
+  async listDays(query: UsageQuery): Promise<UsageDayCell[]> {
+    await this.waitForWrites();
     const rows = query.modelName
-      ? this.db.prepare(`
+      ? allRows<Record<string, unknown>>(await this.db.execute({
+          sql: `
           SELECT
             day,
             SUM(total_requests) AS total_requests,
@@ -286,8 +309,11 @@ export class SqliteUsageStore implements UsageStoreLike {
           WHERE day >= ? AND day <= ? AND model_name = ?
           GROUP BY day
           ORDER BY day
-        `).all(query.start, query.end, query.modelName) as Record<string, unknown>[]
-      : this.db.prepare(`
+        `,
+          args: [query.start, query.end, query.modelName],
+        }))
+      : allRows<Record<string, unknown>>(await this.db.execute({
+          sql: `
           SELECT
             day,
             SUM(total_requests) AS total_requests,
@@ -303,7 +329,9 @@ export class SqliteUsageStore implements UsageStoreLike {
           WHERE day >= ? AND day <= ?
           GROUP BY day
           ORDER BY day
-        `).all(query.start, query.end) as Record<string, unknown>[];
+        `,
+          args: [query.start, query.end],
+        }));
 
     const sparse = new Map<string, UsageDayMetrics>();
     for (const row of rows) {
@@ -315,22 +343,24 @@ export class SqliteUsageStore implements UsageStoreLike {
     return buildDenseDays(query, sparse);
   }
 
-  getModelDay(modelName: string, day: string): UsageDayCell | undefined {
-    const row = this.db.prepare("SELECT * FROM usage_days WHERE model_name = ? AND day = ?").get(modelName, day) as
-      | Record<string, unknown>
-      | undefined;
+  async getModelDay(modelName: string, day: string): Promise<UsageDayCell | undefined> {
+    await this.waitForWrites();
+    const row = firstRow<Record<string, unknown>>(await this.db.execute({
+      sql: "SELECT * FROM usage_days WHERE model_name = ? AND day = ?",
+      args: [modelName, day],
+    }));
     return row ? rowToUsageDayCell(row) : undefined;
   }
 
-  private backfillFromStatusBuckets() {
-    const hasStatusBuckets = this.db.prepare(`
+  private async backfillFromStatusBuckets() {
+    const hasStatusBuckets = firstRow(await this.db.execute(`
       SELECT 1
       FROM sqlite_master
       WHERE type = 'table' AND name = 'status_buckets'
-    `).get();
+    `));
     if (!hasStatusBuckets) return;
 
-    const rows = this.db.prepare(`
+    const rows = allRows<Record<string, unknown>>(await this.db.execute(`
       SELECT
         model_name,
         bucket_start,
@@ -343,7 +373,7 @@ export class SqliteUsageStore implements UsageStoreLike {
         output_tokens
       FROM status_buckets
       ORDER BY bucket_start
-    `).all() as Record<string, unknown>[];
+    `));
 
     const byModelDay = new Map<string, UsageDayMetrics & { day: string; modelName: string }>();
     for (const row of rows) {
@@ -370,24 +400,24 @@ export class SqliteUsageStore implements UsageStoreLike {
       byModelDay.set(key, metrics);
     }
 
-    const insert = this.db.prepare(`
-      INSERT INTO usage_days (
-        day,
-        model_name,
-        total_requests,
-        success_requests,
-        failure_requests,
-        total_duration_ms,
-        duration_samples,
-        non_cache_input_tokens,
-        cache_read_input_tokens,
-        output_tokens,
-        total_tokens
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(day, model_name) DO NOTHING
-    `);
-    for (const metrics of byModelDay.values()) {
-      insert.run(
+    const statements = Array.from(byModelDay.values()).map((metrics) => ({
+      sql: `
+        INSERT INTO usage_days (
+          day,
+          model_name,
+          total_requests,
+          success_requests,
+          failure_requests,
+          total_duration_ms,
+          duration_samples,
+          non_cache_input_tokens,
+          cache_read_input_tokens,
+          output_tokens,
+          total_tokens
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(day, model_name) DO NOTHING
+      `,
+      args: [
         metrics.day,
         metrics.modelName,
         metrics.totalRequests,
@@ -399,7 +429,10 @@ export class SqliteUsageStore implements UsageStoreLike {
         metrics.cacheReadInputTokens,
         metrics.outputTokens,
         metrics.totalTokens,
-      );
+      ],
+    }));
+    if (statements.length > 0) {
+      await this.db.batch(statements, "write");
     }
   }
 }

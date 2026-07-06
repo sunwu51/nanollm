@@ -304,7 +304,27 @@ npx nanollm --config /path/to/config.yaml
 npx nanollm --config /path/to/config.yaml --storage sqlite
 ```
 
-不传 `--storage` 时默认使用 `memory`，行为与旧版本一致。SQLite 文件固定保存在 `~/.nanollm/nanollm.sqlite3`。
+不传 `--storage` 时默认使用 `memory`，行为与旧版本一致。
+
+当 `--storage sqlite` 且未配置 Turso 时，会继续使用本地 SQLite 文件，路径固定为 `~/.nanollm/nanollm.sqlite3`。现有本地数据库文件可以直接复用，不需要迁移格式。
+
+如果希望把 SQLite 存储切到 Turso，可以配置以下环境变量：
+
+```bash
+export NANOLLM_TURSO_DATABASE_URL="libsql://xxx-xxx.aws-ap-northeast-1.turso.io"
+export NANOLLM_TURSO_AUTH_TOKEN="your-token"
+npx nanollm --config /path/to/config.yaml --storage sqlite
+```
+
+也兼容 Turso 默认变量名 `TURSO_DATABASE_URL` 和 `TURSO_AUTH_TOKEN`。只要 URL 配好了，`--storage sqlite` 就会优先走 Turso；未配置时自动回退到本地文件模式。
+
+如果希望在第一次切到 Turso 时自动把本地 SQLite 文件导入过去，可以额外设置：
+
+```bash
+export NANOLLM_TURSO_AUTO_MIGRATE_FROM="$HOME/.nanollm/nanollm.sqlite3"
+```
+
+这个开关只在当前实际连接的是 Turso 时生效。服务启动时会先执行一次导入，再继续启动；同一个源路径的自动迁移完成后会在目标库里记完成标记，后续重启不会重复导入。
 
 如果当前目录就有 `config.yaml`，也可以直接运行：
 ```bash
@@ -337,3 +357,34 @@ npx nanollm
 提供了`http://localhost:3000/record`的采样记录页面，可以查看请求记录，对debug非常有用（默认只保留最新10次请求，可通过`record.max_size`配置修改）。
 
 默认情况下，上述数据都只存在内存中，进程结束即消失。使用 `--storage sqlite` 启动后，`/status` 会在 SQLite 中保留最近 1 个月的稀疏 5 分钟统计 bucket（页面仍只展示最近 6 小时），`/record` 会持久化最近 `record.max_size` 条请求记录。
+
+### Turso Migration
+
+如果你之前在 Railway 上通过 volume 保存了 `nanollm.sqlite3`，推荐迁移流程是：
+
+1. 先在 Turso 创建一个新的空数据库，并拿到 URL / token。
+2. 从 Railway volume 导出现有的 SQLite 文件。
+3. 运行迁移脚本，把本地 SQLite 文件同步到 Turso：
+
+```bash
+npm run migrate:turso -- --from /path/to/nanollm.sqlite3
+```
+
+也可以显式传 URL / token：
+
+```bash
+npm run migrate:turso -- \
+  --from /path/to/nanollm.sqlite3 \
+  --url libsql://xxx-xxx.aws-ap-northeast-1.turso.io \
+  --token your-token
+```
+
+脚本会复制当前库里的表结构、数据和索引，适合把现有 Railway volume 数据一次性迁入新的 Turso 库。完成后，只需要在 Railway 配置上面的 Turso 环境变量，并继续使用 `--storage sqlite` 启动即可，不再依赖 volume。
+
+如果你更想在服务第一次连上 Turso 时自动导入，也可以在 Railway 额外配置：
+
+```bash
+NANOLLM_TURSO_AUTO_MIGRATE_FROM=/data/.nanollm/nanollm.sqlite3
+```
+
+建议首次切换完成后移除这个环境变量，虽然代码会根据完成标记跳过重复导入，但运维上更清晰。

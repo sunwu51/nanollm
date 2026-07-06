@@ -1,6 +1,7 @@
 import { getRequestId } from "./request-context.js";
 import { DEFAULT_RECORD_MAX_SIZE } from "./config.js";
-import type { DatabaseSync } from "node:sqlite";
+import type { SqliteClient } from "./sqlite.js";
+import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
 
 const REDACTED = "[REDACTED]";
 const SENSITIVE_HEADERS = new Set(["authorization", "x-api-key", "cookie", "set-cookie"]);
@@ -69,10 +70,10 @@ export interface RecordSummary {
 }
 
 interface RecordStoreLike {
-  start(options?: { maxSize?: number }): RecordSummary;
-  configure(options?: { maxSize?: number }): RecordSummary;
-  stop(): RecordSummary;
-  summary(): RecordSummary;
+  start(options?: { maxSize?: number }): RecordSummary | Promise<RecordSummary>;
+  configure(options?: { maxSize?: number }): RecordSummary | Promise<RecordSummary>;
+  stop(): RecordSummary | Promise<RecordSummary>;
+  summary(): RecordSummary | Promise<RecordSummary>;
   beginRequest(input: {
     requestId: string;
     path: string;
@@ -80,7 +81,7 @@ interface RecordStoreLike {
     body: unknown;
     stream: boolean;
   }): boolean;
-  get(requestIdOrPrefix: string): RecordEntry | undefined;
+  get(requestIdOrPrefix: string): RecordEntry | undefined | Promise<RecordEntry | undefined>;
   ensureAttempt(input: {
     requestId?: string;
     index: number;
@@ -108,7 +109,7 @@ interface RecordStoreLike {
   appendClientResponseBody(input: { requestId?: string; chunk: string }): void;
   setRequestError(input: { requestId?: string; message: string }): void;
   finalizeRequest(input: { requestId?: string }): void;
-  flush?(): void;
+  flush?(): void | Promise<void>;
 }
 
 function extractRequestModel(body: unknown): string | undefined {
@@ -437,10 +438,15 @@ class SqliteRecordStore implements RecordStoreLike {
   sessionStartedAt?: number;
   private readonly activeRecords = new Map<string, RecordEntry>();
   private readonly persistQueue = new Map<string, RecordEntry>();
+  private readonly ready: Promise<void>;
   private persistScheduled = false;
 
-  constructor(private readonly db: DatabaseSync) {
-    this.db.exec(`
+  constructor(private readonly db: SqliteClient) {
+    this.ready = this.initialize();
+  }
+
+  private async initialize() {
+    await this.db.executeMultiple(`
       CREATE TABLE IF NOT EXISTS records (
         key TEXT PRIMARY KEY,
         request_id TEXT NOT NULL UNIQUE,
@@ -456,16 +462,42 @@ class SqliteRecordStore implements RecordStoreLike {
       CREATE INDEX IF NOT EXISTS idx_records_created_at ON records(created_at);
       CREATE INDEX IF NOT EXISTS idx_records_request_id ON records(request_id);
     `);
-    this.capturedCount = this.countRecords();
+    this.capturedCount = await this.countRecords();
   }
 
-  private countRecords(): number {
-    const row = this.db.prepare("SELECT COUNT(*) AS count FROM records").get() as { count?: number } | undefined;
+  private async countRecords(): Promise<number> {
+    const row = firstRow<{ count?: number }>(await this.db.execute("SELECT COUNT(*) AS count FROM records"));
     return Number(row?.count ?? 0);
   }
 
-  private countVisibleRecords(): number {
-    return this.countRecords() + this.activeRecords.size + this.persistQueue.size;
+  private async waitForReady() {
+    await this.ready;
+  }
+
+  private enqueueWrite(task: () => Promise<void>) {
+    enqueueClientWrite(this.db, async () => {
+      await this.waitForReady();
+      await task();
+    });
+  }
+
+  private async waitForWrites() {
+    await this.waitForReady();
+    await waitForClientWrites(this.db);
+  }
+
+  private async trimToLimit() {
+    await this.waitForReady();
+    await this.db.execute({
+      sql: `
+        DELETE FROM records
+        WHERE key IN (
+          SELECT key FROM records ORDER BY created_at ASC, key ASC LIMIT max((SELECT COUNT(*) FROM records) - ?, 0)
+        )
+      `,
+      args: [this.limit],
+    });
+    this.capturedCount = await this.countRecords();
   }
 
   private getOldestVolatileKey(): string | undefined {
@@ -478,97 +510,99 @@ class SqliteRecordStore implements RecordStoreLike {
     return oldest?.key;
   }
 
-  private getOldestPersistedKey(): string | undefined {
-    const row = this.db.prepare("SELECT key FROM records ORDER BY created_at ASC, key ASC LIMIT 1").get() as { key?: string } | undefined;
-    return row?.key;
+  private async getOldestPersistedRow(): Promise<{ key: string; created_at: number } | undefined> {
+    return firstRow<{ key: string; created_at: number }>(await this.db.execute(`
+      SELECT key, created_at
+      FROM records
+      ORDER BY created_at ASC, key ASC
+      LIMIT 1
+    `));
   }
 
-  private evictOldestIfNeeded() {
-    while (this.countVisibleRecords() >= this.limit && this.limit > 0) {
+  private async countVisibleRecords(): Promise<number> {
+    return (await this.countRecords()) + this.activeRecords.size + this.persistQueue.size;
+  }
+
+  private async evictOldestIfNeeded(incomingCount = 0) {
+    while ((await this.countVisibleRecords()) + incomingCount > this.limit && this.limit > 0) {
       const volatileKey = this.getOldestVolatileKey();
-      const persistedKey = this.getOldestPersistedKey();
       const volatileRecord = volatileKey ? (this.activeRecords.get(volatileKey) ?? this.persistQueue.get(volatileKey)) : undefined;
-      const persistedRecord = persistedKey ? this.readByKey(persistedKey) : undefined;
+      const persistedRow = await this.getOldestPersistedRow();
       const evictVolatile =
         volatileRecord &&
-        (!persistedRecord ||
-          volatileRecord.createdAt < persistedRecord.createdAt ||
-          (volatileRecord.createdAt === persistedRecord.createdAt && volatileRecord.key < persistedRecord.key));
+        (!persistedRow ||
+          volatileRecord.createdAt < persistedRow.created_at ||
+          (volatileRecord.createdAt === persistedRow.created_at && volatileRecord.key < persistedRow.key));
       if (evictVolatile && volatileKey) {
         this.activeRecords.delete(volatileKey);
         this.persistQueue.delete(volatileKey);
-      } else if (persistedKey) {
-        this.db.prepare("DELETE FROM records WHERE key = ?").run(persistedKey);
+      } else if (persistedRow?.key) {
+        await this.db.execute({ sql: "DELETE FROM records WHERE key = ?", args: [persistedRow.key] });
       } else {
         break;
       }
     }
+    this.capturedCount = Math.min(this.limit, await this.countVisibleRecords());
   }
 
-  private trimToLimit() {
-    this.db.prepare(`
-      DELETE FROM records
-      WHERE key IN (
-        SELECT key FROM records ORDER BY created_at ASC, key ASC LIMIT max((SELECT COUNT(*) FROM records) - ?, 0)
-      )
-    `).run(this.limit);
-    this.capturedCount = this.countRecords();
-  }
-
-  private readByKey(key: string): RecordEntry | undefined {
+  private async readByKey(key: string): Promise<RecordEntry | undefined> {
     const active = this.activeRecords.get(key) ?? this.persistQueue.get(key);
     if (active) return active;
-    const row = this.db.prepare("SELECT entry_json FROM records WHERE key = ?").get(key) as RecordRow | undefined;
+    await this.waitForWrites();
+    const row = firstRow<RecordRow>(await this.db.execute({
+      sql: "SELECT entry_json FROM records WHERE key = ?",
+      args: [key],
+    }));
     return row ? parseRecordEntry(row.entry_json) : undefined;
-  }
-
-  private hasPersistedKey(key: string): boolean {
-    return !!this.db.prepare("SELECT 1 FROM records WHERE key = ?").get(key);
   }
 
   private readMutable(requestId?: string): RecordEntry | undefined {
     const id = resolveRequestId(requestId);
     if (!id) return undefined;
-    return this.readByKey(getRecordKey(id));
+    const key = getRecordKey(id);
+    return this.activeRecords.get(key) ?? this.persistQueue.get(key);
   }
 
-  private writeRecordNow(record: RecordEntry) {
+  private buildRecordStatement(record: RecordEntry) {
     const summary = updateSummaryFields(record);
-    this.db.prepare(`
-      INSERT INTO records (
-        key,
-        request_id,
-        created_at,
-        path,
-        model,
-        actual_model,
-        source,
-        status,
-        response_status,
-        entry_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        request_id = excluded.request_id,
-        created_at = excluded.created_at,
-        path = excluded.path,
-        model = excluded.model,
-        actual_model = excluded.actual_model,
-        source = excluded.source,
-        status = excluded.status,
-        response_status = excluded.response_status,
-        entry_json = excluded.entry_json
-    `).run(
-      record.key,
-      record.requestId,
-      record.createdAt,
-      summary.path,
-      summary.model,
-      summary.actualModel,
-      summary.source,
-      summary.status,
-      summary.responseStatus,
-      JSON.stringify(record),
-    );
+    return {
+      sql: `
+        INSERT INTO records (
+          key,
+          request_id,
+          created_at,
+          path,
+          model,
+          actual_model,
+          source,
+          status,
+          response_status,
+          entry_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          request_id = excluded.request_id,
+          created_at = excluded.created_at,
+          path = excluded.path,
+          model = excluded.model,
+          actual_model = excluded.actual_model,
+          source = excluded.source,
+          status = excluded.status,
+          response_status = excluded.response_status,
+          entry_json = excluded.entry_json
+      `,
+      args: [
+        record.key,
+        record.requestId,
+        record.createdAt,
+        summary.path,
+        summary.model,
+        summary.actualModel,
+        summary.source,
+        summary.status,
+        summary.responseStatus,
+        JSON.stringify(record),
+      ],
+    };
   }
 
   private scheduleFlush() {
@@ -576,56 +610,49 @@ class SqliteRecordStore implements RecordStoreLike {
     this.persistScheduled = true;
     queueMicrotask(() => {
       this.persistScheduled = false;
-      this.flush();
+      this.enqueueWrite(() => this.flush());
     });
   }
 
-  flush() {
+  async flush() {
+    await this.waitForReady();
     if (this.persistQueue.size === 0) return;
     const records = Array.from(this.persistQueue.values());
     this.persistQueue.clear();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      for (const record of records) {
-        this.writeRecordNow(record);
-      }
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
+    const statements = records.map((record) => this.buildRecordStatement(record));
+    if (statements.length > 0) {
+      await this.db.batch(statements, "write");
     }
+    await this.trimToLimit();
   }
 
-  start(options?: { maxSize?: number }) {
+  async start(options?: { maxSize?: number }) {
     this.limit = options?.maxSize ?? DEFAULT_RECORD_MAX_SIZE;
     this.enabled = true;
     if (!this.sessionStartedAt) this.sessionStartedAt = Date.now();
-    this.trimToLimit();
+    await this.trimToLimit();
     return this.summary();
   }
 
-  configure(options?: { maxSize?: number }) {
+  async configure(options?: { maxSize?: number }) {
     if (options?.maxSize !== undefined) {
       this.limit = options.maxSize;
-      this.trimToLimit();
+      await this.trimToLimit();
     }
     return this.summary();
   }
 
-  stop() {
-    this.flush();
+  async stop() {
+    await this.flush();
     this.enabled = false;
     this.sessionStartedAt = undefined;
     return this.summary();
   }
 
-  summary(): RecordSummary {
-    const rows = this.db.prepare(`
-      SELECT key, request_id, created_at, path, model, actual_model, source, status, response_status
-      FROM records
-      ORDER BY created_at DESC, key DESC
-      LIMIT ?
-    `).all(this.limit) as Array<{
+  async summary(): Promise<RecordSummary> {
+    await this.flush();
+    await this.evictOldestIfNeeded();
+    const rows = allRows<{
       key: string;
       request_id: string;
       created_at: number;
@@ -635,8 +662,16 @@ class SqliteRecordStore implements RecordStoreLike {
       source: RequestSource;
       status: RequestStatus;
       response_status?: number | null;
-    }>;
-    const activeSummaries = Array.from(this.activeRecords.values()).map((record) => {
+    }>(await this.db.execute({
+      sql: `
+        SELECT key, request_id, created_at, path, model, actual_model, source, status, response_status
+        FROM records
+        ORDER BY created_at DESC, key DESC
+        LIMIT ?
+      `,
+      args: [this.limit],
+    }));
+    const volatileSummaries = [...this.activeRecords.values(), ...this.persistQueue.values()].map((record) => {
       const summary = updateSummaryFields(record);
       return {
         key: record.key,
@@ -650,10 +685,11 @@ class SqliteRecordStore implements RecordStoreLike {
         response_status: summary.responseStatus,
       };
     });
-    const combinedRows = [...activeSummaries, ...rows.filter((row) => !this.activeRecords.has(row.key))]
+    const volatileKeys = new Set(volatileSummaries.map((row) => row.key));
+    const combinedRows = [...volatileSummaries, ...rows.filter((row) => !volatileKeys.has(row.key))]
       .sort((a, b) => b.created_at - a.created_at || b.key.localeCompare(a.key))
       .slice(0, this.limit);
-    const size = Math.min(this.limit, this.countRecords() + activeSummaries.filter((row) => !this.hasPersistedKey(row.key)).length);
+    const size = Math.min(this.limit, (await this.countRecords()) + this.activeRecords.size + this.persistQueue.size);
     this.capturedCount = size;
     return {
       enabled: this.enabled,
@@ -684,9 +720,7 @@ class SqliteRecordStore implements RecordStoreLike {
   }): boolean {
     if (!this.enabled) return false;
     const key = getRecordKey(input.requestId);
-    if (this.activeRecords.has(key) || this.persistQueue.has(key) || this.hasPersistedKey(key)) return true;
-    this.trimToLimit();
-    this.evictOldestIfNeeded();
+    if (this.activeRecords.has(key) || this.persistQueue.has(key)) return true;
     const requestMeta = buildRequestMeta(input.headers, input.body);
     this.activeRecords.set(key, {
       requestId: input.requestId,
@@ -705,11 +739,11 @@ class SqliteRecordStore implements RecordStoreLike {
       attempts: [],
       clientResponse: {},
     });
-    this.capturedCount = this.countRecords() + this.activeRecords.size;
+    this.capturedCount = Math.min(this.limit, this.capturedCount + 1);
     return true;
   }
 
-  get(requestId: string): RecordEntry | undefined {
+  async get(requestId: string): Promise<RecordEntry | undefined> {
     const normalized = normalizeLookupValue(requestId);
     return this.readByKey(normalized);
   }
@@ -757,7 +791,6 @@ class SqliteRecordStore implements RecordStoreLike {
       this.persistQueue.set(record.key, record);
       return;
     }
-    this.writeRecordNow(record);
   }
 
   setAttemptResponseMeta(input: {
@@ -859,33 +892,33 @@ class SqliteRecordStore implements RecordStoreLike {
 let recordStore: RecordStoreLike = new RecordStore();
 
 export function useMemoryRecordStore() {
-  recordStore.flush?.();
+  void recordStore.flush?.();
   recordStore = new RecordStore();
 }
 
-export function useSqliteRecordStore(db: DatabaseSync) {
-  recordStore.flush?.();
+export function useSqliteRecordStore(db: SqliteClient) {
+  void recordStore.flush?.();
   recordStore = new SqliteRecordStore(db);
 }
 
-export function startRecording(options?: { maxSize?: number }) {
-  return recordStore.start(options);
+export async function startRecording(options?: { maxSize?: number }) {
+  return await recordStore.start(options);
 }
 
-export function stopRecording() {
-  return recordStore.stop();
+export async function stopRecording() {
+  return await recordStore.stop();
 }
 
-export function configureRecording(options?: { maxSize?: number }) {
-  return recordStore.configure(options);
+export async function configureRecording(options?: { maxSize?: number }) {
+  return await recordStore.configure(options);
 }
 
-export function getRecordSummary() {
-  return recordStore.summary();
+export async function getRecordSummary() {
+  return await recordStore.summary();
 }
 
-export function flushRecording() {
-  recordStore.flush?.();
+export async function flushRecording() {
+  await recordStore.flush?.();
 }
 
 export function beginRecordedRequest(input: {
@@ -898,8 +931,8 @@ export function beginRecordedRequest(input: {
   return recordStore.beginRequest(input);
 }
 
-export function getRecordedRequest(requestIdOrPrefix: string) {
-  return recordStore.get(requestIdOrPrefix);
+export async function getRecordedRequest(requestIdOrPrefix: string) {
+  return await recordStore.get(requestIdOrPrefix);
 }
 
 export function ensureRecordedAttempt(input: {
