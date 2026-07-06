@@ -1,5 +1,6 @@
 import type { NormalizedUsage } from "./converters/shared.js";
-import type { DatabaseSync } from "node:sqlite";
+import type { SqliteClient } from "./sqlite.js";
+import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const RETENTION_MS = 6 * 60 * 60 * 1000;
@@ -42,7 +43,8 @@ export interface StatusStoreLike {
   ): void;
   recordFailure(modelName: string, durationMs?: number, timestamp?: number): void;
   listBuckets(now?: number): number[];
-  getModelSeries(modelName: string, now?: number): StatusCell[];
+  listModelNames(now?: number): Promise<string[]>;
+  getModelSeries(modelName: string, now?: number): Promise<StatusCell[]>;
 }
 
 function createEmptyMetrics(): RequestMetrics {
@@ -148,7 +150,16 @@ export class StatusStore {
     return buckets;
   }
 
-  getModelSeries(modelName: string, now = Date.now()): StatusCell[] {
+  async listModelNames(now = Date.now()): Promise<string[]> {
+    const names: string[] = [];
+    for (const [modelName, buckets] of this.modelBuckets.entries()) {
+      pruneBuckets(buckets, now);
+      if (buckets.size > 0) names.push(modelName);
+    }
+    return names.sort((left, right) => left.localeCompare(right));
+  }
+
+  async getModelSeries(modelName: string, now = Date.now()): Promise<StatusCell[]> {
     const buckets = this.modelBuckets.get(modelName);
     if (buckets) pruneBuckets(buckets, now);
 
@@ -225,8 +236,13 @@ function buildStatusCell(bucketStart: number, metrics: RequestMetrics): StatusCe
 }
 
 export class SqliteStatusStore implements StatusStoreLike {
-  constructor(private readonly db: DatabaseSync) {
-    this.db.exec(`
+  private readonly ready: Promise<void>;
+  constructor(private readonly db: SqliteClient) {
+    this.ready = this.initialize();
+  }
+
+  private async initialize() {
+    await this.db.executeMultiple(`
       CREATE TABLE IF NOT EXISTS status_buckets (
         model_name TEXT NOT NULL,
         bucket_start INTEGER NOT NULL,
@@ -245,17 +261,33 @@ export class SqliteStatusStore implements StatusStoreLike {
       );
       CREATE INDEX IF NOT EXISTS idx_status_buckets_bucket_start ON status_buckets(bucket_start);
     `);
-    this.pruneOldBuckets();
+    await this.pruneOldBuckets();
   }
 
-  private pruneOldBuckets(now = Date.now()) {
+  private enqueueWrite(task: () => Promise<void>) {
+    enqueueClientWrite(this.db, async () => {
+      await this.ready;
+      await task();
+    });
+  }
+
+  private async waitForWrites() {
+    await this.ready;
+    await waitForClientWrites(this.db);
+  }
+
+  private async pruneOldBuckets(now = Date.now()) {
     const minBucketStart = floorToFiveMinutes(now - SQLITE_RETENTION_MS);
-    this.db.prepare("DELETE FROM status_buckets WHERE bucket_start < ?").run(minBucketStart);
+    await this.db.execute({
+      sql: "DELETE FROM status_buckets WHERE bucket_start < ?",
+      args: [minBucketStart],
+    });
   }
 
-  private addMetrics(modelName: string, timestamp: number, delta: Partial<RequestMetrics>) {
+  private async addMetrics(modelName: string, timestamp: number, delta: Partial<RequestMetrics>) {
     const bucketStart = floorToFiveMinutes(timestamp);
-    this.db.prepare(`
+    await this.db.execute({
+      sql: `
       INSERT INTO status_buckets (
         model_name,
         bucket_start,
@@ -283,26 +315,28 @@ export class SqliteStatusStore implements StatusStoreLike {
         non_cache_input_tokens = non_cache_input_tokens + excluded.non_cache_input_tokens,
         cache_read_input_tokens = cache_read_input_tokens + excluded.cache_read_input_tokens,
         output_tokens = output_tokens + excluded.output_tokens
-    `).run(
-      modelName,
-      bucketStart,
-      delta.totalRequests ?? 0,
-      delta.successRequests ?? 0,
-      delta.totalTtfbMs ?? 0,
-      delta.ttfbSamples ?? 0,
-      delta.totalDurationMs ?? 0,
-      delta.durationSamples ?? 0,
-      delta.totalStreamMs ?? 0,
-      delta.streamSamples ?? 0,
-      delta.nonCacheInputTokens ?? 0,
-      delta.cacheReadInputTokens ?? 0,
-      delta.outputTokens ?? 0,
-    );
-    this.pruneOldBuckets();
+    `,
+      args: [
+        modelName,
+        bucketStart,
+        delta.totalRequests ?? 0,
+        delta.successRequests ?? 0,
+        delta.totalTtfbMs ?? 0,
+        delta.ttfbSamples ?? 0,
+        delta.totalDurationMs ?? 0,
+        delta.durationSamples ?? 0,
+        delta.totalStreamMs ?? 0,
+        delta.streamSamples ?? 0,
+        delta.nonCacheInputTokens ?? 0,
+        delta.cacheReadInputTokens ?? 0,
+        delta.outputTokens ?? 0,
+      ],
+    });
+    await this.pruneOldBuckets();
   }
 
   recordAttempt(modelName: string, timestamp = Date.now()) {
-    this.addMetrics(modelName, timestamp, { totalRequests: 1 });
+    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, { totalRequests: 1 }));
   }
 
   recordSuccess(
@@ -313,7 +347,7 @@ export class SqliteStatusStore implements StatusStoreLike {
     timestamp = Date.now(),
     streamDurationMs?: number,
   ) {
-    this.addMetrics(modelName, timestamp, {
+    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, {
       successRequests: 1,
       totalDurationMs: durationMs,
       durationSamples: 1,
@@ -324,12 +358,12 @@ export class SqliteStatusStore implements StatusStoreLike {
       ...(typeof streamDurationMs === "number" && Number.isFinite(streamDurationMs) && streamDurationMs > 0
         ? { totalStreamMs: streamDurationMs, streamSamples: 1 }
         : {}),
-    });
+    }));
   }
 
   recordFailure(modelName: string, durationMs?: number, timestamp = Date.now()) {
     if (typeof durationMs !== "number" || !Number.isFinite(durationMs)) return;
-    this.addMetrics(modelName, timestamp, { totalDurationMs: durationMs, durationSamples: 1 });
+    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, { totalDurationMs: durationMs, durationSamples: 1 }));
   }
 
   listBuckets(now = Date.now()): number[] {
@@ -341,14 +375,34 @@ export class SqliteStatusStore implements StatusStoreLike {
     return buckets;
   }
 
-  getModelSeries(modelName: string, now = Date.now()): StatusCell[] {
+  async listModelNames(now = Date.now()): Promise<string[]> {
+    await this.waitForWrites();
     const bucketStarts = this.listBuckets(now);
     const firstBucket = bucketStarts[0] ?? floorToFiveMinutes(now);
-    const rows = this.db.prepare(`
+    const rows = allRows<Record<string, unknown>>(await this.db.execute({
+      sql: `
+      SELECT DISTINCT model_name
+      FROM status_buckets
+      WHERE bucket_start >= ?
+      ORDER BY model_name
+    `,
+      args: [firstBucket],
+    }));
+    return rows.map((row) => String(row.model_name ?? ""));
+  }
+
+  async getModelSeries(modelName: string, now = Date.now()): Promise<StatusCell[]> {
+    await this.waitForWrites();
+    const bucketStarts = this.listBuckets(now);
+    const firstBucket = bucketStarts[0] ?? floorToFiveMinutes(now);
+    const rows = allRows<Record<string, unknown>>(await this.db.execute({
+      sql: `
       SELECT *
       FROM status_buckets
       WHERE model_name = ? AND bucket_start >= ? AND bucket_start <= ?
-    `).all(modelName, firstBucket, bucketStarts.at(-1) ?? firstBucket) as Record<string, unknown>[];
+    `,
+      args: [modelName, firstBucket, bucketStarts.at(-1) ?? firstBucket],
+    }));
     const byBucket = new Map<number, RequestMetrics>();
     for (const row of rows) {
       byBucket.set(Number(row.bucket_start), rowToMetrics(row));
@@ -356,7 +410,11 @@ export class SqliteStatusStore implements StatusStoreLike {
     return bucketStarts.map((bucketStart) => buildStatusCell(bucketStart, byBucket.get(bucketStart) ?? createEmptyMetrics()));
   }
 
-  hasBucket(modelName: string, bucketStart: number): boolean {
-    return !!this.db.prepare("SELECT 1 FROM status_buckets WHERE model_name = ? AND bucket_start = ?").get(modelName, bucketStart);
+  async hasBucket(modelName: string, bucketStart: number): Promise<boolean> {
+    await this.waitForWrites();
+    return !!firstRow(await this.db.execute({
+      sql: "SELECT 1 FROM status_buckets WHERE model_name = ? AND bucket_start = ?",
+      args: [modelName, bucketStart],
+    }));
   }
 }

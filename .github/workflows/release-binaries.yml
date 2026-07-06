@@ -83,86 +83,29 @@ jobs:
       - name: Build JavaScript
         run: npm run build
 
-      - name: Bundle for SEA
+      - name: Build pkg SEA binary
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist-sea
-          npx --yes esbuild@0.27.1 dist/cli.js \
-            --bundle \
-            --platform=node \
-            --format=esm \
-            --target=node24 \
-            --packages=bundle \
-            --external:node:sqlite \
-            --outfile=dist-sea/nanollm.bundle.mjs
-
-      - name: Write SEA wrapper and config
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cat > dist-sea/sea-main.cjs <<'EOF'
-          const { getAsset } = require("node:sea");
-          const { createRequire } = require("node:module");
-
-          globalThis.require = createRequire(process.execPath);
-          const source = getAsset("main.mjs", "utf8");
-          const encoded = Buffer.from(source, "utf8").toString("base64");
-
-          import(`data:text/javascript;base64,${encoded}`).catch((error) => {
-            console.error(error);
-            process.exitCode = 1;
-          });
-          EOF
-
-          cat > dist-sea/sea-config.json <<'EOF'
-          {
-            "main": "dist-sea/sea-main.cjs",
-            "output": "dist-sea/nanollm.blob",
-            "assets": {
-              "main.mjs": "dist-sea/nanollm.bundle.mjs"
-            },
-            "disableExperimentalSEAWarning": true,
-            "useCodeCache": false,
-            "useSnapshot": false
-          }
-          EOF
-
-      - name: Build SEA blob
-        run: node --experimental-sea-config dist-sea/sea-config.json
-
-      - name: Prepare executable
-        shell: bash
-        run: |
-          set -euo pipefail
-          node -e "require('node:fs').copyFileSync(process.execPath, 'dist-sea/${{ matrix.executable_name }}')"
-          chmod +x "dist-sea/${{ matrix.executable_name }}" || true
-
-      - name: Remove macOS signature
-        if: runner.os == 'macOS'
-        run: codesign --remove-signature "dist-sea/${{ matrix.executable_name }}"
-
-      - name: Inject SEA blob
-        shell: bash
-        run: |
-          set -euo pipefail
-          npx --yes postject "dist-sea/${{ matrix.executable_name }}" NODE_SEA_BLOB dist-sea/nanollm.blob \
-            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 \
-            ${{ matrix.postject_extra_args }}
+          npx --yes @yao-pkg/pkg@6.21.0 . --targets host --out-path dist-sea
 
       - name: Smoke test
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > dist-sea/smoke.config.yaml <<'EOF'
+          tmpdir="$(mktemp -d)"
+          cp "dist-sea/${{ matrix.executable_name }}" "$tmpdir/${{ matrix.executable_name }}"
+          chmod +x "$tmpdir/${{ matrix.executable_name }}" || true
+          mkdir -p "$tmpdir/home"
+
+          cat > "$tmpdir/smoke.config.yaml" <<'EOF'
           server:
             port: 31991
           models: []
           EOF
 
-          "dist-sea/${{ matrix.executable_name }}" --config dist-sea/smoke.config.yaml > dist-sea/smoke.log 2>&1 &
+          HOME="$tmpdir/home" "$tmpdir/${{ matrix.executable_name }}" --config "$tmpdir/smoke.config.yaml" --storage sqlite > dist-sea/smoke.log 2>&1 &
           pid="$!"
 
           cleanup() {

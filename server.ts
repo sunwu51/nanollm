@@ -45,6 +45,7 @@ import {
   getRecordedRequest,
   getRecordSummary,
   startRecording,
+  type RecordEntry,
   setRecordedClientResponseBody,
   setRecordedClientResponseMeta,
   setRecordedRequestError,
@@ -54,6 +55,8 @@ import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
 import { shouldIgnoreStreamReadError } from "./src/stream-errors.js";
 import { handleServerStartupError } from "./src/startup-error.js";
+import { openSqliteStorage } from "./src/sqlite.js";
+import { autoMigrateSqliteFileToTurso, resolveTursoAutoMigrationConfig } from "./src/turso-migration.js";
 import { stringify as stringifyYAML } from "yaml";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -108,36 +111,27 @@ function resolveStorageMode(argv: string[]): StorageMode {
   return "memory";
 }
 
-async function openSqliteDatabase(dbPath: string) {
-  mkdirSync(dirname(dbPath), { recursive: true });
-  try {
-    const sqlite = await import("node:sqlite");
-    const db = new sqlite.DatabaseSync(dbPath);
-    db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA synchronous = NORMAL;
-      PRAGMA busy_timeout = 5000;
-    `);
-    return db;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to initialize SQLite storage. Use --storage memory or run nanollm with a Node.js version that supports node:sqlite. Cause: ${message}`);
-  }
-}
-
 const startupArgs = process.argv.slice(2);
 const configPath = resolveConfigPath(startupArgs);
 const storageMode = resolveStorageMode(startupArgs);
 const sqlitePath = join(homedir(), ".nanollm", "nanollm.sqlite3");
-const sqliteDb = storageMode === "sqlite" ? await openSqliteDatabase(sqlitePath) : undefined;
+const sqliteStorage = storageMode === "sqlite" ? await openSqliteStorage(sqlitePath) : undefined;
+if (sqliteStorage?.driver === "turso") {
+  const autoMigration = resolveTursoAutoMigrationConfig();
+  if (autoMigration) {
+    await autoMigrateSqliteFileToTurso(sqliteStorage.client, autoMigration, {
+      logger: (message) => console.log(`[TURSO MIGRATE] ${message}`),
+    });
+  }
+}
 const configManager = new ConfigManager(configPath);
 const startupSnapshot = configManager.getActiveSnapshot();
-if (sqliteDb) {
-  useSqliteRecordStore(sqliteDb);
+if (sqliteStorage) {
+  useSqliteRecordStore(sqliteStorage.client);
 }
-startRecording({ maxSize: startupSnapshot.effectiveConfig.record.max_size });
+await startRecording({ maxSize: startupSnapshot.effectiveConfig.record.max_size });
 configManager.onUpdate(({ snapshot }, source) => {
-  configureRecording({ maxSize: snapshot.effectiveConfig.record.max_size });
+  void configureRecording({ maxSize: snapshot.effectiveConfig.record.max_size });
   if (source !== "startup") {
     console.log(
       `[CONFIG APPLY] source=${source} models=${snapshot.effectiveConfig.models.length} fallback_groups=${Object.keys(snapshot.effectiveConfig.fallback).length} record_max_size=${snapshot.effectiveConfig.record.max_size}`,
@@ -247,8 +241,8 @@ type AdminConfigForm = {
 };
 
 const fallbackFailureTracker = new FallbackFailureTracker();
-const statusStore: StatusStoreLike = sqliteDb ? new SqliteStatusStore(sqliteDb) : new StatusStore();
-const usageStore: UsageStoreLike = sqliteDb ? new SqliteUsageStore(sqliteDb) : new UsageStore();
+const statusStore: StatusStoreLike = sqliteStorage ? new SqliteStatusStore(sqliteStorage.client) : new StatusStore();
+const usageStore: UsageStoreLike = sqliteStorage ? new SqliteUsageStore(sqliteStorage.client) : new UsageStore();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
 
@@ -588,7 +582,7 @@ const REPLAY_HEADER_OVERRIDES = new Set([
   "x-nanollm-replay-of",
 ]);
 
-function buildReplayHeaders(record: NonNullable<ReturnType<typeof getRecordedRequest>>, authToken?: string): Headers {
+function buildReplayHeaders(record: RecordEntry, authToken?: string): Headers {
   const headers = new Headers();
   for (const [key, value] of Object.entries(record.clientRequest.headers ?? {})) {
     const normalized = key.toLowerCase();
@@ -606,7 +600,7 @@ function buildReplayHeaders(record: NonNullable<ReturnType<typeof getRecordedReq
   return headers;
 }
 
-async function replayRecordedRequest(record: NonNullable<ReturnType<typeof getRecordedRequest>>, config: ServerConfig) {
+async function replayRecordedRequest(record: RecordEntry, config: ServerConfig) {
   const path = record.clientRequest.path;
   if (!REPLAY_ALLOWED_PATHS.has(path)) {
     return {
@@ -641,23 +635,24 @@ async function replayRecordedRequest(record: NonNullable<ReturnType<typeof getRe
   };
 }
 
-function buildStatusPayload(config: ServerConfig, c?: Context) {
+async function buildStatusPayload(config: ServerConfig, c?: Context) {
   const availableWindows = [1, 3, 6];
   const now = Date.now();
+  const modelNames = await statusStore.listModelNames(now);
   return {
     availableWindows,
     defaultWindowHours: 1,
     refreshedAt: now,
     bucketStarts: statusStore.listBuckets(),
-    models: config.models.map((model) => ({
-      name: model.name,
-      series: statusStore.getModelSeries(model.name),
-    })),
+    models: await Promise.all(modelNames.map(async (modelName) => ({
+      name: modelName,
+      series: await statusStore.getModelSeries(modelName, now),
+    }))),
     fallbackGroups: Object.entries(config.fallback).map(([name, members]) => ({
       name,
       members: sortFallbackGroupMembers(members, (memberName) => fallbackFailureTracker.getFailureCount(memberName, now)),
     })),
-    usage: buildUsagePayload(c, config, { basePath: "/status", now }),
+    usage: await buildUsagePayload(c, config, { basePath: "/status", now }),
   };
 }
 
@@ -694,7 +689,7 @@ function normalizeUsageDayRange(rawStart: unknown, rawEnd: unknown, year: number
   return start <= end ? { start, end } : defaultRange;
 }
 
-function buildUsagePayload(c: Context | undefined, config: ServerConfig, options?: { basePath?: string; now?: number }) {
+async function buildUsagePayload(c: Context | undefined, config: ServerConfig, options?: { basePath?: string; now?: number }) {
   const now = options?.now ?? Date.now();
   const selectedRange = normalizeUsageRangeMode(c?.req.query("range"));
   const selectedYear = selectedRange === "year" ? toUsageYear(c?.req.query("year"), now) : null;
@@ -713,14 +708,17 @@ function buildUsagePayload(c: Context | undefined, config: ServerConfig, options
     selectedModel: selectedModel ?? null,
     models: modelNames,
     basePath: options?.basePath,
-    days: usageStore.listDays({ ...range, modelName: selectedModel }),
+    days: await usageStore.listDays({ ...range, modelName: selectedModel }),
   };
 }
 
-function buildRecordQueryPayload(requestIdOrPrefix: string) {
-  const record = getRecordedRequest(requestIdOrPrefix);
+async function buildRecordQueryPayload(requestIdOrPrefix: string) {
+  const [record, summary] = await Promise.all([
+    getRecordedRequest(requestIdOrPrefix),
+    getRecordSummary(),
+  ]);
   return {
-    summary: getRecordSummary(),
+    summary,
     ...(record ? { record } : {}),
   };
 }
@@ -1313,13 +1311,13 @@ app.get("/", (c) => {
 
 app.get("/health", (c) => c.json({ ok: true }));
 
-app.get("/status", (c) => c.html(renderStatusPage(buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c))));
-app.get("/status/data", (c) => c.json(buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c)));
-app.get("/record", (c) => c.html(renderRecordPage(getRecordSummary())));
-app.get("/record/summary", (c) => c.json(getRecordSummary()));
-app.get("/record/:requestId", (c) => {
+app.get("/status", async (c) => c.html(renderStatusPage(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c))));
+app.get("/status/data", async (c) => c.json(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c)));
+app.get("/record", async (c) => c.html(renderRecordPage(await getRecordSummary())));
+app.get("/record/summary", async (c) => c.json(await getRecordSummary()));
+app.get("/record/:requestId", async (c) => {
   const requestId = c.req.param("requestId");
-  const payload = buildRecordQueryPayload(requestId);
+  const payload = await buildRecordQueryPayload(requestId);
   if (!payload.record) {
     return c.json({ error: `Record '${requestId.slice(0, 6)}' not found`, summary: payload.summary }, 404);
   }
@@ -1327,16 +1325,16 @@ app.get("/record/:requestId", (c) => {
 });
 app.post("/record/:requestId/replay", async (c) => {
   const requestId = c.req.param("requestId");
-  const record = getRecordedRequest(requestId);
+  const record = await getRecordedRequest(requestId);
   if (!record) {
-    return c.json({ error: `Record '${requestId.slice(0, 6)}' not found`, summary: getRecordSummary() }, 404);
+    return c.json({ error: `Record '${requestId.slice(0, 6)}' not found`, summary: await getRecordSummary() }, 404);
   }
 
   const result = await replayRecordedRequest(record, configManager.getActiveSnapshot().effectiveConfig);
   return c.json({
     ...result,
     replayOf: record.requestId,
-    summary: getRecordSummary(),
+    summary: await getRecordSummary(),
     note: "Sensitive client headers are not replayed; provider auth uses current config.",
   }, result.status);
 });
@@ -1428,7 +1426,7 @@ app.post("/v1/images/edits", createImageRoute("edits"));
 const startupConfig = startupSnapshot.effectiveConfig;
 const server = serve({ fetch: app.fetch, port: startupConfig.port }, (info) => {
   console.log(`nanollm gateway listening on http://localhost:${info.port}`);
-  console.log(`Storage: ${storageMode}${sqliteDb ? ` (${sqlitePath})` : ""}`);
+  console.log(`Storage: ${storageMode}${sqliteStorage ? ` (${sqliteStorage.driver}: ${sqliteStorage.location})` : ""}`);
   console.log(`Models: ${startupConfig.models.map((m) => m.name).join(", ") || "(none)"}`);
   console.log(
     `Fallback groups: ${
@@ -1448,8 +1446,8 @@ server.once("error", (error: Error & { code?: string }) => {
 
 server.once("close", () => {
   configManager.dispose();
-  flushRecording();
-  sqliteDb?.close();
+  void flushRecording();
+  sqliteStorage?.client.close();
 });
 
 export { server };
