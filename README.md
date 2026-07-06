@@ -85,6 +85,12 @@ Run the proxy server:
 npx nanollm --config /path/to/config.yaml
 ```
 
+### 二进制打包说明
+
+GitHub release 二进制现在使用 `@yao-pkg/pkg` 的 enhanced SEA 模式构建，而不是直接手写 Node SEA。这样可以继续保持单文件分发，同时兼容当前 `@libsql/client` 在本地 sqlite 模式下对 `@libsql/*` 原生包的动态加载。
+
+`package.json` 里的 `pkg.assets` 显式包含了 `node_modules/@libsql/**/*`，让打包产物在首次运行时可以把对应平台的 `.node` 原生文件解压到本地缓存后再加载；否则独立二进制在 `--storage sqlite` 模式下会报 `Cannot find module '@libsql/<platform>'`。
+
 对外提供的模型为所有`models[i].name`和`fallback.[group_name]`例如上面demo配置就提供了
 ```
 gpt-5.4-a

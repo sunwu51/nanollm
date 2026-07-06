@@ -43,6 +43,7 @@ export interface StatusStoreLike {
   ): void;
   recordFailure(modelName: string, durationMs?: number, timestamp?: number): void;
   listBuckets(now?: number): number[];
+  listModelNames(now?: number): Promise<string[]>;
   getModelSeries(modelName: string, now?: number): Promise<StatusCell[]>;
 }
 
@@ -147,6 +148,15 @@ export class StatusStore {
       buckets.push(currentBucket - index * FIVE_MINUTES_MS);
     }
     return buckets;
+  }
+
+  async listModelNames(now = Date.now()): Promise<string[]> {
+    const names: string[] = [];
+    for (const [modelName, buckets] of this.modelBuckets.entries()) {
+      pruneBuckets(buckets, now);
+      if (buckets.size > 0) names.push(modelName);
+    }
+    return names.sort((left, right) => left.localeCompare(right));
   }
 
   async getModelSeries(modelName: string, now = Date.now()): Promise<StatusCell[]> {
@@ -363,6 +373,22 @@ export class SqliteStatusStore implements StatusStoreLike {
       buckets.push(currentBucket - index * FIVE_MINUTES_MS);
     }
     return buckets;
+  }
+
+  async listModelNames(now = Date.now()): Promise<string[]> {
+    await this.waitForWrites();
+    const bucketStarts = this.listBuckets(now);
+    const firstBucket = bucketStarts[0] ?? floorToFiveMinutes(now);
+    const rows = allRows<Record<string, unknown>>(await this.db.execute({
+      sql: `
+      SELECT DISTINCT model_name
+      FROM status_buckets
+      WHERE bucket_start >= ?
+      ORDER BY model_name
+    `,
+      args: [firstBucket],
+    }));
+    return rows.map((row) => String(row.model_name ?? ""));
   }
 
   async getModelSeries(modelName: string, now = Date.now()): Promise<StatusCell[]> {

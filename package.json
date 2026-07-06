@@ -1,6 +1,6 @@
 {
   "name": "nanollm",
-  "version": "0.0.22",
+  "version": "0.0.23",
   "description": "Hono server that proxies llm request",
   "main": "./dist/server.js",
   "bin": {
@@ -20,6 +20,12 @@
     "typecheck": "tsc --noEmit",
     "test": "tsc -p tsconfig.build.json && node .test-dist/tests/run.js",
     "converter:test": "tsc -p tsconfig.build.json && node .test-dist/src/converters/test.js"
+  },
+  "pkg": {
+    "sea": true,
+    "assets": [
+      "node_modules/@libsql/**/*"
+    ]
   },
   "keywords": [
     "llm",

@@ -638,14 +638,15 @@ async function replayRecordedRequest(record: RecordEntry, config: ServerConfig) 
 async function buildStatusPayload(config: ServerConfig, c?: Context) {
   const availableWindows = [1, 3, 6];
   const now = Date.now();
+  const modelNames = await statusStore.listModelNames(now);
   return {
     availableWindows,
     defaultWindowHours: 1,
     refreshedAt: now,
     bucketStarts: statusStore.listBuckets(),
-    models: await Promise.all(config.models.map(async (model) => ({
-      name: model.name,
-      series: await statusStore.getModelSeries(model.name),
+    models: await Promise.all(modelNames.map(async (modelName) => ({
+      name: modelName,
+      series: await statusStore.getModelSeries(modelName, now),
     }))),
     fallbackGroups: Object.entries(config.fallback).map(([name, members]) => ({
       name,

@@ -3754,6 +3754,19 @@ await runAsync("status store keeps only the last 6 hours of buckets", async () =
   assert.equal(series.at(-1)?.totalRequests, 1);
 });
 
+await runAsync("status store lists only model names with recent buckets", async () => {
+  const store = new StatusStore();
+  const now = Date.UTC(2026, 3, 19, 23, 55, 0);
+  const expired = now - (6 * 60 * 60 * 1000) - (5 * 60 * 1000);
+
+  store.recordAttempt("zeta", expired);
+  store.recordAttempt("beta", now);
+  store.recordSuccess("beta", 100, 20, undefined, now);
+  store.recordAttempt("alpha", now);
+
+  assert.deepEqual(await store.listModelNames(now), ["alpha", "beta"]);
+});
+
 await runAsync("sqlite status store persists sparse buckets for a month while UI series stays at 6 hours", async () => {
   const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-status-"));
   const db = createTestSqliteClient(join(dir, "status.sqlite3"));
@@ -3796,6 +3809,30 @@ await runAsync("sqlite status store persists sparse buckets for a month while UI
       Number((await db.execute("SELECT COUNT(*) AS count FROM status_buckets WHERE model_name = 'alpha'")).rows[0]?.count ?? 0),
       2,
     );
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await runAsync("sqlite status store lists only model names with recent buckets", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-status-models-"));
+  const db = createTestSqliteClient(join(dir, "status.sqlite3"));
+  try {
+    const now = Date.now();
+    const expiredTimestamp = now - 31 * 24 * 60 * 60 * 1000;
+    const hiddenTimestamp = now - 7 * 60 * 60 * 1000;
+    const visibleTimestamp = now - 5 * 60 * 1000;
+    const store = new SqliteStatusStore(db);
+
+    store.recordAttempt("zeta", expiredTimestamp);
+    store.recordAttempt("gamma", hiddenTimestamp);
+    store.recordSuccess("gamma", 100, 10, undefined, hiddenTimestamp);
+    store.recordAttempt("beta", visibleTimestamp);
+    store.recordSuccess("beta", 80, 20, undefined, visibleTimestamp);
+    store.recordAttempt("alpha", now);
+
+    assert.deepEqual(await store.listModelNames(now), ["alpha", "beta"]);
   } finally {
     db.close();
     rmSync(dir, { recursive: true, force: true });
