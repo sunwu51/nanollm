@@ -26,6 +26,7 @@ export interface UpstreamRequestOptions {
   userAgent?: string;
   attemptIndex?: number;
   modelName?: string;
+  recordedRequestBody?: unknown;
 }
 
 export interface UpstreamTiming {
@@ -281,7 +282,15 @@ async function upstreamFetch(
   stream: boolean,
   options?: UpstreamRequestOptions,
 ): Promise<{ response: Response; timing: UpstreamTiming }> {
-  return upstreamFetchToUrl(config, getUpstreamURL(config), body, stream, getForwardHeaders(config, options), options);
+  return upstreamFetchToUrl(
+    config,
+    getUpstreamURL(config),
+    body,
+    stream,
+    getForwardHeaders(config, options),
+    options,
+    options?.recordedRequestBody ?? body,
+  );
 }
 
 async function upstreamFetchToUrl(
@@ -572,7 +581,7 @@ export async function passthroughRequest(
   options?: UpstreamRequestOptions,
 ): Promise<{ json: unknown; timing: UpstreamTiming; usage?: NormalizedUsage }> {
   const body = preparePassthroughBody(config, rawBody, false);
-  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, options);
+  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, { ...options, recordedRequestBody: body });
   const text = await response.text();
   setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
   const json = JSON.parse(text);
@@ -586,7 +595,7 @@ export async function passthroughStreamRequest(
   options?: UpstreamRequestOptions,
 ): Promise<{ body: ReadableStream<Uint8Array>; headers: Headers; timing: UpstreamTiming }> {
   const body = preparePassthroughBody(config, rawBody, true);
-  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, options);
+  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, { ...options, recordedRequestBody: body });
   if (!response.body) throw new Error("Upstream returned no streaming body");
   const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0 });
   return { body: validatedBody, headers: response.headers, timing };
@@ -604,7 +613,7 @@ export async function forwardRequest(
   normalized.image = config.image ?? true;
 
   const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
-  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, options);
+  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, { ...options, recordedRequestBody: body });
   const text = await response.text();
   setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
   const json = JSON.parse(text);
@@ -622,7 +631,7 @@ export async function forwardStreamRequest(
   normalized.image = config.image ?? true;
 
   const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
-  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, options);
+  const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, { ...options, recordedRequestBody: body });
   if (!response.body) throw new Error("Upstream returned no streaming body");
   const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0 });
   return { body: validatedBody, upstreamFormat: config.provider, timing };

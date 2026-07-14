@@ -42,6 +42,7 @@ import {
   configureRecording,
   finalizeRecordedRequest,
   flushRecording,
+  getRecordedImage,
   getRecordedRequest,
   getRecordSummary,
   startRecording,
@@ -1323,9 +1324,28 @@ app.get("/record/:requestId", async (c) => {
   }
   return c.json(payload);
 });
+app.get("/record/images/:hash", async (c) => {
+  const hash = c.req.param("hash");
+  if (!/^[a-f0-9]{64}$/i.test(hash)) {
+    return c.json({ error: "Invalid image hash" }, 400);
+  }
+  const dataUrl = await getRecordedImage(hash);
+  if (!dataUrl) {
+    return c.json({ error: "Recorded image not found" }, 404);
+  }
+  const match = /^data:([^;,]+);base64,([\s\S]*)$/i.exec(dataUrl);
+  if (!match) {
+    return c.json({ error: "Recorded image is invalid" }, 500);
+  }
+  return c.body(Buffer.from(match[2], "base64"), 200, {
+    "Content-Type": match[1],
+    "Content-Disposition": `inline; filename="recorded-image-${hash.slice(0, 12)}"`,
+    "Cache-Control": "private, no-store",
+  });
+});
 app.post("/record/:requestId/replay", async (c) => {
   const requestId = c.req.param("requestId");
-  const record = await getRecordedRequest(requestId);
+  const record = await getRecordedRequest(requestId, { hydrateImages: true });
   if (!record) {
     return c.json({ error: `Record '${requestId.slice(0, 6)}' not found`, summary: await getRecordSummary() }, 404);
   }

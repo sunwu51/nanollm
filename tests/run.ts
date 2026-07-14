@@ -41,6 +41,7 @@ import {
   configureRecording,
   ensureRecordedAttempt,
   finalizeRecordedRequest,
+  getRecordedImage,
   getRecordedRequest,
   getRecordSummary,
   setRecordedAttemptResponseBody,
@@ -4178,6 +4179,31 @@ await runAsync("record store resets on start and supports full request id lookup
   await stopRecording();
 });
 
+await runAsync("record store deduplicates image data URLs and restores them for replay", async () => {
+  await startRecording({ maxSize: 3 });
+  const image = `data:image/png;base64,${"a".repeat(1024 * 1024)}`;
+  for (const requestId of ["image001-1234-5678-9abc-def012345678", "image002-1234-5678-9abc-def012345678"]) {
+    beginRecordedRequest({
+      requestId,
+      path: "/v1/chat/completions",
+      headers: {},
+      body: { model: "alpha", messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: image } }] }] },
+      stream: false,
+    });
+  }
+
+  const compact = await getRecordedRequest("image001-1234-5678-9abc-def012345678");
+  const compactUrl = (((compact?.clientRequest.body as any).messages[0].content[0].image_url.url) as Record<string, unknown>);
+  assert.equal(typeof compactUrl.__nanollm_record_image_ref, "string");
+  assert.equal(compactUrl.bytes, Buffer.byteLength(image));
+  assert.notEqual(compactUrl, image);
+  assert.equal(await getRecordedImage(String(compactUrl.__nanollm_record_image_ref)), image);
+
+  const replayable = await getRecordedRequest("image001-1234-5678-9abc-def012345678", { hydrateImages: true });
+  assert.equal((replayable?.clientRequest.body as any).messages[0].content[0].image_url.url, image);
+  await stopRecording();
+});
+
 await runAsync("record summary keeps fallback actual model and failure status", async () => {
   await startRecording();
   const requestId = "fedcba98-7654-3210-abcd-ef1234567890";
@@ -4308,6 +4334,42 @@ await runAsync("sqlite record store persists records and trims when max size shr
   }
 });
 
+await runAsync("sqlite record store restores compacted images after restart", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-record-images-"));
+  const dbPath = join(dir, "record.sqlite3");
+  let db = createTestSqliteClient(dbPath);
+  const requestId = "image003-1234-5678-9abc-def012345678";
+  const image = `data:image/jpeg;base64,${"b".repeat(1024 * 256)}`;
+  try {
+    useSqliteRecordStore(db);
+    await startRecording({ maxSize: 2 });
+    beginRecordedRequest({
+      requestId,
+      path: "/v1/responses",
+      headers: {},
+      body: { model: "alpha", input: [{ role: "user", content: [{ type: "input_image", image_url: image }] }] },
+      stream: false,
+    });
+    finalizeRecordedRequest({ requestId });
+    await stopRecording();
+    db.close();
+
+    db = createTestSqliteClient(dbPath);
+    useSqliteRecordStore(db);
+    await startRecording({ maxSize: 2 });
+    const compact = await getRecordedRequest(requestId);
+    const compactImage = (compact?.clientRequest.body as any).input[0].content[0].image_url;
+    assert.equal(typeof compactImage.__nanollm_record_image_ref, "string");
+    assert.equal(await getRecordedImage(compactImage.__nanollm_record_image_ref), image);
+    const replayable = await getRecordedRequest(requestId, { hydrateImages: true });
+    assert.equal((replayable?.clientRequest.body as any).input[0].content[0].image_url, image);
+  } finally {
+    useMemoryRecordStore();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 await runAsync("status page renders fallback group priority panel without top hint text", async () => {
   const store = new StatusStore();
   const bucketStarts = store.listBuckets();
@@ -4412,6 +4474,10 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /createValueNode/);
   assert.match(html, /createCollapsibleSection/);
   assert.match(html, /createStringNode/);
+  assert.match(html, /createImageReferenceLink/);
+  assert.match(html, /__nanollm_record_image_ref/);
+  assert.match(html, /"\/record\/images\/" \+ encodeURIComponent\(hash\)/);
+  assert.match(html, /image-ref-link/);
   assert.match(html, /parseStreamEvents/);
   assert.match(html, /renderStreamBody/);
   assert.match(html, /createCopyButton/);
