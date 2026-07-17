@@ -735,6 +735,29 @@ run("responses developer input message becomes chat system role", () => {
   assert.equal(chat.messages[1].role, "user");
 });
 
+run("responses agent_message input becomes a developer message", () => {
+  const chat = responsesRequestToChatParams({
+    model: "gpt-5",
+    input: [
+      {
+        type: "agent_message",
+        author: "/root",
+        recipient: "/root/query_time",
+        content: [
+          { type: "input_text", text: "Message Type: NEW_TASK\nTask name: /root/query_time\nSender: /root\nPayload:\n" },
+          { type: "encrypted_content", encrypted_content: "查询当前时间（Asia/Shanghai），简洁返回结果。" },
+        ],
+      },
+    ],
+  } as any);
+
+  assert.equal(chat.messages[0].role, "system");
+  assert.equal(
+    chat.messages[0].content,
+    "Delegated message from /root\nTarget agent: /root/query_time\nMessage Type: NEW_TASK\nTask name: /root/query_time\nSender: /root\nPayload:\n\n查询当前时间（Asia/Shanghai），简洁返回结果。",
+  );
+});
+
 run("unsupported request fields are ignored instead of failing", () => {
   const chatToResponses = chatParamsToResponsesRequest({
     model: "gpt-4o-mini",

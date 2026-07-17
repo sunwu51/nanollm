@@ -477,6 +477,7 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
   return input.flatMap((item) => {
     const itemType = item.type ?? "message";
     if (itemType === "message") return [normalizeOpenAIResponsesMessage(item)];
+    if (itemType === "agent_message") return [normalizeOpenAIResponsesAgentMessage(item)];
     if (itemType === "reasoning") {
       const reasoningParts = Array.isArray(item.summary) && item.summary.length > 0 ? item.summary : Array.isArray(item.content) ? item.content : [];
       const thinking = reasoningParts.map((part: any) => ({ type: "thinking" as const, thinking: part.text }));
@@ -509,6 +510,24 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
     if (itemType === "item_reference") return [];
     fail(`Responses input item type "${itemType}" is not supported`);
   });
+}
+
+function normalizeOpenAIResponsesAgentMessage(item: any): NormalizedMessage {
+  const content = Array.isArray(item.content)
+    ? item.content
+        .flatMap((part: any) => {
+          if (part.type === "input_text" && typeof part.text === "string") return [part.text];
+          if (part.type === "encrypted_content" && typeof part.encrypted_content === "string") return [part.encrypted_content];
+          return [];
+        })
+        .join("\n")
+    : "";
+  const header = [
+    `Delegated message from ${item.author ?? "unknown"}`,
+    `Target agent: ${item.recipient ?? "unknown"}`,
+  ].join("\n");
+
+  return { role: "developer", parts: [text(content ? `${header}\n${content}` : header)] };
 }
 
 function normalizeCustomToolInputToFunctionArguments(input: any): string {
