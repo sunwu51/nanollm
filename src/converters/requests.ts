@@ -1212,7 +1212,7 @@ function denormalizeOpenAIResponsesTools(tools: NormalizedTool[] | undefined): O
       namespaceTool = {
         type: "namespace",
         name: namespace,
-        description: "",
+        description: `Tools available in the ${namespace} namespace.`,
         tools: [],
       };
       namespaceTools.set(namespace, namespaceTool);

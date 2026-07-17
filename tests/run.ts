@@ -489,6 +489,7 @@ run("anthropic qualified mcp tools become responses namespace tools", () => {
   assert.equal((result.tools ?? []).length, 1);
   assert.equal((result.tools?.[0] as any).type, "namespace");
   assert.equal((result.tools?.[0] as any).name, "mcp__mcpcenter__");
+  assert.equal((result.tools?.[0] as any).description, "Tools available in the mcp__mcpcenter__ namespace.");
   assert.equal(((result.tools?.[0] as any).tools ?? [])[0].name, "calendar_get_events");
 });
 
