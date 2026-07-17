@@ -87,7 +87,10 @@ export function normalizeOpenAIResponsesRequest(request: OpenAIResponsesRequest)
     else messages.push(...normalizeOpenAIResponsesInput(request.instructions as any[]));
   }
   if (request.input !== undefined) messages.push(...normalizeOpenAIResponsesInput(typeof request.input === "string" ? request.input : (request.input as any[])));
-  const tools = request.tools?.flatMap((tool) => normalizeOpenAIResponsesTool(tool as any));
+  const additionalTools = Array.isArray(request.input)
+    ? request.input.flatMap((item: any) => item?.type === "additional_tools" && Array.isArray(item.tools) ? item.tools : [])
+    : [];
+  const tools = [...(request.tools ?? []), ...additionalTools].flatMap((tool) => normalizeOpenAIResponsesTool(tool as any));
   const normalizedToolChoice = request.tool_choice ? normalizeOpenAIResponsesToolChoice(request.tool_choice as any) : undefined;
 
   return {
@@ -502,6 +505,7 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
       console.warn(`Dropping unsupported Responses input item type "${itemType}" during conversion`);
       return [];
     }
+    if (itemType === "additional_tools") return [];
     if (itemType === "item_reference") return [];
     fail(`Responses input item type "${itemType}" is not supported`);
   });

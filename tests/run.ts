@@ -356,6 +356,34 @@ run("responses tool output becomes anthropic tool_result block", () => {
   assert.equal((result.messages[0].content as Array<{ type: string }>)[0].type, "tool_result");
 });
 
+run("responses additional_tools input item is converted to target protocol tools", () => {
+  const request = {
+    model: "gpt-5",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+      {
+        type: "additional_tools",
+        tools: [{
+          type: "function",
+          name: "lookup_weather",
+          description: "Look up weather",
+          parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+          strict: true,
+        }],
+      },
+    ],
+  } as any;
+
+  const anthropic = responsesRequestToAnthropicMessageRequest(request);
+  assert.equal(anthropic.tools?.length ?? 0, 1);
+  assert.equal((anthropic.tools?.[0] as any).name, "lookup_weather");
+  assert.deepEqual((anthropic.tools?.[0] as any).input_schema, { type: "object", properties: { city: { type: "string" } }, required: ["city"] });
+
+  const chat = responsesRequestToChatParams(request);
+  assert.equal(chat.tools?.length ?? 0, 1);
+  assert.equal((chat.tools?.[0] as any).function.name, "lookup_weather");
+});
+
 run("responses namespace tools flatten to qualified function names", () => {
   const result = responsesRequestToAnthropicMessageRequest({
     model: "gpt-5",
