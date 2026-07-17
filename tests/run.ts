@@ -41,6 +41,7 @@ import {
   configureRecording,
   ensureRecordedAttempt,
   finalizeRecordedRequest,
+  getRecordedImage,
   getRecordedRequest,
   getRecordSummary,
   setRecordedAttemptResponseBody,
@@ -355,6 +356,34 @@ run("responses tool output becomes anthropic tool_result block", () => {
   assert.equal((result.messages[0].content as Array<{ type: string }>)[0].type, "tool_result");
 });
 
+run("responses additional_tools input item is converted to target protocol tools", () => {
+  const request = {
+    model: "gpt-5",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+      {
+        type: "additional_tools",
+        tools: [{
+          type: "function",
+          name: "lookup_weather",
+          description: "Look up weather",
+          parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] },
+          strict: true,
+        }],
+      },
+    ],
+  } as any;
+
+  const anthropic = responsesRequestToAnthropicMessageRequest(request);
+  assert.equal(anthropic.tools?.length ?? 0, 1);
+  assert.equal((anthropic.tools?.[0] as any).name, "lookup_weather");
+  assert.deepEqual((anthropic.tools?.[0] as any).input_schema, { type: "object", properties: { city: { type: "string" } }, required: ["city"] });
+
+  const chat = responsesRequestToChatParams(request);
+  assert.equal(chat.tools?.length ?? 0, 1);
+  assert.equal((chat.tools?.[0] as any).function.name, "lookup_weather");
+});
+
 run("responses namespace tools flatten to qualified function names", () => {
   const result = responsesRequestToAnthropicMessageRequest({
     model: "gpt-5",
@@ -488,6 +517,7 @@ run("anthropic qualified mcp tools become responses namespace tools", () => {
   assert.equal((result.tools ?? []).length, 1);
   assert.equal((result.tools?.[0] as any).type, "namespace");
   assert.equal((result.tools?.[0] as any).name, "mcp__mcpcenter__");
+  assert.equal((result.tools?.[0] as any).description, "Tools available in the mcp__mcpcenter__ namespace.");
   assert.equal(((result.tools?.[0] as any).tools ?? [])[0].name, "calendar_get_events");
 });
 
@@ -703,6 +733,29 @@ run("responses developer input message becomes chat system role", () => {
   assert.equal(chat.messages[0].role, "system");
   assert.equal(chat.messages[0].content, "legacy provider compatible");
   assert.equal(chat.messages[1].role, "user");
+});
+
+run("responses agent_message input becomes a developer message", () => {
+  const chat = responsesRequestToChatParams({
+    model: "gpt-5",
+    input: [
+      {
+        type: "agent_message",
+        author: "/root",
+        recipient: "/root/query_time",
+        content: [
+          { type: "input_text", text: "Message Type: NEW_TASK\nTask name: /root/query_time\nSender: /root\nPayload:\n" },
+          { type: "encrypted_content", encrypted_content: "查询当前时间（Asia/Shanghai），简洁返回结果。" },
+        ],
+      },
+    ],
+  } as any);
+
+  assert.equal(chat.messages[0].role, "system");
+  assert.equal(
+    chat.messages[0].content,
+    "Delegated message from /root\nTarget agent: /root/query_time\nMessage Type: NEW_TASK\nTask name: /root/query_time\nSender: /root\nPayload:\n\n查询当前时间（Asia/Shanghai），简洁返回结果。",
+  );
 });
 
 run("unsupported request fields are ignored instead of failing", () => {
@@ -4178,6 +4231,31 @@ await runAsync("record store resets on start and supports full request id lookup
   await stopRecording();
 });
 
+await runAsync("record store deduplicates image data URLs and restores them for replay", async () => {
+  await startRecording({ maxSize: 3 });
+  const image = `data:image/png;base64,${"a".repeat(1024 * 1024)}`;
+  for (const requestId of ["image001-1234-5678-9abc-def012345678", "image002-1234-5678-9abc-def012345678"]) {
+    beginRecordedRequest({
+      requestId,
+      path: "/v1/chat/completions",
+      headers: {},
+      body: { model: "alpha", messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: image } }] }] },
+      stream: false,
+    });
+  }
+
+  const compact = await getRecordedRequest("image001-1234-5678-9abc-def012345678");
+  const compactUrl = (((compact?.clientRequest.body as any).messages[0].content[0].image_url.url) as Record<string, unknown>);
+  assert.equal(typeof compactUrl.__nanollm_record_image_ref, "string");
+  assert.equal(compactUrl.bytes, Buffer.byteLength(image));
+  assert.notEqual(compactUrl, image);
+  assert.equal(await getRecordedImage(String(compactUrl.__nanollm_record_image_ref)), image);
+
+  const replayable = await getRecordedRequest("image001-1234-5678-9abc-def012345678", { hydrateImages: true });
+  assert.equal((replayable?.clientRequest.body as any).messages[0].content[0].image_url.url, image);
+  await stopRecording();
+});
+
 await runAsync("record summary keeps fallback actual model and failure status", async () => {
   await startRecording();
   const requestId = "fedcba98-7654-3210-abcd-ef1234567890";
@@ -4308,6 +4386,42 @@ await runAsync("sqlite record store persists records and trims when max size shr
   }
 });
 
+await runAsync("sqlite record store restores compacted images after restart", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-record-images-"));
+  const dbPath = join(dir, "record.sqlite3");
+  let db = createTestSqliteClient(dbPath);
+  const requestId = "image003-1234-5678-9abc-def012345678";
+  const image = `data:image/jpeg;base64,${"b".repeat(1024 * 256)}`;
+  try {
+    useSqliteRecordStore(db);
+    await startRecording({ maxSize: 2 });
+    beginRecordedRequest({
+      requestId,
+      path: "/v1/responses",
+      headers: {},
+      body: { model: "alpha", input: [{ role: "user", content: [{ type: "input_image", image_url: image }] }] },
+      stream: false,
+    });
+    finalizeRecordedRequest({ requestId });
+    await stopRecording();
+    db.close();
+
+    db = createTestSqliteClient(dbPath);
+    useSqliteRecordStore(db);
+    await startRecording({ maxSize: 2 });
+    const compact = await getRecordedRequest(requestId);
+    const compactImage = (compact?.clientRequest.body as any).input[0].content[0].image_url;
+    assert.equal(typeof compactImage.__nanollm_record_image_ref, "string");
+    assert.equal(await getRecordedImage(compactImage.__nanollm_record_image_ref), image);
+    const replayable = await getRecordedRequest(requestId, { hydrateImages: true });
+    assert.equal((replayable?.clientRequest.body as any).input[0].content[0].image_url, image);
+  } finally {
+    useMemoryRecordStore();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 await runAsync("status page renders fallback group priority panel without top hint text", async () => {
   const store = new StatusStore();
   const bucketStarts = store.listBuckets();
@@ -4412,6 +4526,10 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /createValueNode/);
   assert.match(html, /createCollapsibleSection/);
   assert.match(html, /createStringNode/);
+  assert.match(html, /createImageReferenceLink/);
+  assert.match(html, /__nanollm_record_image_ref/);
+  assert.match(html, /"\/record\/images\/" \+ encodeURIComponent\(hash\)/);
+  assert.match(html, /image-ref-link/);
   assert.match(html, /parseStreamEvents/);
   assert.match(html, /renderStreamBody/);
   assert.match(html, /createCopyButton/);

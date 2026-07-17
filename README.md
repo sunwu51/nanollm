@@ -360,7 +360,7 @@ npx nanollm
 
 提供了`http://localhost:3000/status`的监控页面，可以查看模型健康状态。
 
-提供了`http://localhost:3000/record`的采样记录页面，可以查看请求记录，对debug非常有用（默认只保留最新10次请求，可通过`record.max_size`配置修改）。
+提供了`http://localhost:3000/record`的采样记录页面，可以查看请求记录，对debug非常有用（默认只保留最新10次请求，可通过`record.max_size`配置修改）。请求中的 `data:image/...;base64,...` 图片会按内容哈希去重保存；记录页显示图片引用和大小，点击回放时服务会自动还原原始图片。这样多轮工具调用重复携带同一图片时，只保留一份图片数据。可复制记录中的 `__nanollm_record_image_ref` 值，并通过 `GET /record/images/{hash}` 查看原图；该接口使用与 `/record` 相同的鉴权。
 
 默认情况下，上述数据都只存在内存中，进程结束即消失。使用 `--storage sqlite` 启动后，`/status` 会在 SQLite 中保留最近 1 个月的稀疏 5 分钟统计 bucket（页面仍只展示最近 6 小时），`/record` 会持久化最近 `record.max_size` 条请求记录。
 

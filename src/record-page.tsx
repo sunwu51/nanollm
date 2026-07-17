@@ -453,6 +453,11 @@ const STYLE = /* css */ String.raw`
       .json-tree .null {
         color: #8c3d8c;
       }
+      .json-tree .image-ref-link {
+        color: #0b6f51;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+      }
       .inline-fold {
         display: inline-block;
         vertical-align: top;
@@ -833,6 +838,17 @@ const SCRIPT = String.raw`
         return details;
       }
 
+      function createImageReferenceLink(hash) {
+        const link = document.createElement("a");
+        link.className = "image-ref-link";
+        link.href = "/record/images/" + encodeURIComponent(hash);
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.title = "打开图片";
+        link.textContent = JSON.stringify(hash);
+        return link;
+      }
+
       function createValueNode(value, options) {
         const depth = options?.depth ?? 0;
         const expandedDepth = typeof options?.expandedDepth === "number" ? options.expandedDepth : null;
@@ -896,7 +912,11 @@ const SCRIPT = String.raw`
               key.className = "key";
               key.textContent = keyName + ": ";
               entry.appendChild(key);
-              entry.appendChild(createValueNode(childValue, childOptions));
+              if (keyName === "__nanollm_record_image_ref" && typeof childValue === "string" && /^[a-f0-9]{64}$/i.test(childValue)) {
+                entry.appendChild(createImageReferenceLink(childValue));
+              } else {
+                entry.appendChild(createValueNode(childValue, childOptions));
+              }
               body.appendChild(entry);
             }
           }
