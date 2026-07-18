@@ -414,7 +414,7 @@ run("responses namespace tools flatten to qualified function names", () => {
   } as any);
 
   assert.equal(result.tools?.length ?? 0, 1);
-  assert.equal((result.tools?.[0] as any).name, "mcp__mcpcenter__calendar_get_events");
+  assert.equal((result.tools?.[0] as any).name, "mcp__mcpcenter___n1a2n3o_calendar_get_events");
 });
 
 run("responses non-mcp namespace tools flatten to qualified function names in anthropic conversion", () => {
@@ -446,7 +446,7 @@ run("responses non-mcp namespace tools flatten to qualified function names in an
   } as any);
 
   assert.equal(result.tools?.length ?? 0, 1);
-  assert.equal((result.tools?.[0] as any).name, "crm__lookup_account");
+  assert.equal((result.tools?.[0] as any).name, "crm_n1a2n3o_lookup_account");
   assert.equal((result.tools?.[0] as any).description, "Look up an account");
 });
 
@@ -490,7 +490,7 @@ run("responses namespace tool calls flatten to qualified function names", () => 
 
   assert.equal(result.messages[0].role, "assistant");
   assert.equal(((result.messages[0].content ?? []) as Array<{ type: string }>)[0].type, "tool_use");
-  assert.equal(((result.messages[0].content ?? []) as Array<{ name?: string }>)[0].name, "mcp__mcpcenter__calendar_get_events");
+  assert.equal(((result.messages[0].content ?? []) as Array<{ name?: string }>)[0].name, "mcp__mcpcenter___n1a2n3o_calendar_get_events");
 });
 
 run("anthropic qualified mcp tools become responses namespace tools", () => {
@@ -556,6 +556,43 @@ run("anthropic qualified mcp tool use becomes responses namespaced function_call
   assert.equal(functionCall.namespace, "mcp__mcpcenter__");
   assert.equal(functionCall.name, "calendar_get_events");
   assert.equal(functionCall.arguments, "{\"start\":\"2026-05-01\",\"end\":\"2026-05-02\"}");
+});
+
+run("responses namespaced function_call namespace round-trips exactly for various forms", () => {
+  for (const ns of ["mcp_me", "mcp__me", "mcp__me__", "mcp_me__", "crm"]) {
+    const result = runWithRequestId("round_" + ns, () => {
+      const asChat = responsesResponseToChatCompletion({
+        id: "resp_1", object: "response", created_at: 1, model: "gpt-5",
+        status: "completed", error: null, incomplete_details: null, instructions: null,
+        output: [{
+          id: "fc_1", type: "function_call", status: "completed",
+          call_id: "call_1", name: "say_hi", namespace: ns,
+          arguments: "{\"who\":\"world\"}"
+        }],
+        parallel_tool_calls: false, tool_choice: "auto", tools: [], top_p: null,
+        temperature: null, text: { format: { type: "text" } },
+      } as any);
+
+      const backResp = chatCompletionToResponsesResponse({
+        id: "chat_1", object: "chat.completion", created: 1, model: "gpt-5",
+        choices: [{
+          index: 0, finish_reason: "tool_calls", logprobs: null,
+          message: {
+            role: "assistant", content: null,
+            tool_calls: [{ id: "call_1", type: "function",
+              function: { name: asChat.choices[0].message.tool_calls[0].function.name,
+                arguments: "{\"who\":\"world\"}" } }]
+          }
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+      } as any);
+
+      const fc = backResp.output.find((o: any) => o.type === "function_call" || o.type === "custom_tool_call");
+      assert.equal(fc?.namespace, ns, `namespace should round-trip for input '${ns}'`);
+      assert.equal(fc?.name, "say_hi", `name should round-trip for input '${ns}'`);
+      return fc;
+    });
+  }
 });
 
 run("responses anthropic conversion makes tool_use and tool_result adjacent", () => {
@@ -1083,7 +1120,7 @@ run("responses stream namespaced mcp function calls become qualified chat tool n
     .map((toolCall: any) => toolCall.function?.name)
     .find(Boolean);
 
-  assert.equal(toolName, "mcp__mcpcenter__calendar_get_events");
+  assert.equal(toolName, "mcp__mcpcenter___n1a2n3o_calendar_get_events");
 });
 
 run("anthropic stream qualified mcp tool_use becomes responses namespaced function_call events", () => {
