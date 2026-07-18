@@ -206,6 +206,12 @@ export function unwrapResponsesCustomToolInput(argumentsText: string): string {
 
 const OPENAI_RESPONSES_MCP_QUALIFIED_TOOL_PATTERN = /^(mcp__.+?__)(.+)$/;
 
+// We use an obviously-unique separator when joining namespace + tool name into a single
+// flat function name. Using "__" collides with OpenAI MCP flat names (e.g.
+// `mcp__server__tool`) and is ambiguous. `_n1a2n3o_` cannot appear inside an OpenAI MCP
+// flat name (`mcp__...`); as a result `split` only has to look for this marker.
+const NANOLLM_NS_SEPARATOR = "_n1a2n3o_";
+
 export function isOpenAIResponsesMcpNamespace(namespace: string | null | undefined): namespace is string {
   return typeof namespace === "string" && namespace.startsWith("mcp__");
 }
@@ -217,23 +223,35 @@ export function joinOpenAIResponsesNamespacePath(name: string, namespace?: strin
 
 export function qualifyOpenAIResponsesToolName(name: string, namespace?: string | null): string {
   if (!namespace) return name;
-  return namespace.endsWith("__") ? namespace + name : namespace + "__" + name;
+  return namespace + NANOLLM_NS_SEPARATOR + name;
 }
 
 export function splitQualifiedOpenAIResponsesToolName(name: string): { name: string; namespace?: string } {
-  // First try the mcp__ pattern for backward compatibility
+  // First, look for our own unambiguous separator — this handles every qualified name we
+  // produced and preserves the namespace exactly, including any trailing `__`.
+  const nanoIdx = name.indexOf(NANOLLM_NS_SEPARATOR);
+  if (nanoIdx > 0) {
+    const namespace = name.substring(0, nanoIdx);
+    const localName = name.substring(nanoIdx + NANOLLM_NS_SEPARATOR.length);
+    if (namespace && localName) return { namespace, name: localName };
+  }
+
+  // External Anthropic-style flat names look like `mcp__server__tool` (no `_n1a2n3o_`);
+  // extract namespace including its trailing `__` to match OpenAI wire conventions.
   const mcpMatch = OPENAI_RESPONSES_MCP_QUALIFIED_TOOL_PATTERN.exec(name);
   if (mcpMatch) {
     const [, namespace, localName] = mcpMatch;
     if (isOpenAIResponsesMcpNamespace(namespace) && localName) return { namespace, name: localName };
   }
-  // Generic fallback: split at the first "__" (namespace__toolname)
+
+  // Legacy / external non-MCP flat names: single `__` separator (`namespace__tool`).
   const idx = name.indexOf("__");
   if (idx > 0) {
     const namespace = name.substring(0, idx);
     const localName = name.substring(idx + 2);
     if (namespace && localName) return { namespace, name: localName };
   }
+
   return { name };
 }
 
