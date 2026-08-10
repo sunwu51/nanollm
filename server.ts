@@ -1085,6 +1085,9 @@ function buildStreamReadable(
               appendRecordedClientResponseBody({ chunk: outboundText });
               controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
             }
+            if (usageCollector.hasFailed()) {
+              throw new Error("Upstream stream reported an error");
+            }
             const usage = usageCollector.finish();
             settleSuccess(usage);
             finalizeRecord();
@@ -1218,6 +1221,9 @@ function buildPipeStreamAndCache(
               } catch {}
             }
             cacheResponseItems(outputItems);
+            if (usageCollector.hasFailed()) {
+              throw new Error("Upstream stream reported an error");
+            }
             const usage = usageCollector.finish();
             settleSuccess(usage);
             finalizeRecord();

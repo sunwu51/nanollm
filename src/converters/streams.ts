@@ -399,6 +399,11 @@ export class ResponsesStreamParser implements StreamParser {
         out.push({ type: "end", finishReason: "error" });
         break;
       }
+
+      case "error": {
+        out.push({ type: "end", finishReason: "error" });
+        break;
+      }
     }
 
     return out;
@@ -1207,11 +1212,16 @@ export function createUsageCollector(format: StreamFormat) {
   const parser = createParser(format);
   let latestUsage: import("./shared.js").NormalizedUsage | undefined;
   let sawEnd = false;
+  let sawError = false;
 
   function collect(events: NormalizedStreamEvent[]) {
     for (const event of events) {
       if (event.type === "end") {
-        sawEnd = true;
+        if (event.finishReason === "error") {
+          sawError = true;
+        } else {
+          sawEnd = true;
+        }
         if (event.usage) {
           latestUsage = event.usage;
         }
@@ -1237,7 +1247,10 @@ export function createUsageCollector(format: StreamFormat) {
       return latestUsage;
     },
     hasCompleted() {
-      return sawEnd;
+      return sawEnd && !sawError;
+    },
+    hasFailed() {
+      return sawError;
     },
     getLatestUsage() {
       return latestUsage;
