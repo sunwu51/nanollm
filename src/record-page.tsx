@@ -1055,13 +1055,6 @@ const SCRIPT = String.raw`
           if (payload.response && typeof payload.response === "object") {
             lastResponse = payload.response;
           }
-          if (type === "response.completed" && payload.response) {
-            const output = payload.response.output;
-            if (Array.isArray(output) && output.length > 0) {
-              return payload.response;
-            }
-            // response.completed has empty output; continue to reconstruct from delta events
-          }
         }
         if (!sawResponsesEvent) return null;
         if (!lastResponse) {
