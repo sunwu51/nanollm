@@ -1071,6 +1071,19 @@ function buildStreamReadable(
     finalizeRecordedRequest({});
   }
 
+  function closeAfterTerminalEvent(controller: ReadableStreamDefaultController<Uint8Array>): boolean {
+    if (!usageCollector.hasCompleted()) return false;
+    finished = true;
+    settleSuccess(usageCollector.getLatestUsage());
+    finalizeRecord();
+    console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (terminal event)`));
+    controller.close();
+    void reader.cancel("terminal SSE event received").catch((error) => {
+      console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`, cachedRequestId), error);
+    });
+    return true;
+  }
+
   return new ReadableStream({
     async pull(controller) {
       if (finished) return;
@@ -1105,6 +1118,7 @@ function buildStreamReadable(
             appendRecordedClientResponseBody({ chunk: outboundText });
             controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
           }
+          if (closeAfterTerminalEvent(controller)) return;
         }
       } catch (error) {
         finished = true;
@@ -1195,6 +1209,20 @@ function buildPipeStreamAndCache(
     finalizeRecordedRequest({});
   }
 
+  function closeAfterTerminalEvent(controller: ReadableStreamDefaultController<Uint8Array>): boolean {
+    if (!usageCollector.hasCompleted()) return false;
+    finished = true;
+    cacheResponseItems(outputItems);
+    settleSuccess(usageCollector.getLatestUsage());
+    finalizeRecord();
+    console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (terminal event)`));
+    controller.close();
+    void reader.cancel("terminal SSE event received").catch((error) => {
+      console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`, cachedRequestId), error);
+    });
+    return true;
+  }
+
   return new ReadableStream({
     async pull(controller) {
       if (finished) return;
@@ -1249,6 +1277,7 @@ function buildPipeStreamAndCache(
             appendRecordedClientResponseBody({ chunk: text });
             controller.enqueue(value);
           }
+          if (closeAfterTerminalEvent(controller)) return;
         }
       } catch (error) {
         finished = true;
