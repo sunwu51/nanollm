@@ -283,12 +283,17 @@ export const USAGE_SCRIPT = String.raw`
       }
 
       function getUsageMetricValue(day) {
+        if (currentUsageMetric === "cacheHitRate") {
+          const input = Number(day.nonCacheInputTokens || 0) + Number(day.cacheReadInputTokens || 0);
+          return input > 0 ? (Number(day.cacheReadInputTokens || 0) / input) * 100 : 0;
+        }
         return Number(day[currentUsageMetric] || 0);
       }
 
       function getUsageMetricLabel() {
         if (currentUsageMetric === "totalRequests") return "requests";
         if (currentUsageMetric === "outputTokens") return "output tokens";
+        if (currentUsageMetric === "cacheHitRate") return "cache hit rate";
         return "tokens";
       }
 
@@ -313,12 +318,14 @@ export const USAGE_SCRIPT = String.raw`
         const inputTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.nonCacheInputTokens || 0), 0);
         const cachedTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.cacheReadInputTokens || 0), 0);
         const outputTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.outputTokens || 0), 0);
+        const cacheHitRate = inputTokens + cachedTokens > 0 ? cachedTokens / (inputTokens + cachedTokens) * 100 : null;
         USAGE_SUMMARY_EL.innerHTML =
           "<span><strong>" + formatUsageCompact(totalRequests) + "</strong> Requests</span>" +
           "<span><strong>" + formatUsageCompact(totalTokens) + "</strong> Tokens</span>" +
           "<span><strong>" + formatUsageCompact(inputTokens) + "</strong> Input</span>" +
           "<span><strong>" + formatUsageCompact(cachedTokens) + "</strong> Cached</span>" +
           "<span><strong>" + formatUsageCompact(outputTokens) + "</strong> Output</span>";
+        USAGE_SUMMARY_EL.innerHTML += "<span><strong>" + (cacheHitRate == null ? "--" : cacheHitRate.toFixed(1) + "%") + "</strong> Cache hit rate</span>";
       }
 
       function renderUsageMonths(cells) {
@@ -349,6 +356,9 @@ export const USAGE_SCRIPT = String.raw`
           ["Failed", formatUsageFull(day.failureRequests)],
           ["Input", formatUsageFull(day.nonCacheInputTokens)],
           ["Cached", formatUsageFull(day.cacheReadInputTokens)],
+          ["Cache hit rate", ((Number(day.nonCacheInputTokens || 0) + Number(day.cacheReadInputTokens || 0)) > 0
+            ? (Number(day.cacheReadInputTokens || 0) / (Number(day.nonCacheInputTokens || 0) + Number(day.cacheReadInputTokens || 0)) * 100).toFixed(1) + "%"
+            : "--")],
           ["Output", formatUsageFull(day.outputTokens)],
           ["Tokens", formatUsageFull(day.totalTokens)],
         ];
@@ -493,6 +503,7 @@ export function UsageSection({ payload }: { payload: UsagePagePayload }) {
                 <option value="totalTokens">Tokens</option>
                 <option value="totalRequests">Requests</option>
                 <option value="outputTokens">Output</option>
+                <option value="cacheHitRate">Cache hit rate</option>
               </select>
               <select class="usage-select" id="usage-model" aria-label="Model">
                 <option value="">All models</option>
