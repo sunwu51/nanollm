@@ -22,6 +22,7 @@ import {
 import { runInNewContext } from "node:vm";
 import { Agent, ProxyAgent, fetch as undiciFetch } from "undici";
 import { extractErrorCauses } from "./error-details.js";
+import { getCachedSubscriptionCredential, ensureSubscriptionCredential, SUBSCRIPTION_URL } from "./openai-subscription.js";
 
 export interface UpstreamRequestOptions {
   userAgent?: string;
@@ -45,6 +46,7 @@ export function getUpstreamURL(config: ModelConfig): string {
 }
 
 export function getUpstreamURLForPath(config: ModelConfig, imageOperation?: OpenAIImageOperation): string {
+  if (config.subscription_provider) return `${SUBSCRIPTION_URL}/responses`;
   const base = config.base_url.replace(/\/+$/, "");
   switch (config.provider) {
     case "openai-chat":
@@ -63,6 +65,15 @@ export function getUpstreamURLForPath(config: ModelConfig, imageOperation?: Open
 // ─── Auth Headers ───────────────────────────────────────────────────────────
 
 function getAuthHeaders(config: ModelConfig): Record<string, string> {
+  if (config.subscription_provider) {
+    const credential = getCachedSubscriptionCredential(config.subscription_provider);
+    if (!credential) throw new Error(`OpenAI subscription provider '${config.subscription_provider}' is not authenticated`);
+    return {
+      Authorization: `Bearer ${credential.accessToken}`,
+      ...(credential.accountId ? { "ChatGPT-Account-Id": credential.accountId } : {}),
+      originator: "codex_cli_rs",
+    };
+  }
   switch (config.provider) {
     case "openai-chat":
     case "openai-responses":
@@ -299,6 +310,7 @@ async function upstreamFetch(
   stream: boolean,
   options?: UpstreamRequestOptions,
 ): Promise<{ response: Response; timing: UpstreamTiming }> {
+  if (config.subscription_provider) await ensureSubscriptionCredential(config.subscription_provider);
   return upstreamFetchToUrl(
     config,
     getUpstreamURL(config),
@@ -413,7 +425,10 @@ async function upstreamFetchToUrl(
     err.upstream = text;
     throw err;
   }
-  if (stream && !contentType.includes("text/event-stream")) {
+  // Codex occasionally omits Content-Type while still returning a valid SSE
+  // stream. Let the body validator inspect that response; reject only an
+  // explicitly non-SSE content type.
+  if (stream && contentType.trim() && !contentType.includes("text/event-stream")) {
     const text = await res.text();
     setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
     setRecordedAttemptError({
@@ -560,6 +575,7 @@ export async function passthroughRawRequest(
   incomingHeaders: Headers,
   options?: UpstreamRequestOptions & { imageOperation?: OpenAIImageOperation; recordedRequestBody?: unknown },
 ): Promise<{ body: unknown; responseText: string; headers: Headers; status: number; timing: UpstreamTiming }> {
+  if (config.subscription_provider) await ensureSubscriptionCredential(config.subscription_provider);
   const url = getUpstreamURLForPath(config, options?.imageOperation);
   const headers = getRawForwardHeaders(config, incomingHeaders, options);
   const preparedBody = await prepareRawBody(config, body, incomingHeaders, options?.recordedRequestBody);

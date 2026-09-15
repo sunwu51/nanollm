@@ -68,6 +68,16 @@ export const USAGE_STYLE = /* css */ String.raw`
         color: var(--usage-text);
         font-weight: 600;
       }
+      .usage-equivalent-cost {
+        margin: 4px 0 0;
+        color: var(--usage-muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      .usage-equivalent-cost strong {
+        color: var(--usage-text);
+        font-weight: 600;
+      }
       .usage-note {
         margin: 2px 0 0;
         color: var(--usage-muted);
@@ -250,6 +260,7 @@ export const USAGE_SCRIPT = String.raw`
       const USAGE_HEATMAP_EL = document.getElementById("usage-heatmap");
       const USAGE_MONTHS_EL = document.getElementById("usage-months");
       const USAGE_SUMMARY_EL = document.getElementById("usage-summary");
+      const USAGE_EQUIVALENT_COST_EL = document.getElementById("usage-equivalent-cost");
       const USAGE_RANGE_EL = document.getElementById("usage-range");
       const USAGE_METRIC_EL = document.getElementById("usage-metric");
       const USAGE_MODEL_EL = document.getElementById("usage-model");
@@ -280,6 +291,11 @@ export const USAGE_SCRIPT = String.raw`
 
       function formatUsageFull(value) {
         return new Intl.NumberFormat("en-US").format(Math.round(value || 0));
+      }
+
+      function formatEquivalentCost(value) {
+        if (!Number.isFinite(value) || value <= 0) return "0.00";
+        return value < 0.01 ? value.toFixed(4) : value.toFixed(2);
       }
 
       function getUsageMetricValue(day) {
@@ -326,6 +342,15 @@ export const USAGE_SCRIPT = String.raw`
           "<span><strong>" + formatUsageCompact(cachedTokens) + "</strong> Cached</span>" +
           "<span><strong>" + formatUsageCompact(outputTokens) + "</strong> Output</span>";
         USAGE_SUMMARY_EL.innerHTML += "<span><strong>" + (cacheHitRate == null ? "--" : cacheHitRate.toFixed(1) + "%") + "</strong> Cache hit rate</span>";
+        const equivalentCost = (
+          cachedTokens * 0.04 +
+          inputTokens * 2 +
+          outputTokens * 8
+        ) / 1000000;
+        USAGE_EQUIVALENT_COST_EL.innerHTML =
+          "Equivalent cost at DeepSeek Flash peak pricing " +
+          "(¥0.04 / ¥2.00 / ¥8.00 per 1M cached input / input / output tokens): " +
+          "<strong>¥" + formatEquivalentCost(equivalentCost) + "</strong>";
       }
 
       function renderUsageMonths(cells) {
@@ -492,6 +517,7 @@ export function UsageSection({ payload }: { payload: UsagePagePayload }) {
               <h1 class="usage-title">Usage in selected time range</h1>
               <p class="usage-note">Persistent usage history requires --storage sqlite; memory mode only shows data from the current process.</p>
               <div class="usage-summary" id="usage-summary" aria-label="usage summary"></div>
+              <p class="usage-equivalent-cost" id="usage-equivalent-cost"></p>
             </div>
             <div class="usage-controls">
               <select class="usage-select" id="usage-range" aria-label="Time range">

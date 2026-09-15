@@ -60,6 +60,7 @@ import { openSqliteStorage } from "./src/sqlite.js";
 import { autoMigrateSqliteFileToTurso, resolveTursoAutoMigrationConfig } from "./src/turso-migration.js";
 import { stringify as stringifyYAML } from "yaml";
 import { extractErrorCauses, formatErrorWithCauses } from "./src/error-details.js";
+import { bootstrapSubscriptionProviders, configureSubscriptionStorage, fetchSubscriptionUsage, getCachedSubscriptionCredential, pollDeviceLogin, startDeviceLogin } from "./src/openai-subscription.js";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -115,6 +116,7 @@ function resolveStorageMode(argv: string[]): StorageMode {
 
 const startupArgs = process.argv.slice(2);
 const configPath = resolveConfigPath(startupArgs);
+configureSubscriptionStorage(configPath);
 const storageMode = resolveStorageMode(startupArgs);
 const sqlitePath = join(homedir(), ".nanollm", "nanollm.sqlite3");
 const sqliteStorage = storageMode === "sqlite" ? await openSqliteStorage(sqlitePath) : undefined;
@@ -128,11 +130,13 @@ if (sqliteStorage?.driver === "turso") {
 }
 const configManager = new ConfigManager(configPath);
 const startupSnapshot = configManager.getActiveSnapshot();
+bootstrapSubscriptionProviders(startupSnapshot.effectiveConfig.providers.filter((provider) => provider.provider === "openai-subscription").map((provider) => provider.name));
 if (sqliteStorage) {
   useSqliteRecordStore(sqliteStorage.client);
 }
 await startRecording({ maxSize: startupSnapshot.effectiveConfig.record.max_size });
 configManager.onUpdate(({ snapshot }, source) => {
+  bootstrapSubscriptionProviders(snapshot.effectiveConfig.providers.filter((provider) => provider.provider === "openai-subscription").map((provider) => provider.name));
   void configureRecording({ maxSize: snapshot.effectiveConfig.record.max_size });
   if (source !== "startup") {
     console.log(
@@ -217,11 +221,19 @@ type Denormalizer = (normalized: NormalizedResponse) => unknown;
 type UpstreamOptions = { userAgent?: string; attemptIndex?: number; modelName?: string };
 type AdminModelDraft = {
   name: string;
+  connection_mode: "direct" | "custom";
   provider: string;
+  custom_provider: string;
   base_url: string;
   api_key: string;
   model: string;
   extras?: Record<string, unknown>;
+};
+type AdminProviderDraft = {
+  name: string;
+  provider: string;
+  base_url: string;
+  api_key: string;
 };
 type AdminFallbackDraft = {
   name: string;
@@ -239,6 +251,7 @@ type AdminConfigForm = {
     max_size: string;
   };
   models: AdminModelDraft[];
+  providers: AdminProviderDraft[];
   fallbackGroups: AdminFallbackDraft[];
 };
 
@@ -285,7 +298,7 @@ function toPlainObject(value: unknown): Record<string, unknown> {
 
 function buildAdminConfigForm(rawText: string): AdminConfigForm {
   const sourceConfig = parseSourceConfigDocument(rawText) as Record<string, unknown>;
-  const { server, record, models, fallback, ...rootExtras } = sourceConfig;
+  const { server, record, models, providers, fallback, ...rootExtras } = sourceConfig;
   const serverObject = toPlainObject(server);
   const recordObject = toPlainObject(record);
   const { port, ttfb_timeout, ...serverExtras } = serverObject;
@@ -302,13 +315,26 @@ function buildAdminConfigForm(rawText: string): AdminConfigForm {
     record: {
       max_size: toInputString(max_size),
     },
+    providers: Array.isArray(providers)
+      ? providers.map((entry) => {
+          const providerObject = toPlainObject(entry);
+          return {
+            name: toInputString(providerObject.name),
+            provider: toInputString(providerObject.provider),
+            base_url: toInputString(providerObject.base_url),
+            api_key: toInputString(providerObject.api_key),
+          };
+        })
+      : [],
     models: Array.isArray(models)
       ? models.map((entry) => {
           const modelObject = toPlainObject(entry);
-          const { name, provider, base_url, api_key, model, ...extras } = modelObject;
+          const { name, provider, custom_provider, base_url, api_key, model, ...extras } = modelObject;
           return {
             name: toInputString(name),
+            connection_mode: custom_provider ? "custom" : "direct",
             provider: toInputString(provider),
+            custom_provider: toInputString(custom_provider),
             base_url: toInputString(base_url),
             api_key: toInputString(api_key),
             model: toInputString(model),
@@ -338,9 +364,12 @@ function buildAdminConfigFormFromEffectiveConfig(config: ServerConfig): AdminCon
     record: {
       max_size: toInputString(config.record.max_size),
     },
+    providers: config.providers.map((provider) => ({ ...provider })),
     models: config.models.map((model) => ({
       name: model.name,
+      connection_mode: model.custom_provider ? "custom" : "direct",
       provider: model.provider,
+      custom_provider: model.custom_provider ?? "",
       base_url: model.base_url,
       api_key: model.api_key,
       model: model.model,
@@ -361,15 +390,26 @@ function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { preserved
   const serverTTFBTimeout = toPositiveIntegerOrUndefined(form.server?.ttfb_timeout, "server.ttfb_timeout");
   const recordMaxSize = toPositiveIntegerOrUndefined(form.record?.max_size, "record.max_size");
 
-  const models = Array.isArray(form.models)
-    ? form.models.map((entry) => ({
-        ...toPlainObject(entry.extras),
+  const providers = Array.isArray(form.providers)
+    ? form.providers.map((entry) => ({
         name: entry.name ?? "",
         provider: entry.provider ?? "",
-        base_url: entry.base_url ?? "",
-        api_key: entry.api_key ?? "",
-        model: entry.model ?? "",
+        ...(entry.provider === "openai-subscription" ? {} : { base_url: entry.base_url ?? "", api_key: entry.api_key ?? "" }),
       }))
+    : [];
+
+  const models = Array.isArray(form.models)
+    ? form.models.map((entry) => {
+        const customProvider = entry.connection_mode === "custom" ? (entry.custom_provider ?? "").trim() : "";
+        return {
+          ...toPlainObject(entry.extras),
+          name: entry.name ?? "",
+          ...(customProvider
+            ? { custom_provider: customProvider }
+            : { provider: entry.provider ?? "", base_url: entry.base_url ?? "", api_key: entry.api_key ?? "" }),
+          model: entry.model ?? "",
+        };
+      })
     : [];
 
   const fallbackGroups = Object.fromEntries(
@@ -382,6 +422,8 @@ function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { preserved
   );
 
   const document: Record<string, unknown> = { ...root };
+
+  if (providers.length > 0) document.providers = providers;
 
   if (Object.keys(serverExtras).length > 0 || preservedPort !== undefined || serverTTFBTimeout !== undefined) {
     document.server = {
@@ -1400,6 +1442,22 @@ app.post("/record/:requestId/replay", async (c) => {
 });
 
 app.get("/admin", (c) => c.html(renderAdminConfigPage(buildConfigAdminPayload())));
+app.post("/admin/providers/:name/device-login", async (c) => {
+  try { return c.json(await startDeviceLogin(c.req.param("name"))); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400); }
+});
+app.get("/admin/providers/:name/device-login/status", (c) => {
+  const credential = getCachedSubscriptionCredential(c.req.param("name"));
+  return c.json({ authenticated: Boolean(credential?.accessToken && credential.expiresAt > Date.now()), expiresAt: credential?.expiresAt ?? null });
+});
+app.get("/admin/providers/:name/usage", async (c) => {
+  try { return c.json(await fetchSubscriptionUsage(c.req.param("name"))); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400); }
+});
+app.post("/admin/providers/:name/device-login/:sessionId/poll", async (c) => {
+  try { return c.json(await pollDeviceLogin(c.req.param("sessionId"))); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400); }
+});
 app.get("/admin/config", (c) => {
   const token = c.req.query("token");
   const target = token ? `/admin?token=${encodeURIComponent(token)}` : "/admin";

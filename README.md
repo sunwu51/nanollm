@@ -20,6 +20,17 @@ server:
 record:
   max_size: 100 # optional, default 10
 
+providers:
+  # 普通共享供应商：集中保存协议、地址和 API Key
+  - name: deepseek
+    provider: openai-chat
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+
+  # OpenAI Codex 订阅：不配置 base_url 和 api_key
+  - name: codex-subscription
+    provider: openai-subscription
+
 models:
   - name: gpt-5.4-a
     # responses规范
@@ -75,6 +86,14 @@ models:
     api_key: YOUR_KEY4
     model: gpt-image-1
 
+  - name: deepseek-shared
+    custom_provider: deepseek
+    model: deepseek-chat
+
+  - name: codex-subscription-model
+    custom_provider: codex-subscription
+    model: gpt-5
+
 fallback:
   gpt-5.4:
     - gpt-5.4-a
@@ -88,7 +107,11 @@ npx nanollm --config /path/to/config.yaml
 
 ### 二进制打包说明
 
-GitHub release 二进制现在使用 `@yao-pkg/pkg` 的 enhanced SEA 模式构建，而不是直接手写 Node SEA。这样可以继续保持单文件分发，同时兼容当前 `@libsql/client` 在本地 sqlite 模式下对 `@libsql/*` 原生包的动态加载。
+GitHub release 按平台提供压缩包。每个压缩包同时包含 nanollm 主程序和 `nanollm-oauth-transport`，解压后必须将两个可执行文件放在同一目录运行。Rust helper 用于 OpenAI subscription 的 OAuth 请求。
+
+npm 发布包包含 Windows x64、Linux x64 和 macOS arm64 三个平台的 helper，`npx nanollm@<version>` 会根据当前平台自动选择。发布工作流会先安装生成的 tarball，确认 helper 路径可解析并完成服务健康检查；配置了仓库 secret `NPM_TOKEN` 时，验证通过的 tarball 会自动发布到 npm。直接从源码运行 `npm publish` 时也会检查三个 helper 是否齐全，避免发布残缺包。
+
+主程序仍使用 `@yao-pkg/pkg` 的 enhanced SEA 模式构建，以兼容当前 `@libsql/client` 在本地 sqlite 模式下对 `@libsql/*` 原生包的动态加载。
 
 `package.json` 里的 `pkg.assets` 显式包含了 `node_modules/@libsql/**/*`，让打包产物在首次运行时可以把对应平台的 `.node` 原生文件解压到本地缓存后再加载；否则独立二进制在 `--storage sqlite` 模式下会报 `Cannot find module '@libsql/<platform>'`。
 
@@ -99,9 +122,11 @@ gpt-5.4-b
 glm5.1
 claude-sonnet-4-6
 gpt-image-1
+deepseek-shared
+codex-subscription-model
 gpt-5.4
 ```
-这样6个模型，其中`gpt-5.4`是兜底分组名，当使用这个模型的时候，会在下属列表的模型中寻找可用的模型，尝试顺序为按`max(0, 最近5min失败次数-1)`升序；如果分数相同，则保持配置里的原始顺序。
+这样8个模型，其中`gpt-5.4`是兜底分组名，当使用这个模型的时候，会在下属列表的模型中寻找可用的模型，尝试顺序为按`max(0, 最近5min失败次数-1)`升序；如果分数相同，则保持配置里的原始顺序。
 
 ### Bearer Key 认证
 
@@ -136,6 +161,58 @@ http://localhost:3000/record?token=YOUR_TOKEN
 ```
 
 首次用 `?token=` 或 Bearer header 认证成功后，nanollm 会写入同源认证 cookie。之后同一浏览器里直接访问 `/admin`、`/status`、`/record`，以及这些页面内部的 `fetch` 请求，都不需要再重复带 `?token=`。
+
+### 共享供应商配置
+
+多个模型使用相同的协议、上游地址和 API Key 时，可以在顶层 `providers` 中集中配置，然后通过 `models[*].custom_provider` 引用：
+
+```yaml
+providers:
+  - name: deepseek
+    provider: openai-chat
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+
+models:
+  - name: deepseek-chat
+    custom_provider: deepseek
+    model: deepseek-chat
+  - name: deepseek-reasoner
+    custom_provider: deepseek
+    model: deepseek-reasoner
+```
+
+`providers[*].name` 必须唯一，引用的供应商必须存在。配置了 `custom_provider` 的模型不需要再写 `provider`、`base_url` 和 `api_key`；运行时会从供应商配置展开这些连接字段。模型自身的其他高级字段仍然按原方式配置。
+
+两种模型连接方式互斥：
+
+- 直接连接：模型配置 `provider`、`base_url`、`api_key`。
+- 共享供应商：模型只配置 `custom_provider`，不能同时配置上述三个直接连接字段。
+
+普通共享供应商的 `provider` 支持 `openai-chat`、`openai-responses`、`anthropic` 和 `openai-image`。
+
+#### OpenAI subscription
+
+Codex 订阅只能在顶层 `providers` 中配置，不能直接写成模型的 `provider`：
+
+```yaml
+providers:
+  - name: my-codex-subscription
+    provider: openai-subscription
+
+models:
+  - name: gpt-subscription
+    custom_provider: my-codex-subscription
+    model: gpt-5
+```
+
+`openai-subscription` 不接受 `base_url` 或 `api_key`。保存配置后，在 `/admin` 展开该供应商并点击“登录”，按页面显示的 Device Code 完成授权。登录成功后，页面会显示“已登录”，并提供“重新登录”和“查询用量”。
+
+凭据以明文 JSON 保存到 `<config.yaml 所在目录>/openai-subscription/<uuid>.json`，内容包含 access token、refresh token、过期时间、账户 ID 和供应商名称等信息。nanollm 会在 token 到期前自动刷新并更新该文件，因此该目录需要限制访问并持久化。
+
+Railway 使用 `/data/config.yaml` 时，凭据位于 `/data/openai-subscription/<uuid>.json`。将 volume 挂载到 `/data` 即可同时保存配置和登录状态，服务端可以直接通过管理页完成 Device Code 登录。
+
+Railway 从 Git 仓库部署时会自动使用仓库根目录的 `Dockerfile`。Docker 构建阶段会编译 Linux x64 Rust helper，最终运行镜像只包含 Node.js、nanollm 和编译好的 helper，不需要在运行容器中安装 Rust，也不依赖 GitHub Release 下载。保持启动命令为空即可使用 Dockerfile 中的默认命令；volume 挂载目录设置为 `/data`。
 
 ### 动态请求体表达式
 
@@ -339,7 +416,6 @@ npx nanollm
 ```
 
 注意：npm 发布包不会包含作者本地的 `config.yaml`，需要你自己准备配置文件。
-
 
 ## Config Admin
 

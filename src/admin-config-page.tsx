@@ -289,6 +289,11 @@ const STYLE = /* css */ String.raw`
         align-items: center;
         flex-wrap: wrap;
       }
+      .card-actions {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
       .card-title {
         display: flex;
         align-items: center;
@@ -389,8 +394,9 @@ const STYLE = /* css */ String.raw`
 
 const SCRIPT = /* js */ String.raw`
       const INITIAL_PAYLOAD = __INITIAL_PAYLOAD__;
-      const PROVIDERS = ["openai-chat", "openai-responses", "anthropic", "openai-image"];
-      const RESERVED_MODEL_EXTRA_KEYS = new Set(["name", "provider", "base_url", "api_key", "model"]);
+      const MODEL_PROVIDERS = ["openai-chat", "openai-responses", "anthropic", "openai-image"];
+      const PROVIDERS = [...MODEL_PROVIDERS, "openai-subscription"];
+      const RESERVED_MODEL_EXTRA_KEYS = new Set(["name", "provider", "custom_provider", "base_url", "api_key", "model"]);
       let saving = false;
       let dirty = false;
       let localIdCounter = 0;
@@ -418,9 +424,15 @@ const SCRIPT = /* js */ String.raw`
           record: {
             max_size: form.record?.max_size ?? "",
           },
+          providers: (form.providers || []).map((provider) => ({
+            ...provider,
+            _id: nextId("provider"),
+            _expanded: false,
+          })),
           models: (form.models || []).map((model) => ({
             ...model,
             _id: nextId("model"),
+            connection_mode: model.connection_mode === "custom" ? "custom" : "direct",
             _expanded: false,
             _advancedExpanded: false,
             extras: model.extras || {},
@@ -430,6 +442,7 @@ const SCRIPT = /* js */ String.raw`
           fallbackGroups: (form.fallbackGroups || []).map((group) => ({
             ...group,
             _id: nextId("fallback"),
+            _expanded: false,
             members: (group.members || []).map((member) => ({
               _id: nextId("member"),
               value: member,
@@ -448,6 +461,7 @@ const SCRIPT = /* js */ String.raw`
       const pillsEl = document.getElementById("summary-pills");
       const errorBoxEl = document.getElementById("error-box");
       const errorTextEl = document.getElementById("error-text");
+      const providersContainer = document.getElementById("providers-container");
       const modelsContainer = document.getElementById("models-container");
       const fallbackContainer = document.getElementById("fallback-container");
       const globalFieldsEl = document.getElementById("global-fields");
@@ -519,6 +533,9 @@ const SCRIPT = /* js */ String.raw`
 
       function validateAdvancedFields() {
         formState.models.forEach((model, index) => {
+          if (model.connection_mode === "custom" && !(model.custom_provider || "").trim()) {
+            throw new Error(getModelLabel(model, index) + " 尚未选择 custom_provider。");
+          }
           const text = model._advancedJsonText ?? formatAdvancedJson(model.extras);
           model.extras = parseAdvancedJson(text, getModelLabel(model, index));
           model._extrasError = "";
@@ -533,11 +550,13 @@ const SCRIPT = /* js */ String.raw`
           recordExtras: formState.recordExtras || {},
           server: { ...formState.server },
           record: { ...formState.record },
+          providers: formState.providers.map(({ _id, _expanded, ...provider }) => provider),
           models: formState.models.map(({ _id, _expanded, _advancedExpanded, _advancedJsonText, _extrasError, ...model }) => ({
             ...model,
+            custom_provider: model.connection_mode === "custom" ? model.custom_provider : "",
             extras: model.extras || {},
           })),
-          fallbackGroups: formState.fallbackGroups.map(({ _id, members, ...group }) => ({
+          fallbackGroups: formState.fallbackGroups.map(({ _id, _expanded, members, ...group }) => ({
             ...group,
             members: members.map((member) => member.value),
           })),
@@ -570,6 +589,7 @@ const SCRIPT = /* js */ String.raw`
 
         pillsEl.textContent = "";
         const pills = [
+          { label: "providers " + formState.providers.length, kind: "neutral" },
           { label: "models " + formState.models.length, kind: "success" },
           { label: "fallback groups " + formState.fallbackGroups.length, kind: "neutral" },
           { label: "port 修改需重启", kind: "warning" },
@@ -723,6 +743,167 @@ const SCRIPT = /* js */ String.raw`
         });
       }
 
+      function renderProviders() {
+        providersContainer.textContent = "";
+        if (formState.providers.length === 0) {
+          const empty = document.createElement("div");
+          empty.className = "note-box";
+          empty.textContent = "还没有自定义供应商，点击“添加供应商”集中配置连接信息。";
+          providersContainer.appendChild(empty);
+          return;
+        }
+        formState.providers.forEach((provider) => {
+          const card = document.createElement("section");
+          card.className = "card" + (provider._expanded ? "" : " compact");
+
+          const head = document.createElement("div");
+          head.className = "card-head";
+          const toggle = document.createElement("button");
+          toggle.type = "button";
+          toggle.className = "card-toggle";
+          toggle.addEventListener("click", () => {
+            provider._expanded = !provider._expanded;
+            renderAll();
+          });
+          const toggleTop = document.createElement("div");
+          toggleTop.className = "card-toggle-top";
+          const chevron = document.createElement("span");
+          chevron.className = "card-chevron";
+          chevron.textContent = provider._expanded ? "▾" : "▸";
+          const title = document.createElement("div");
+          title.className = "card-title";
+          const h3 = document.createElement("h3");
+          h3.textContent = (provider.name || "").trim() || "未命名供应商";
+          title.appendChild(h3);
+          toggleTop.appendChild(chevron);
+          toggleTop.appendChild(title);
+          toggle.appendChild(toggleTop);
+          const summary = document.createElement("div");
+          summary.className = "card-summary";
+          summary.textContent = provider.provider === "openai-subscription"
+            ? "openai-subscription"
+            : (provider.provider || "未选协议") + " · " + (provider.base_url || "未填 base_url");
+          toggle.appendChild(summary);
+          head.appendChild(toggle);
+
+          const actions = document.createElement("div");
+          actions.className = "card-actions";
+          if (provider.provider === "openai-subscription") {
+            const status = document.createElement("span");
+            status.className = "meta";
+            status.textContent = "检查登录状态…";
+            actions.appendChild(status);
+            const usageButton = createActionButton("查询用量", "secondary", async () => {
+              usageButton.disabled = true;
+              usageButton.textContent = "查询中…";
+              try {
+                const response = await fetch("/admin/providers/" + encodeURIComponent(provider.name) + "/usage", { cache: "no-store" });
+                const text = await response.text();
+                let payload; try { payload = JSON.parse(text); } catch { payload = { error: text.slice(0, 240) }; }
+                if (!response.ok) throw new Error(payload.error || "用量查询失败");
+                const dialog = document.createElement("dialog");
+                const panel = document.createElement("div");
+                panel.style.minWidth = "420px";
+                const heading = document.createElement("h3"); heading.textContent = "Codex 订阅用量";
+                const plan = document.createElement("p"); plan.className = "meta"; plan.textContent = "Plan: " + (payload.plan_type || "unknown");
+                panel.append(heading, plan);
+                const formatDuration = (seconds) => seconds >= 86400 ? Math.round(seconds / 86400) + " 天" : seconds >= 3600 ? Math.round(seconds / 3600) + " 小时" : Math.round(seconds / 60) + " 分钟";
+                const formatReset = (windowData) => {
+                  const timestamp = Number(windowData?.reset_at) * 1000 || Date.now() + Number(windowData?.reset_after_seconds || 0) * 1000;
+                  return timestamp ? new Date(timestamp).toLocaleString() : "未知";
+                };
+                const limits = [{ name: "Codex", value: payload.rate_limit }].concat((payload.additional_rate_limits || []).map((item) => ({ name: item.limit_name || item.metered_feature, value: item.rate_limit })));
+                limits.forEach((limit) => {
+                  const title = document.createElement("h4"); title.textContent = limit.name;
+                  panel.appendChild(title);
+                  [["短期窗口", limit.value?.primary_window], ["长期窗口", limit.value?.secondary_window]].forEach(([label, value]) => {
+                    if (!value) return;
+                    const row = document.createElement("p");
+                    const duration = Number(value.limit_window_seconds) > 0 ? " · " + formatDuration(Number(value.limit_window_seconds)) : "";
+                    row.textContent = label + duration + " · 已用 " + (Number.isFinite(Number(value.used_percent)) ? Number(value.used_percent) + "%" : "未知") + " · 重置 " + formatReset(value);
+                    panel.appendChild(row);
+                  });
+                });
+                const close = document.createElement("button"); close.type = "button"; close.textContent = "关闭"; close.addEventListener("click", () => dialog.close());
+                panel.appendChild(close); dialog.appendChild(panel); document.body.appendChild(dialog); dialog.addEventListener("close", () => dialog.remove(), { once: true }); dialog.showModal();
+              } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
+              finally { usageButton.disabled = false; usageButton.textContent = "查询用量"; }
+            });
+            usageButton.hidden = true;
+            fetch("/admin/providers/" + encodeURIComponent(provider.name) + "/device-login/status")
+              .then((response) => response.json())
+              .then((value) => {
+                status.textContent = value.authenticated ? "已登录" : "未登录";
+                status.className = value.authenticated ? "success" : "meta";
+                loginButton.textContent = value.authenticated ? "重新登录" : "登录";
+                usageButton.hidden = !value.authenticated;
+              })
+              .catch(() => { status.textContent = "状态未知"; });
+            const loginButton = createActionButton("登录", "secondary", async () => {
+              const name = (provider.name || "").trim();
+              if (!name) { window.alert("请先填写供应商名称并保存配置。"); return; }
+              try {
+                const start = await fetch("/admin/providers/" + encodeURIComponent(name) + "/device-login", { method: "POST" });
+                const startText = await start.text();
+                let payload; try { payload = JSON.parse(startText); } catch { payload = { error: startText.slice(0, 240) }; }
+                if (!start.ok) throw new Error(payload.error || "无法发起设备登录");
+                const link = payload.verificationUriComplete || payload.verificationUri;
+                window.open(link, "_blank", "noopener");
+                const dialog = document.createElement("dialog");
+                dialog.innerHTML = "<form method=dialog style='min-width:360px'><h3>OpenAI subscription 登录</h3><p>请在浏览器打开的页面中输入以下验证码：</p><input readonly value='" + String(payload.userCode).replace(/'/g, "&#39;") + "' style='width:100%;font-size:22px;letter-spacing:2px;text-align:center'><p><button value='ok' type='submit'>完成后继续检查</button></p></form>";
+                document.body.appendChild(dialog); dialog.showModal();
+                await new Promise((resolve) => dialog.addEventListener("close", resolve, { once: true }));
+                dialog.remove();
+                for (let attempt = 0; attempt < 60; attempt += 1) {
+                  const poll = await fetch("/admin/providers/" + encodeURIComponent(name) + "/device-login/" + encodeURIComponent(payload.sessionId) + "/poll", { method: "POST" });
+                  const pollText = await poll.text();
+                  let result; try { result = JSON.parse(pollText); } catch { result = { error: pollText.slice(0, 240) }; }
+                  if (!poll.ok) throw new Error(result.error || "设备登录失败");
+                  if (result.status === "authenticated") { status.textContent = "已登录"; status.className = "success"; loginButton.textContent = "重新登录"; usageButton.hidden = false; window.alert("OpenAI subscription 登录成功。"); return; }
+                  await new Promise((resolve) => setTimeout(resolve, Math.max(2000, Number(result.retryAfter || payload.interval || 5) * 1000)));
+                }
+                throw new Error("设备登录超时，请重新尝试。");
+              } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
+            });
+            actions.appendChild(loginButton);
+            actions.appendChild(usageButton);
+          }
+          actions.appendChild(createActionButton("删除供应商", "danger", () => {
+            formState.providers = formState.providers.filter((item) => item._id !== provider._id);
+            markDirty(true);
+            renderAll();
+          }));
+          head.appendChild(actions);
+          card.appendChild(head);
+
+          const body = document.createElement("div");
+          body.className = "card-body";
+          body.hidden = !provider._expanded;
+          const grid = document.createElement("div");
+          grid.className = "field-grid two";
+          bindField(grid, "name", { value: provider.name, attributes: { "data-focus-id": "provider-name-" + provider._id }, onInput(value) {
+            const previousName = provider.name;
+            provider.name = value;
+            if (previousName) {
+              formState.models.forEach((model) => {
+                if (model.connection_mode === "custom" && model.custom_provider === previousName) model.custom_provider = value;
+              });
+            }
+            markDirty(true);
+          } });
+          bindField(grid, "provider", { type: "select", options: PROVIDERS, value: provider.provider || PROVIDERS[0], onInput(value) { provider.provider = value; if (value === "openai-subscription") { provider.base_url = ""; provider.api_key = ""; } markDirty(true); renderAll(); } });
+          if (provider.provider === "openai-subscription") {
+            const note = document.createElement("div"); note.className = "helper"; note.textContent = "OAuth subscription; base URL and API key are managed automatically."; grid.appendChild(note);
+          } else {
+            bindField(grid, "base_url", { value: provider.base_url, placeholder: "https://example.com/v1", onInput(value) { provider.base_url = value; markDirty(true); } });
+            bindField(grid, "api_key", { value: provider.api_key, placeholder: "支持直接填 key 或环境变量占位符", onInput(value) { provider.api_key = value; markDirty(true); } });
+          }
+          body.appendChild(grid);
+          card.appendChild(body);
+          providersContainer.appendChild(card);
+        });
+      }
+
       function createActionButton(label, className, onClick) {
         const button = document.createElement("button");
         button.type = "button";
@@ -741,6 +922,9 @@ const SCRIPT = /* js */ String.raw`
       }
 
       function buildModelSummary(model) {
+        if (model.connection_mode === "custom" && model.custom_provider) {
+          return "custom provider · " + model.custom_provider + " · " + (model.model || "未填上游模型名");
+        }
         const provider = model.provider || "未选供应商";
         const upstreamModel = model.model || "未填上游模型名";
         const baseUrl = model.base_url || "未填 base_url";
@@ -799,7 +983,21 @@ const SCRIPT = /* js */ String.raw`
           toggle.appendChild(summary);
 
           head.appendChild(toggle);
-          head.appendChild(
+          const actions = document.createElement("div");
+          actions.className = "card-actions";
+          actions.appendChild(
+            createActionButton("复刻", "secondary", () => {
+              const id = nextId("model");
+              const duplicate = clone(model);
+              duplicate._id = id;
+              duplicate._expanded = true;
+              formState.models.splice(index + 1, 0, duplicate);
+              pendingFocusTarget = "model-name-" + id;
+              markDirty(true);
+              renderAll();
+            }),
+          );
+          actions.appendChild(
             createActionButton("删除模型", "danger", () => {
               formState.models = formState.models.filter((item) => item._id !== model._id);
               formState.fallbackGroups.forEach((group) => {
@@ -809,6 +1007,7 @@ const SCRIPT = /* js */ String.raw`
               renderAll();
             }),
           );
+          head.appendChild(actions);
           card.appendChild(head);
 
           const body = document.createElement("div");
@@ -837,21 +1036,44 @@ const SCRIPT = /* js */ String.raw`
           });
           bindField(grid, "provider", {
             type: "select",
-            options: PROVIDERS,
-            value: model.provider || PROVIDERS[0],
+            options: [...MODEL_PROVIDERS, "custom_provider"],
+            value: model.connection_mode === "custom" ? "custom_provider" : (model.provider || PROVIDERS[0]),
             onInput(value) {
-              model.provider = value;
+              if (value === "custom_provider") {
+                model.connection_mode = "custom";
+                model.custom_provider = model.custom_provider || formState.providers[0]?.name || "";
+              } else {
+                model.connection_mode = "direct";
+                model.provider = value;
+                model.custom_provider = "";
+              }
               markDirty(true);
+              renderAll({ preserveScroll: true, scrollToFocus: false });
             },
           });
-          bindField(grid, "base_url", {
-            value: model.base_url,
-            placeholder: "https://example.com/v1",
-            onInput(value) {
-              model.base_url = value;
-              markDirty(true);
-            },
-          });
+          if (model.connection_mode === "custom") {
+            bindField(grid, "custom_provider（引用上方供应商连接配置）", {
+              type: "select",
+              options: formState.providers.map((provider) => provider.name),
+              value: model.custom_provider || "",
+              helper: formState.providers.length > 0 ? "" : "请先添加供应商。",
+              onInput(value) {
+                model.custom_provider = value;
+                markDirty(true);
+                renderAll({ preserveScroll: true, scrollToFocus: false });
+              },
+            });
+          }
+          if (model.connection_mode === "direct") {
+            bindField(grid, "base_url", {
+              value: model.base_url,
+              placeholder: "https://example.com/v1",
+              onInput(value) {
+                model.base_url = value;
+                markDirty(true);
+              },
+            });
+          }
           bindField(grid, "model", {
             value: model.model,
             placeholder: "上游真实模型名",
@@ -860,15 +1082,17 @@ const SCRIPT = /* js */ String.raw`
               markDirty(true);
             },
           });
-          bindField(grid, "api_key", {
-            spanClass: "span-2",
-            value: model.api_key,
-            placeholder: "支持直接填 key 或 \${ENV_VAR}",
-            onInput(value) {
-              model.api_key = value;
-              markDirty(true);
-            },
-          });
+          if (model.connection_mode === "direct") {
+            bindField(grid, "api_key", {
+              spanClass: "span-2",
+              value: model.api_key,
+              placeholder: "支持直接填 key 或 \${ENV_VAR}",
+              onInput(value) {
+                model.api_key = value;
+                markDirty(true);
+              },
+            });
+          }
           bindAdvancedJsonField(grid, model, index);
           body.appendChild(grid);
 
@@ -892,25 +1116,51 @@ const SCRIPT = /* js */ String.raw`
 
         formState.fallbackGroups.forEach((group, index) => {
           const card = document.createElement("section");
-          card.className = "card";
+          card.className = "card" + (group._expanded ? "" : " compact");
           const duplicateMembers = getDuplicateMembers(group);
 
           const head = document.createElement("div");
           head.className = "card-head";
+          const toggle = document.createElement("button");
+          toggle.type = "button";
+          toggle.className = "card-toggle";
+          toggle.addEventListener("click", () => {
+            group._expanded = !group._expanded;
+            renderAll();
+          });
+          const toggleTop = document.createElement("div");
+          toggleTop.className = "card-toggle-top";
+          const chevron = document.createElement("span");
+          chevron.className = "card-chevron";
+          chevron.textContent = group._expanded ? "▾" : "▸";
           const title = document.createElement("div");
           title.className = "card-title";
           const h3 = document.createElement("h3");
           h3.textContent = group.name?.trim() || "未命名分组 " + (index + 1);
           title.appendChild(h3);
-          head.appendChild(title);
-          head.appendChild(
+          toggleTop.appendChild(chevron);
+          toggleTop.appendChild(title);
+          toggle.appendChild(toggleTop);
+          const summary = document.createElement("div");
+          summary.className = "card-summary";
+          summary.textContent = group.members.length + " models";
+          toggle.appendChild(summary);
+          head.appendChild(toggle);
+          const headActions = document.createElement("div");
+          headActions.className = "card-actions";
+          headActions.appendChild(
             createActionButton("删除分组", "danger", () => {
               formState.fallbackGroups = formState.fallbackGroups.filter((item) => item._id !== group._id);
               markDirty(true);
               renderAll();
             }),
           );
+          head.appendChild(headActions);
           card.appendChild(head);
+
+          const body = document.createElement("div");
+          body.className = "card-body";
+          body.hidden = !group._expanded;
 
           const grid = document.createElement("div");
           grid.className = "field-grid";
@@ -926,7 +1176,7 @@ const SCRIPT = /* js */ String.raw`
               renderAll({ preserveScroll: true, scrollToFocus: false });
             },
           });
-          card.appendChild(grid);
+          body.appendChild(grid);
 
           const membersWrap = document.createElement("div");
           membersWrap.className = "member-list";
@@ -1045,9 +1295,9 @@ const SCRIPT = /* js */ String.raw`
             membersWrap.appendChild(row);
           });
 
-          card.appendChild(membersWrap);
+          body.appendChild(membersWrap);
 
-          card.appendChild(
+          body.appendChild(
             createActionButton("添加模型到分组", "secondary", () => {
               const memberId = nextId("member");
               const used = new Set(group.members.map((item) => item.value).filter(Boolean));
@@ -1058,6 +1308,7 @@ const SCRIPT = /* js */ String.raw`
               renderAll();
             }),
           );
+          card.appendChild(body);
 
           fallbackContainer.appendChild(card);
         });
@@ -1068,6 +1319,7 @@ const SCRIPT = /* js */ String.raw`
         const scrollY = window.scrollY;
         renderSnapshotMeta();
         renderGlobalFields();
+        renderProviders();
         renderModels();
         renderFallbackGroups();
         if (preserveScroll) window.scrollTo(scrollX, scrollY);
@@ -1168,6 +1420,8 @@ const SCRIPT = /* js */ String.raw`
           _expanded: true,
           name: "",
           provider: "openai-chat",
+          connection_mode: "direct",
+          custom_provider: "",
           base_url: "",
           api_key: "",
           model: "",
@@ -1181,10 +1435,26 @@ const SCRIPT = /* js */ String.raw`
         renderAll();
       });
 
+      document.getElementById("add-provider-button").addEventListener("click", () => {
+        const id = nextId("provider");
+        formState.providers.push({
+          _id: id,
+          _expanded: true,
+          name: "",
+          provider: "openai-chat",
+          base_url: "",
+          api_key: "",
+        });
+        pendingFocusTarget = "provider-name-" + id;
+        markDirty(true);
+        renderAll();
+      });
+
       document.getElementById("add-fallback-button").addEventListener("click", () => {
         const id = nextId("fallback");
         formState.fallbackGroups.push({
           _id: id,
+          _expanded: true,
           name: "",
           members: [],
         });
@@ -1273,8 +1543,19 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
             <section class="panel">
               <div class="section-header">
                 <div>
+                  <h2>Providers</h2>
+                  <p class="meta">集中配置可供多个模型引用的协议、上游地址和 API Key；供应商名称必须唯一。</p>
+                </div>
+                <button id="add-provider-button" class="secondary" type="button">添加供应商</button>
+              </div>
+              <div class="card-list" id="providers-container"></div>
+            </section>
+
+            <section class="panel">
+              <div class="section-header">
+                <div>
                   <h2>Models</h2>
-                  <p class="meta">每个模型都可以单独编辑名称、供应商、上游地址、API Key 和真实模型名。</p>
+                  <p class="meta">模型可以直接配置连接信息，也可以通过 custom_provider 引用上方供应商。</p>
                 </div>
                 <button id="add-model-button" class="secondary" type="button">添加模型</button>
               </div>

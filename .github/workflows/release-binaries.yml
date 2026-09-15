@@ -2,10 +2,8 @@ name: Release binaries
 
 on:
   push:
-    branches:
-      - master
-    paths:
-      - package.json
+    branches: [master]
+    paths: [package.json]
   workflow_dispatch:
 
 permissions:
@@ -19,35 +17,25 @@ jobs:
       changed: ${{ steps.version.outputs.changed }}
       version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Compare package version
-        id: version
+      - id: version
         shell: bash
         run: |
           set -euo pipefail
-
           current_version="$(node -p "require('./package.json').version")"
           previous_version=""
-
           if [ "${{ github.event_name }}" = "push" ] && git cat-file -e "${{ github.event.before }}:package.json" 2>/dev/null; then
             previous_version="$(git show "${{ github.event.before }}:package.json" | node -e "let input=''; process.stdin.on('data', c => input += c); process.stdin.on('end', () => console.log(JSON.parse(input).version || ''));")"
           fi
-
           changed=false
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$current_version" != "$previous_version" ]; then
-            changed=true
-          fi
-
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$current_version" != "$previous_version" ]; then changed=true; fi
           echo "version=$current_version" >> "$GITHUB_OUTPUT"
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
-          echo "current_version=$current_version previous_version=${previous_version:-<none>} changed=$changed"
 
   build:
-    name: Build ${{ matrix.asset_name }}
+    name: Build ${{ matrix.bundle_name }}
     needs: version
     if: needs.version.outputs.changed == 'true'
     strategy:
@@ -55,122 +43,169 @@ jobs:
       matrix:
         include:
           - runner: windows-latest
-            asset_name: nanollm-windows-x64.exe
+            bundle_name: nanollm-windows-x64.zip
             executable_name: nanollm.exe
-            postject_extra_args: ""
+            helper_name: nanollm-oauth-transport.exe
+            native_dir: win32-x64
           - runner: ubuntu-24.04
-            asset_name: nanollm-linux-x64
+            bundle_name: nanollm-linux-x64.tar.gz
             executable_name: nanollm
-            postject_extra_args: ""
+            helper_name: nanollm-oauth-transport
+            native_dir: linux-x64
           - runner: macos-14
-            asset_name: nanollm-darwin-arm64
+            bundle_name: nanollm-darwin-arm64.tar.gz
             executable_name: nanollm
-            postject_extra_args: "--macho-segment-name NODE_SEA"
+            helper_name: nanollm-oauth-transport
+            native_dir: darwin-arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 24.9.0
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build JavaScript
-        run: npm run build
-
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run build
+      - name: Build OAuth transport
+        run: cargo build --release --locked --manifest-path native/oauth-transport/Cargo.toml
       - name: Build pkg SEA binary
         shell: bash
-        run: |
-          set -euo pipefail
-          npx --yes @yao-pkg/pkg@6.21.0 . --targets host --out-path dist-sea
-
-      - name: Smoke test
+        run: npx --yes @yao-pkg/pkg@6.21.0 . --targets host --out-path dist-sea
+      - name: Stage executables
         shell: bash
         run: |
           set -euo pipefail
-
+          mkdir -p bundle "native-bin/${{ matrix.native_dir }}"
+          cp "dist-sea/${{ matrix.executable_name }}" "bundle/${{ matrix.executable_name }}"
+          cp "native/oauth-transport/target/release/${{ matrix.helper_name }}" "bundle/${{ matrix.helper_name }}"
+          cp "native/oauth-transport/target/release/${{ matrix.helper_name }}" "native-bin/${{ matrix.native_dir }}/${{ matrix.helper_name }}"
+          chmod +x bundle/* "native-bin/${{ matrix.native_dir }}/${{ matrix.helper_name }}" || true
+      - name: Smoke test bundled executables
+        shell: bash
+        run: |
+          set -euo pipefail
           tmpdir="$(mktemp -d)"
-          cp "dist-sea/${{ matrix.executable_name }}" "$tmpdir/${{ matrix.executable_name }}"
-          chmod +x "$tmpdir/${{ matrix.executable_name }}" || true
+          cp bundle/* "$tmpdir/"
           mkdir -p "$tmpdir/home"
-
-          cat > "$tmpdir/smoke.config.yaml" <<'EOF'
+          cat > "$tmpdir/config.yaml" <<'EOF'
           server:
             port: 31991
           models: []
           EOF
-
-          HOME="$tmpdir/home" "$tmpdir/${{ matrix.executable_name }}" --config "$tmpdir/smoke.config.yaml" --storage sqlite > dist-sea/smoke.log 2>&1 &
+          HOME="$tmpdir/home" "$tmpdir/${{ matrix.executable_name }}" --config "$tmpdir/config.yaml" > smoke.log 2>&1 &
           pid="$!"
-
-          cleanup() {
-            kill "$pid" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
           for _ in $(seq 1 40); do
-            if node -e "fetch('http://127.0.0.1:31991/health').then(r => r.json()).then(j => { if (!j.ok) process.exit(1) }).catch(() => process.exit(1))"; then
-              exit 0
-            fi
+            if node -e "fetch('http://127.0.0.1:31991/health').then(r => r.json()).then(j => { if (!j.ok) process.exit(1) }).catch(() => process.exit(1))"; then exit 0; fi
             sleep 0.25
           done
-
-          cat dist-sea/smoke.log
+          cat smoke.log
           exit 1
-
-      - name: Rename artifact
+      - name: Create release bundle
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release
-          cp "dist-sea/${{ matrix.executable_name }}" "release/${{ matrix.asset_name }}"
-          chmod +x "release/${{ matrix.asset_name }}" || true
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "release/${{ matrix.bundle_name }}" "./bundle/*"
+          else
+            tar -C bundle -czf "release/${{ matrix.bundle_name }}" .
+          fi
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: release/${{ matrix.asset_name }}
+          name: bundle-${{ matrix.native_dir }}
+          path: release/${{ matrix.bundle_name }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-helper-${{ matrix.native_dir }}
+          path: native-bin
+          if-no-files-found: error
+
+  npm-package:
+    name: Verify npm package
+    needs: [version, build]
+    if: needs.version.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.9.0
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-helper-*
+          path: native-bin
+          merge-multiple: true
+      - name: Build and test installed npm package
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x native-bin/linux-x64/nanollm-oauth-transport native-bin/darwin-arm64/nanollm-oauth-transport
+          node scripts/verify-native-package.mjs
+          npm pack
+          tarball="$(find "$PWD" -maxdepth 1 -name 'nanollm-*.tgz' -print -quit)"
+          mkdir npm-smoke
+          cd npm-smoke
+          npm init -y >/dev/null
+          npm install "$tarball" >/dev/null
+          node --input-type=module -e "import('./node_modules/nanollm/dist/src/oauth-transport.js').then(m => { const p=m.resolveOAuthTransportPath(); if (!p || !p.replaceAll('\\\\','/').endsWith('native-bin/linux-x64/nanollm-oauth-transport')) throw new Error('npm helper was not resolved: '+p); console.log(p) })"
+          cat > config.yaml <<'EOF'
+          server:
+            port: 31992
+          models: []
+          EOF
+          ./node_modules/.bin/nanollm --config config.yaml > smoke.log 2>&1 &
+          pid="$!"
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            if node -e "fetch('http://127.0.0.1:31992/health').then(r => r.json()).then(j => { if (!j.ok) process.exit(1) }).catch(() => process.exit(1))"; then exit 0; fi
+            sleep 0.25
+          done
+          cat smoke.log
+          exit 1
+      - name: Publish verified npm package
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        shell: bash
+        run: npm publish nanollm-*.tgz --access public
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: nanollm-*.tgz
           if-no-files-found: error
 
   release:
     name: Publish release
-    needs:
-      - version
-      - build
+    needs: [version, build, npm-package]
     if: needs.version.outputs.changed == 'true'
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
+          pattern: bundle-*
           path: release-assets
           merge-multiple: true
-
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: release-assets
       - name: Publish GitHub release
         shell: bash
         run: |
           set -euo pipefail
-
           tag="$RELEASE_VERSION"
-          notes="Binary release for nanollm $RELEASE_VERSION."
-
+          notes="Binary release for nanollm $RELEASE_VERSION. Each platform archive contains nanollm and its OAuth transport helper."
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" release-assets/* --clobber
           else
-            gh release create "$tag" release-assets/* \
-              --title "$RELEASE_VERSION" \
-              --notes "$notes" \
-              --target "${{ github.sha }}"
+            gh release create "$tag" release-assets/* --title "$RELEASE_VERSION" --notes "$notes" --target "${{ github.sha }}"
           fi
