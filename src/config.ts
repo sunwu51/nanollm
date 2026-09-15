@@ -14,6 +14,7 @@ export interface ModelConfig {
   model: string;
   image?: boolean;
   ttfb_timeout?: number;
+  allowH2?: boolean;
   proxy?: string;
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
@@ -159,12 +160,14 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
   const modelTTFBTimeout = normalizeTimeout(model.ttfb_timeout, `models.${model.name || "<unknown>"}.ttfb_timeout`);
   const ttfb_timeout = modelTTFBTimeout ?? (model.provider === "openai-image" ? DEFAULT_OPENAI_IMAGE_TTFB_TIMEOUT : defaultTTFBTimeout);
   const image = model.image === undefined ? true : !!model.image;
+  const allowH2 = normalizeBoolean(model.allowH2, `models.${model.name || "<unknown>"}.allowH2`, false);
   const ignore_invalid_history = normalizeBoolean(model.ignore_invalid_history, `models.${model.name || "<unknown>"}.ignore_invalid_history`, true);
   const proxy = normalizeProxyUrl(model.proxy, `models.${model.name || "<unknown>"}.proxy`);
 
   return {
     ...model,
     image,
+    allowH2,
     ignore_invalid_history,
     proxy,
     ...(ttfb_timeout !== undefined ? { ttfb_timeout } : {}),

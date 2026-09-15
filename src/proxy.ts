@@ -20,7 +20,7 @@ import {
   setRecordedAttemptResponseMeta,
 } from "./record.js";
 import { runInNewContext } from "node:vm";
-import { ProxyAgent, fetch as undiciFetch } from "undici";
+import { Agent, ProxyAgent, fetch as undiciFetch } from "undici";
 import { extractErrorCauses } from "./error-details.js";
 
 export interface UpstreamRequestOptions {
@@ -277,6 +277,22 @@ export function resolveProxyUrl(config: ModelConfig): string | undefined {
   return config.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
 }
 
+const upstreamAgents = {
+  http1: new Agent({ allowH2: false }),
+  http2: new Agent({ allowH2: true }),
+};
+
+export function createUpstreamDispatcher(config: ModelConfig, proxyUrl = resolveProxyUrl(config)) {
+  const allowH2 = config.allowH2 ?? false;
+  if (!proxyUrl) return allowH2 ? upstreamAgents.http2 : upstreamAgents.http1;
+
+  return new ProxyAgent({
+    uri: proxyUrl,
+    allowH2,
+    requestTls: { allowH2 },
+  });
+}
+
 async function upstreamFetch(
   config: ModelConfig,
   body: string,
@@ -324,9 +340,7 @@ async function upstreamFetchToUrl(
     requestBody: recordedRequestBody,
   });
 
-  if (proxyUrl) {
-    fetchOptions.dispatcher = new ProxyAgent(proxyUrl);
-  }
+  fetchOptions.dispatcher = createUpstreamDispatcher(config, proxyUrl);
 
   if (abortController && timeoutMs !== undefined) {
     timeoutHandle = setTimeout(() => {

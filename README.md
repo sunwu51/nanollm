@@ -43,6 +43,7 @@ models:
     model: glm5.1
     image: true # optional, default true; only effective for openai-chat provider
     ttfb_timeout: 3000 # optional, overrides server.ttfb_timeout
+    allowH2: false # optional, default false; enable HTTP/2 ALPN for this upstream
     proxy: http://127.0.0.1:7890 # optional, overrides HTTPS_PROXY/HTTP_PROXY for this model
     headers:
       user-agent: nanollm
