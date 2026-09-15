@@ -163,6 +163,11 @@ function applyModelBodyTransforms(config: ModelConfig, body: unknown): unknown {
   return applyModelBodyExpression(config, applyModelBodyOverrides(config, body));
 }
 
+function enforceSubscriptionRequest(config: ModelConfig, body: unknown): unknown {
+  if (!config.subscription_provider || !isPlainObject(body)) return body;
+  return { ...body, store: false };
+}
+
 const OPENAI_RESPONSES_UNSTORED_ITEM_ID_TYPES = new Set(["message", "reasoning", "function_call", "custom_tool_call"]);
 
 function stripOpenAIResponsesUnstoredItemIds(config: ModelConfig, body: unknown): unknown {
@@ -179,10 +184,10 @@ function stripOpenAIResponsesUnstoredItemIds(config: ModelConfig, body: unknown)
   return changed ? { ...body, input } : body;
 }
 
-function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unknown>, stream: boolean): unknown {
+export function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unknown>, stream: boolean): unknown {
   return stripOpenAIResponsesUnstoredItemIds(
     config,
-    applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream }),
+    enforceSubscriptionRequest(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream })),
   );
 }
 
@@ -644,7 +649,7 @@ export async function forwardRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
+  const body = enforceSubscriptionRequest(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, { ...options, recordedRequestBody: body });
   const text = await response.text();
   setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
@@ -662,7 +667,7 @@ export async function forwardStreamRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
+  const body = enforceSubscriptionRequest(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, { ...options, recordedRequestBody: body });
   if (!response.body) throw new Error("Upstream returned no streaming body");
   const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0 });

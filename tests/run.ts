@@ -28,7 +28,7 @@ import { renderAdminConfigPage } from "../src/admin-config-page.js";
 import { ConfigManager } from "../src/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
-import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
+import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, preparePassthroughBody, resolveProxyUrl } from "../src/proxy.js";
 import { cacheResponseItems, resolveItemReferences } from "../src/response-cache.js";
 import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/response-compression.js";
 import { renderRecordPage } from "../src/record-page.js";
@@ -3767,6 +3767,27 @@ await runAsync("openai responses passthrough drops persisted item ids when store
       { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
     ]);
   });
+});
+
+run("subscription responses always disable upstream storage after model body transforms", () => {
+  const body = preparePassthroughBody({
+    name: "subscription-model",
+    provider: "openai-responses",
+    subscription_provider: "codex-subscription",
+    base_url: "https://chatgpt.com/backend-api/codex",
+    api_key: "",
+    model: "gpt-5",
+    body: { store: true },
+    bodyExpression: "({ ...body, store: true })",
+  }, {
+    model: "subscription-model",
+    store: true,
+    input: "hello",
+  }, true) as Record<string, unknown>;
+
+  assert.equal(body.store, false);
+  assert.equal(body.stream, true);
+  assert.equal(body.model, "gpt-5");
 });
 
 await runAsync("model bodyExpression rewrites passthrough upstream request body", async () => {
