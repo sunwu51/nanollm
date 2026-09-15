@@ -1544,6 +1544,16 @@ const SCRIPT = String.raw`
         parent.appendChild(box);
       }
 
+      function formatRecordedError(error) {
+        if (!error?.message) return "";
+        const details = Array.isArray(error.causes)
+          ? error.causes.map((cause) => cause?.code && cause.code !== cause.message
+              ? cause.message + " (" + cause.code + ")"
+              : cause?.message).filter(Boolean)
+          : [];
+        return [error.message, ...details].filter((value, index, values) => values.indexOf(value) === index).join(": ");
+      }
+
       function renderRecord(record) {
         contentEl.textContent = "";
 
@@ -1554,7 +1564,7 @@ const SCRIPT = String.raw`
           ["path", record.clientRequest?.path],
           ["stream", record.stream],
           ["createdAt", record.createdAt ? new Date(record.createdAt).toLocaleString("zh-CN") : "-"],
-          ["error", record.error?.message ?? ""],
+          ["error", formatRecordedError(record.error)],
         ]);
         baseSection.appendChild(createReplayControls(record));
         contentEl.appendChild(baseSection);
@@ -1588,7 +1598,7 @@ const SCRIPT = String.raw`
             appendKV(card, [
               ["url", attempt.url],
               ["status", attempt.response?.status],
-              ["error", attempt.error?.message ?? ""],
+              ["error", formatRecordedError(attempt.error)],
             ]);
 
             const upstreamRequestFold = createFold("Upstream Request");

@@ -59,6 +59,7 @@ import { handleServerStartupError } from "./src/startup-error.js";
 import { openSqliteStorage } from "./src/sqlite.js";
 import { autoMigrateSqliteFileToTurso, resolveTursoAutoMigrationConfig } from "./src/turso-migration.js";
 import { stringify as stringifyYAML } from "yaml";
+import { extractErrorCauses, formatErrorWithCauses } from "./src/error-details.js";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -853,7 +854,7 @@ function createRoute(incomingFormat: StreamFormat) {
           console.warn(
             orange(
               withRequestId(
-                `[MODEL FAILED] requested=${modelName} candidate=${modelConfig.name} path=${c.req.path} target=${getUpstreamURL(modelConfig)} message=${err.message}`,
+                `[MODEL FAILED] requested=${modelName} candidate=${modelConfig.name} path=${c.req.path} target=${getUpstreamURL(modelConfig)} message=${formatErrorWithCauses(err)}`,
               ),
             ),
           );
@@ -869,9 +870,11 @@ function createRoute(incomingFormat: StreamFormat) {
     if (lastError) {
       console.error(orange(withRequestId(`[proxy error] ${lastError.message}`)), lastError.cause ?? "");
       const status = lastError.status || 500;
-      setRecordedRequestError({ message: lastError.message || "Request failed" });
+      const causes = extractErrorCauses(lastError);
+      setRecordedRequestError({ message: lastError.message || "Request failed", causes });
       const errorBody = {
         error: lastError.message || "Request failed",
+        ...(causes.length ? { causes } : {}),
         ...(lastError.upstream ? { upstream: tryParseJSON(lastError.upstream) } : {}),
       };
       const response = c.json(errorBody, status);
@@ -981,7 +984,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
           console.warn(
             orange(
               withRequestId(
-                `[MODEL FAILED] requested=${modelName} candidate=${modelConfig.name} path=${c.req.path} target=${getUpstreamURL(modelConfig)} message=${err.message}`,
+                `[MODEL FAILED] requested=${modelName} candidate=${modelConfig.name} path=${c.req.path} target=${getUpstreamURL(modelConfig)} message=${formatErrorWithCauses(err)}`,
               ),
             ),
           );
@@ -989,10 +992,12 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
       }
 
       if (lastError) {
-        setRecordedRequestError({ message: lastError.message });
+        const causes = extractErrorCauses(lastError);
+        setRecordedRequestError({ message: lastError.message, causes });
         const status = lastError.status && lastError.status >= 400 && lastError.status < 600 ? lastError.status : 502;
         const errorBody = {
           error: lastError.message,
+          ...(causes.length ? { causes } : {}),
           ...(lastError.upstream ? { upstream: lastError.upstream } : {}),
         };
         const response = c.json(errorBody, status);

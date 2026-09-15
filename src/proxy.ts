@@ -21,6 +21,7 @@ import {
 } from "./record.js";
 import { runInNewContext } from "node:vm";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
+import { extractErrorCauses } from "./error-details.js";
 
 export interface UpstreamRequestOptions {
   userAgent?: string;
@@ -349,6 +350,7 @@ async function upstreamFetchToUrl(
     setRecordedAttemptError({
       index: options?.attemptIndex ?? 0,
       message: error instanceof Error ? error.message : String(error),
+      causes: extractErrorCauses(error),
     });
     throw error;
   } finally {
