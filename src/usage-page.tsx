@@ -68,6 +68,16 @@ export const USAGE_STYLE = /* css */ String.raw`
         color: var(--usage-text);
         font-weight: 600;
       }
+      .usage-equivalent-cost {
+        margin: 4px 0 0;
+        color: var(--usage-muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      .usage-equivalent-cost strong {
+        color: var(--usage-text);
+        font-weight: 600;
+      }
       .usage-note {
         margin: 2px 0 0;
         color: var(--usage-muted);
@@ -250,6 +260,7 @@ export const USAGE_SCRIPT = String.raw`
       const USAGE_HEATMAP_EL = document.getElementById("usage-heatmap");
       const USAGE_MONTHS_EL = document.getElementById("usage-months");
       const USAGE_SUMMARY_EL = document.getElementById("usage-summary");
+      const USAGE_EQUIVALENT_COST_EL = document.getElementById("usage-equivalent-cost");
       const USAGE_RANGE_EL = document.getElementById("usage-range");
       const USAGE_METRIC_EL = document.getElementById("usage-metric");
       const USAGE_MODEL_EL = document.getElementById("usage-model");
@@ -282,13 +293,23 @@ export const USAGE_SCRIPT = String.raw`
         return new Intl.NumberFormat("en-US").format(Math.round(value || 0));
       }
 
+      function formatEquivalentCost(value) {
+        if (!Number.isFinite(value) || value <= 0) return "0.00";
+        return value < 0.01 ? value.toFixed(4) : value.toFixed(2);
+      }
+
       function getUsageMetricValue(day) {
+        if (currentUsageMetric === "cacheHitRate") {
+          const input = Number(day.nonCacheInputTokens || 0) + Number(day.cacheReadInputTokens || 0);
+          return input > 0 ? (Number(day.cacheReadInputTokens || 0) / input) * 100 : 0;
+        }
         return Number(day[currentUsageMetric] || 0);
       }
 
       function getUsageMetricLabel() {
         if (currentUsageMetric === "totalRequests") return "requests";
         if (currentUsageMetric === "outputTokens") return "output tokens";
+        if (currentUsageMetric === "cacheHitRate") return "cache hit rate";
         return "tokens";
       }
 
@@ -313,12 +334,23 @@ export const USAGE_SCRIPT = String.raw`
         const inputTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.nonCacheInputTokens || 0), 0);
         const cachedTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.cacheReadInputTokens || 0), 0);
         const outputTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.outputTokens || 0), 0);
+        const cacheHitRate = inputTokens + cachedTokens > 0 ? cachedTokens / (inputTokens + cachedTokens) * 100 : null;
         USAGE_SUMMARY_EL.innerHTML =
           "<span><strong>" + formatUsageCompact(totalRequests) + "</strong> Requests</span>" +
           "<span><strong>" + formatUsageCompact(totalTokens) + "</strong> Tokens</span>" +
           "<span><strong>" + formatUsageCompact(inputTokens) + "</strong> Input</span>" +
           "<span><strong>" + formatUsageCompact(cachedTokens) + "</strong> Cached</span>" +
           "<span><strong>" + formatUsageCompact(outputTokens) + "</strong> Output</span>";
+        USAGE_SUMMARY_EL.innerHTML += "<span><strong>" + (cacheHitRate == null ? "--" : cacheHitRate.toFixed(1) + "%") + "</strong> Cache hit rate</span>";
+        const equivalentCost = (
+          cachedTokens * 0.04 +
+          inputTokens * 2 +
+          outputTokens * 8
+        ) / 1000000;
+        USAGE_EQUIVALENT_COST_EL.innerHTML =
+          "Equivalent cost at DeepSeek Flash peak pricing " +
+          "(¥0.04 / ¥2.00 / ¥8.00 per 1M cached input / input / output tokens): " +
+          "<strong>¥" + formatEquivalentCost(equivalentCost) + "</strong>";
       }
 
       function renderUsageMonths(cells) {
@@ -349,6 +381,9 @@ export const USAGE_SCRIPT = String.raw`
           ["Failed", formatUsageFull(day.failureRequests)],
           ["Input", formatUsageFull(day.nonCacheInputTokens)],
           ["Cached", formatUsageFull(day.cacheReadInputTokens)],
+          ["Cache hit rate", ((Number(day.nonCacheInputTokens || 0) + Number(day.cacheReadInputTokens || 0)) > 0
+            ? (Number(day.cacheReadInputTokens || 0) / (Number(day.nonCacheInputTokens || 0) + Number(day.cacheReadInputTokens || 0)) * 100).toFixed(1) + "%"
+            : "--")],
           ["Output", formatUsageFull(day.outputTokens)],
           ["Tokens", formatUsageFull(day.totalTokens)],
         ];
@@ -482,6 +517,7 @@ export function UsageSection({ payload }: { payload: UsagePagePayload }) {
               <h1 class="usage-title">Usage in selected time range</h1>
               <p class="usage-note">Persistent usage history requires --storage sqlite; memory mode only shows data from the current process.</p>
               <div class="usage-summary" id="usage-summary" aria-label="usage summary"></div>
+              <p class="usage-equivalent-cost" id="usage-equivalent-cost"></p>
             </div>
             <div class="usage-controls">
               <select class="usage-select" id="usage-range" aria-label="Time range">
@@ -493,6 +529,7 @@ export function UsageSection({ payload }: { payload: UsagePagePayload }) {
                 <option value="totalTokens">Tokens</option>
                 <option value="totalRequests">Requests</option>
                 <option value="outputTokens">Output</option>
+                <option value="cacheHitRate">Cache hit rate</option>
               </select>
               <select class="usage-select" id="usage-model" aria-label="Model">
                 <option value="">All models</option>

@@ -23,12 +23,12 @@ import {
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/auth.js";
-import { getPublicModelNames, loadConfig, resolveFallbackModels, resolveModelForRequest } from "../src/config.js";
+import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/config.js";
 import { renderAdminConfigPage } from "../src/admin-config-page.js";
 import { ConfigManager } from "../src/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
-import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
+import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, preparePassthroughBody, resolveProxyUrl } from "../src/proxy.js";
 import { cacheResponseItems, resolveItemReferences } from "../src/response-cache.js";
 import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/response-compression.js";
 import { renderRecordPage } from "../src/record-page.js";
@@ -57,6 +57,7 @@ import {
 import { runWithRequestId } from "../src/request-context.js";
 import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/status.js";
 import { shouldIgnoreStreamReadError } from "../src/stream-errors.js";
+import { extractErrorCauses, formatErrorWithCauses } from "../src/error-details.js";
 import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/usage.js";
 import { openSqliteStorage } from "../src/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../src/turso-migration.js";
@@ -80,6 +81,34 @@ function runThrows(name: string, fn: () => void, expectedMessage: string) {
     assert.throws(fn, new RegExp(expectedMessage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 }
+
+run("extractErrorCauses preserves useful nested transport details and redacts secrets", () => {
+  const nested = Object.assign(new Error("HTTP/2 GOAWAY Bearer secret-token"), {
+    code: "ERR_HTTP2_GOAWAY_SESSION",
+    cause: Object.assign(new Error("socket closed"), { errno: -54 }),
+  });
+  const error = new TypeError("fetch failed", { cause: nested });
+  assert.deepEqual(extractErrorCauses(error), [
+    {
+      name: "Error",
+      message: "HTTP/2 GOAWAY Bearer [REDACTED]",
+      code: "ERR_HTTP2_GOAWAY_SESSION",
+    },
+    { name: "Error", message: "socket closed", errno: -54 },
+  ]);
+  assert.equal(
+    formatErrorWithCauses(error),
+    "fetch failed: HTTP/2 GOAWAY Bearer [REDACTED] (ERR_HTTP2_GOAWAY_SESSION): socket closed",
+  );
+});
+
+run("extractErrorCauses stops at circular cause chains", () => {
+  const cause = new Error("closed") as Error & { cause?: unknown };
+  cause.cause = cause;
+  assert.deepEqual(extractErrorCauses(new Error("fetch failed", { cause })), [
+    { name: "Error", message: "closed" },
+  ]);
+});
 
 async function runAsync(name: string, fn: () => Promise<void>) {
   try {
@@ -573,6 +602,10 @@ run("responses namespaced function_call namespace round-trips exactly for variou
         temperature: null, text: { format: { type: "text" } },
       } as any);
 
+      const chatToolCall = asChat.choices[0].message.tool_calls?.[0];
+      assert.equal(chatToolCall?.type, "function");
+      if (!chatToolCall || chatToolCall.type !== "function") throw new Error("Expected function tool call");
+
       const backResp = chatCompletionToResponsesResponse({
         id: "chat_1", object: "chat.completion", created: 1, model: "gpt-5",
         choices: [{
@@ -580,14 +613,18 @@ run("responses namespaced function_call namespace round-trips exactly for variou
           message: {
             role: "assistant", content: null,
             tool_calls: [{ id: "call_1", type: "function",
-              function: { name: asChat.choices[0].message.tool_calls[0].function.name,
+              function: { name: chatToolCall.function.name,
                 arguments: "{\"who\":\"world\"}" } }]
           }
         }],
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
       } as any);
 
-      const fc = backResp.output.find((o: any) => o.type === "function_call" || o.type === "custom_tool_call");
+      const fc = backResp.output.find((output) => output.type === "function_call" || output.type === "custom_tool_call");
+      assert.ok(fc);
+      if (!fc || (fc.type !== "function_call" && fc.type !== "custom_tool_call")) {
+        throw new Error("Expected function or custom tool call");
+      }
       assert.equal(fc?.namespace, ns, `namespace should round-trip for input '${ns}'`);
       assert.equal(fc?.name, "say_hi", `name should round-trip for input '${ns}'`);
       return fc;
@@ -2683,6 +2720,76 @@ models:
   }
 });
 
+run("config expands custom provider references into effective model connection fields", () => {
+  const configPath = writeTempConfig(`
+providers:
+  - name: deepseek
+    provider: openai-chat
+    base_url: https://api.deepseek.com/v1
+    api_key: \${DEEPSEEK_API_KEY}
+models:
+  - name: deepseek-chat
+    custom_provider: deepseek
+    model: deepseek-chat
+`);
+  const previousKey = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = "resolved-key";
+  try {
+    const config = loadConfig(configPath);
+    assert.equal(config.providers[0].name, "deepseek");
+    assert.equal(config.models[0].custom_provider, "deepseek");
+    assert.equal(config.models[0].provider, "openai-chat");
+    assert.equal(config.models[0].base_url, "https://api.deepseek.com/v1");
+    assert.equal(config.models[0].api_key, "resolved-key");
+  } finally {
+    if (previousKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = previousKey;
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+run("config rejects duplicate and unknown custom providers", () => {
+  assert.throws(() => parseConfigText(`
+providers:
+  - name: shared
+    provider: openai-chat
+    base_url: https://one.example/v1
+    api_key: one
+  - name: shared
+    provider: anthropic
+    base_url: https://two.example/v1
+    api_key: two
+models: []
+`), /Duplicate provider name 'shared'/);
+  assert.throws(() => parseConfigText(`
+models:
+  - name: alpha
+    custom_provider: missing
+    model: upstream-alpha
+`), /references unknown custom provider 'missing'/);
+});
+
+run("config rejects models that mix custom provider and direct connection fields", () => {
+  for (const conflictingLine of [
+    "    provider: openai-chat",
+    "    base_url: ''",
+    "    api_key: direct-key",
+  ]) {
+    assert.throws(() => parseConfigText(`
+providers:
+  - name: shared
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: shared-key
+models:
+  - name: alpha
+    custom_provider: shared
+${conflictingLine}
+    model: upstream-alpha
+`), /cannot combine 'custom_provider'/);
+  }
+});
+
 run("config respects model image flag", () => {
   const configPath = writeTempConfig(`
 models:
@@ -3278,7 +3385,7 @@ fallback:
     - beta
 `, "ui");
 
-    assert.deepEqual(result.appliedFields, ["models", "fallback", "server.ttfb_timeout", "record.max_size"]);
+    assert.deepEqual(result.appliedFields, ["providers", "models", "fallback", "server.ttfb_timeout", "record.max_size"]);
     assert.deepEqual(result.requiresRestartFields, ["server.port", "server.auth.token"]);
     assert.equal(result.snapshot.effectiveConfig.port, 3000);
     assert.equal(result.snapshot.effectiveConfig.auth?.token, "old-token");
@@ -3660,6 +3767,27 @@ await runAsync("openai responses passthrough drops persisted item ids when store
       { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
     ]);
   });
+});
+
+run("subscription responses always disable upstream storage after model body transforms", () => {
+  const body = preparePassthroughBody({
+    name: "subscription-model",
+    provider: "openai-responses",
+    subscription_provider: "codex-subscription",
+    base_url: "https://chatgpt.com/backend-api/codex",
+    api_key: "",
+    model: "gpt-5",
+    body: { store: true },
+    bodyExpression: "({ ...body, store: true })",
+  }, {
+    model: "subscription-model",
+    store: true,
+    input: "hello",
+  }, true) as Record<string, unknown>;
+
+  assert.equal(body.store, false);
+  assert.equal(body.stream, true);
+  assert.equal(body.model, "gpt-5");
 });
 
 await runAsync("model bodyExpression rewrites passthrough upstream request body", async () => {
@@ -4643,6 +4771,14 @@ run("admin page relies on server cookie auth instead of client-side token storag
     form: {
       server: { port: "3000", ttfb_timeout: "5000" },
       record: { max_size: "10" },
+      providers: [
+        {
+          name: "shared",
+          provider: "openai-chat",
+          base_url: "https://example.com/v1",
+          api_key: "test-key",
+        },
+      ],
       models: [
         {
           name: "alpha",
@@ -4669,6 +4805,13 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.match(html, /_advancedExpanded/);
   assert.match(html, /function parseAdvancedJson/);
   assert.match(html, /RESERVED_MODEL_EXTRA_KEYS/);
+  assert.match(html, /id="providers-container"/);
+  assert.match(html, /id="add-provider-button"/);
+  assert.match(html, /custom_provider/);
+  assert.match(html, /connection_mode/);
+  assert.match(html, /model\.connection_mode === "custom"/);
+  assert.match(html, /previousName\) \{/);
+  assert.match(html, /删除供应商/);
   assert.match(html, /不能覆盖 name\/provider\/base_url\/api_key\/model/);
   assert.match(html, /"image":false/);
   assert.match(html, /"X-Test":"ok"/);

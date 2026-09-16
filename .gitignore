@@ -6,4 +6,7 @@ config.yaml
 .test-dist/
 dist/
 dist-sea/
+native-bin/
+native/**/target/
+/openai-subscription/
 *~

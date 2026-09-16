@@ -1,0 +1,14 @@
+.git
+.github
+.vscode
+.env
+.npm-cache
+.test-dist
+dist
+dist-sea
+native-bin
+native/**/target
+node_modules
+openai-subscription
+config.yaml
+*.log

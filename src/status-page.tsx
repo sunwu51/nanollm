@@ -447,6 +447,11 @@ const SCRIPT = String.raw`
         return cell.totalRequests === 0 ? "-" : cell.successRate.toFixed(1) + "%";
       }
 
+      function formatCacheHitRate(cell) {
+        const input = (cell.nonCacheInputTokens || 0) + (cell.cacheReadInputTokens || 0);
+        return input > 0 ? ((cell.cacheReadInputTokens || 0) / input * 100).toFixed(1) + "%" : "-";
+      }
+
       function getTone(cell) {
         if (cell.totalRequests === 0) return "empty";
         if (cell.successRate >= 100) return "green";
@@ -466,6 +471,7 @@ const SCRIPT = String.raw`
           ["平均总耗时", formatMetric(cell.avgDurationMs)],
           ["Input", formatToken(cell.nonCacheInputTokens)],
           ["Cache", formatToken(cell.cacheReadInputTokens)],
+          ["Cache 命中率", formatCacheHitRate(cell)],
           ["Output", formatToken(cell.outputTokens)],
           ["平均速度", formatSpeed(cell.avgTokenSpeed)],
         ];
@@ -588,6 +594,7 @@ const SCRIPT = String.raw`
         const entries = [
           ["Input", formatTokenM(summary.nonCacheInputTokens)],
           ["Cache", formatTokenM(summary.cacheReadInputTokens)],
+          ["Cache 命中率", formatCacheHitRate(summary)],
           ["Output", formatTokenM(summary.outputTokens)],
         ];
         for (const [label, value] of entries) {
@@ -648,6 +655,7 @@ const SCRIPT = String.raw`
           usage.textContent =
             "Input " + formatToken(usageSummary.nonCacheInputTokens) +
             " | Cache " + formatToken(usageSummary.cacheReadInputTokens) +
+            " (" + formatCacheHitRate(usageSummary) + ")" +
             " | Output " + formatToken(usageSummary.outputTokens) +
             " | " + formatSpeed(aggregateSpeed);
           name.appendChild(main);

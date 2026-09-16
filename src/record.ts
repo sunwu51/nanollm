@@ -3,6 +3,7 @@ import { getRequestId } from "./request-context.js";
 import { DEFAULT_RECORD_MAX_SIZE } from "./config.js";
 import type { SqliteClient } from "./sqlite.js";
 import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
+import type { ErrorCauseDetail } from "./error-details.js";
 
 const REDACTED = "[REDACTED]";
 const SENSITIVE_HEADERS = new Set(["authorization", "x-api-key", "cookie", "set-cookie"]);
@@ -35,6 +36,7 @@ export interface RecordedAttempt {
   };
   error?: {
     message: string;
+    causes?: ErrorCauseDetail[];
     status?: number;
     upstream?: unknown;
   };
@@ -66,6 +68,7 @@ export interface RecordEntry {
   };
   error?: {
     message: string;
+    causes?: ErrorCauseDetail[];
   };
 }
 
@@ -109,7 +112,7 @@ interface RecordStoreLike {
   }): void;
   setAttemptResponseBody(input: { requestId?: string; index: number; body: unknown }): void;
   appendAttemptResponseBody(input: { requestId?: string; index: number; chunk: string }): void;
-  setAttemptError(input: { requestId?: string; index: number; message: string; status?: number; upstream?: unknown }): void;
+  setAttemptError(input: { requestId?: string; index: number; message: string; causes?: ErrorCauseDetail[]; status?: number; upstream?: unknown }): void;
   setClientResponseMeta(input: {
     requestId?: string;
     status: number;
@@ -117,7 +120,7 @@ interface RecordStoreLike {
   }): void;
   setClientResponseBody(input: { requestId?: string; body: unknown }): void;
   appendClientResponseBody(input: { requestId?: string; chunk: string }): void;
-  setRequestError(input: { requestId?: string; message: string }): void;
+  setRequestError(input: { requestId?: string; message: string; causes?: ErrorCauseDetail[] }): void;
   finalizeRequest(input: { requestId?: string }): void;
   flush?(): void | Promise<void>;
 }
@@ -437,11 +440,12 @@ class RecordStore implements RecordStoreLike {
     attempt.response.truncated = text.truncated;
   }
 
-  setAttemptError(input: { requestId?: string; index: number; message: string; status?: number; upstream?: unknown }) {
+  setAttemptError(input: { requestId?: string; index: number; message: string; causes?: ErrorCauseDetail[]; status?: number; upstream?: unknown }) {
     const attempt = this.getMutable(input.requestId)?.attempts.find((item) => item.index === input.index);
     if (!attempt) return;
     attempt.error = {
       message: input.message,
+      ...(input.causes?.length ? { causes: input.causes } : {}),
       ...(input.status != null ? { status: input.status } : {}),
       ...(input.upstream !== undefined ? { upstream: normalizeBody(input.upstream).value } : {}),
     };
@@ -478,10 +482,10 @@ class RecordStore implements RecordStoreLike {
     record.clientRequest.status = "success";
   }
 
-  setRequestError(input: { requestId?: string; message: string }) {
+  setRequestError(input: { requestId?: string; message: string; causes?: ErrorCauseDetail[] }) {
     const record = this.getMutable(input.requestId);
     if (!record) return;
-    record.error = { message: input.message };
+    record.error = { message: input.message, ...(input.causes?.length ? { causes: input.causes } : {}) };
     record.clientRequest.status = "failure";
   }
 
@@ -976,12 +980,13 @@ class SqliteRecordStore implements RecordStoreLike {
     });
   }
 
-  setAttemptError(input: { requestId?: string; index: number; message: string; status?: number; upstream?: unknown }) {
+  setAttemptError(input: { requestId?: string; index: number; message: string; causes?: ErrorCauseDetail[]; status?: number; upstream?: unknown }) {
     this.mutate(input.requestId, (record) => {
       const attempt = record.attempts.find((item) => item.index === input.index);
       if (!attempt) return;
       attempt.error = {
         message: input.message,
+        ...(input.causes?.length ? { causes: input.causes } : {}),
         ...(input.status != null ? { status: input.status } : {}),
         ...(input.upstream !== undefined ? { upstream: normalizeBody(input.upstream).value } : {}),
       };
@@ -1019,9 +1024,9 @@ class SqliteRecordStore implements RecordStoreLike {
     });
   }
 
-  setRequestError(input: { requestId?: string; message: string }) {
+  setRequestError(input: { requestId?: string; message: string; causes?: ErrorCauseDetail[] }) {
     this.mutate(input.requestId, (record) => {
-      record.error = { message: input.message };
+      record.error = { message: input.message, ...(input.causes?.length ? { causes: input.causes } : {}) };
       record.clientRequest.status = "failure";
     });
   }
@@ -1117,7 +1122,7 @@ export function appendRecordedAttemptResponseBody(input: { requestId?: string; i
   recordStore.appendAttemptResponseBody(input);
 }
 
-export function setRecordedAttemptError(input: { requestId?: string; index: number; message: string; status?: number; upstream?: unknown }) {
+export function setRecordedAttemptError(input: { requestId?: string; index: number; message: string; causes?: ErrorCauseDetail[]; status?: number; upstream?: unknown }) {
   recordStore.setAttemptError(input);
 }
 
@@ -1137,7 +1142,7 @@ export function appendRecordedClientResponseBody(input: { requestId?: string; ch
   recordStore.appendClientResponseBody(input);
 }
 
-export function setRecordedRequestError(input: { requestId?: string; message: string }) {
+export function setRecordedRequestError(input: { requestId?: string; message: string; causes?: ErrorCauseDetail[] }) {
   recordStore.setRequestError(input);
 }
 

@@ -12,13 +12,23 @@ export interface ModelConfig {
   base_url: string;
   api_key: string;
   model: string;
+  custom_provider?: string;
+  subscription_provider?: string;
   image?: boolean;
   ttfb_timeout?: number;
+  allowH2?: boolean;
   proxy?: string;
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
   bodyExpression?: string;
   ignore_invalid_history?: boolean;
+}
+
+export interface CustomProviderConfig {
+  name: string;
+  provider: StreamFormat | "openai-subscription";
+  base_url: string;
+  api_key: string;
 }
 
 export interface ServerConfig {
@@ -28,6 +38,7 @@ export interface ServerConfig {
     token?: string;
   };
   models: ModelConfig[];
+  providers: CustomProviderConfig[];
   fallback: Record<string, string[]>;
   record: {
     max_size: number;
@@ -37,7 +48,8 @@ export interface ServerConfig {
 export interface ParsedConfigDocument {
   server?: { port?: number; ttfb_timeout?: number; auth?: { token?: string } };
   record?: { max_size?: number };
-  models?: ModelConfig[];
+  models?: Array<Partial<ModelConfig> & Pick<ModelConfig, "name" | "model">>;
+  providers?: CustomProviderConfig[];
   fallback?: Record<string, string[]>;
 }
 
@@ -159,12 +171,14 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
   const modelTTFBTimeout = normalizeTimeout(model.ttfb_timeout, `models.${model.name || "<unknown>"}.ttfb_timeout`);
   const ttfb_timeout = modelTTFBTimeout ?? (model.provider === "openai-image" ? DEFAULT_OPENAI_IMAGE_TTFB_TIMEOUT : defaultTTFBTimeout);
   const image = model.image === undefined ? true : !!model.image;
+  const allowH2 = normalizeBoolean(model.allowH2, `models.${model.name || "<unknown>"}.allowH2`, false);
   const ignore_invalid_history = normalizeBoolean(model.ignore_invalid_history, `models.${model.name || "<unknown>"}.ignore_invalid_history`, true);
   const proxy = normalizeProxyUrl(model.proxy, `models.${model.name || "<unknown>"}.proxy`);
 
   return {
     ...model,
     image,
+    allowH2,
     ignore_invalid_history,
     proxy,
     ...(ttfb_timeout !== undefined ? { ttfb_timeout } : {}),
@@ -203,7 +217,48 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
   const defaultTTFBTimeout = options?.ttfb_timeout ?? normalizeTimeout(document.server?.ttfb_timeout, "server.ttfb_timeout") ?? DEFAULT_TTFB_TIMEOUT;
   const recordMaxSize = options?.recordMaxSize ?? (normalizePositiveInteger(document.record?.max_size, "record.max_size") ?? DEFAULT_RECORD_MAX_SIZE);
   const authToken = normalizeOptionalString(options?.authToken ?? document.server?.auth?.token);
-  const models = (document.models ?? []).map((model) => normalizeModelConfig(model, defaultTTFBTimeout));
+  const providers = (document.providers ?? []).map((provider) => ({
+    ...provider,
+    name: String(provider.name || "").trim(),
+    provider: provider.provider,
+    base_url: String(provider.base_url || "").trim(),
+    api_key: String(provider.api_key || ""),
+  }));
+  const providerNames = new Set<string>();
+  for (const provider of providers) {
+    if (!provider.name) throw new Error("Provider config missing 'name'");
+    if (providerNames.has(provider.name)) throw new Error(`Duplicate provider name '${provider.name}'`);
+    providerNames.add(provider.name);
+    if (!provider.provider) throw new Error(`Provider '${provider.name}' missing 'provider'`);
+    if (provider.provider !== "openai-subscription" && !provider.base_url) throw new Error(`Provider '${provider.name}' missing 'base_url'`);
+    if (provider.provider !== "openai-subscription" && !['openai-chat', 'openai-responses', 'anthropic', 'openai-image'].includes(provider.provider)) {
+      throw new Error(`Provider '${provider.name}' has invalid provider '${provider.provider}'`);
+    }
+    if (provider.provider === "openai-subscription" && (provider.base_url || provider.api_key)) {
+      throw new Error(`Provider '${provider.name}' of type 'openai-subscription' cannot configure 'base_url' or 'api_key'`);
+    }
+  }
+  const models = (document.models ?? []).map((sourceModel) => {
+    const customProviderName = String(sourceModel.custom_provider || "").trim();
+    if (customProviderName) {
+      const conflictingFields = ["provider", "base_url", "api_key"].filter((field) => Object.hasOwn(sourceModel, field));
+      if (conflictingFields.length > 0) {
+        throw new Error(
+          `Model '${sourceModel.name}' cannot combine 'custom_provider' with ${conflictingFields.map((field) => `'${field}'`).join(", ")}`,
+        );
+      }
+    }
+    const customProvider = customProviderName ? providers.find((provider) => provider.name === customProviderName) : undefined;
+    if (customProviderName && !customProvider) {
+      throw new Error(`Model '${sourceModel.name}' references unknown custom provider '${customProviderName}'`);
+    }
+    const expanded = customProvider
+      ? customProvider.provider === "openai-subscription"
+        ? { ...sourceModel, custom_provider: customProviderName, subscription_provider: customProviderName, provider: "openai-responses", base_url: "https://chatgpt.com/backend-api/codex", api_key: "" }
+        : { ...sourceModel, custom_provider: customProviderName, provider: customProvider.provider, base_url: customProvider.base_url, api_key: customProvider.api_key }
+      : sourceModel;
+    return normalizeModelConfig(expanded as ModelConfig, defaultTTFBTimeout);
+  });
   const fallback = document.fallback ?? {};
 
   for (const m of models) {
@@ -222,6 +277,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
     ...(defaultTTFBTimeout !== undefined ? { ttfb_timeout: defaultTTFBTimeout } : {}),
     ...(authToken ? { auth: { token: authToken } } : {}),
     models,
+    providers,
     fallback,
     record: {
       max_size: recordMaxSize,
