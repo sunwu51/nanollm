@@ -2965,7 +2965,9 @@ models:
   }
 });
 
-run("config preserves model bodyExpression", () => {
+run("config preserves model request and response expressions", () => {
+  const previousExpressionModel = process.env.actualModel;
+  process.env.actualModel = "must-not-replace-expression-template";
   const configPath = writeTempConfig(`
 models:
   - name: alpha
@@ -2973,7 +2975,8 @@ models:
     base_url: https://example.com/v1
     api_key: test-key
     model: upstream-alpha
-    bodyExpression: |
+    allow_h2: true
+    body_expression: |
       ({
         ...body,
         messages: body.messages?.map((message) => ({
@@ -2981,14 +2984,51 @@ models:
           updatedAt: Date.now()
         }))
       })
+    response_expression: |
+      (() => {
+        console.log(\`actual model: \${actualModel}\`)
+        return { ...response, checked: true }
+      })()
 `);
 
   try {
     const config = loadConfig(configPath);
+    assert.equal(config.models[0].allow_h2, true);
     assert.match(config.models[0].bodyExpression ?? "", /updatedAt/);
+    assert.match(config.models[0].responseExpression ?? "", /checked/);
+    assert.match(config.models[0].responseExpression ?? "", /\$\{actualModel\}/);
+    assert.doesNotMatch(config.models[0].responseExpression ?? "", /must-not-replace/);
   } finally {
+    if (previousExpressionModel === undefined) delete process.env.actualModel;
+    else process.env.actualModel = previousExpressionModel;
     rmSync(dirname(configPath), { recursive: true, force: true });
   }
+});
+
+run("config keeps camelCase expression aliases and rejects duplicate aliases", () => {
+  const compatible = parseConfigText(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+    bodyExpression: "({ ...body, legacy: true })"
+    responseExpression: "({ ...response, legacy: true })"
+`);
+  assert.match(compatible.models[0].bodyExpression ?? "", /legacy/);
+  assert.match(compatible.models[0].responseExpression ?? "", /legacy/);
+
+  assert.throws(() => parseConfigText(`
+models:
+  - name: alpha
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: test-key
+    model: upstream-alpha
+    body_expression: "body"
+    bodyExpression: "body"
+`), /cannot configure both 'body_expression' and 'bodyExpression'/);
 });
 
 run("config allows overriding record max_size", () => {
@@ -3828,6 +3868,63 @@ await runAsync("model bodyExpression rewrites passthrough upstream request body"
     assert.equal(upstreamBody.stream, false);
     assert.deepEqual(upstreamBody.metadata, { fromConfigBody: true, fromExpression: true });
     assert.deepEqual(upstreamBody.messages, [{ role: "user", content: "hello patched", updatedAt: 123 }]);
+  });
+});
+
+await runAsync("model responseExpression rewrites JSON before returning it", async () => {
+  await withHTTPServer(async (_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/problem+json", "X-Upstream-Request-Id": "req-json" });
+    res.end(JSON.stringify({ model: "actual-model", choices: [] }));
+  }, async (baseURL) => {
+    const result = await passthroughRequest({
+      name: "alpha",
+      provider: "openai-chat",
+      base_url: baseURL,
+      api_key: "test-key",
+      model: "upstream-alpha",
+      responseExpression: `({
+        ...response,
+        observedModel: response.model,
+        upstreamRequestId: headers["x-upstream-request-id"],
+        headersFrozen: Object.isFrozen(headers)
+      })`,
+    }, { model: "alpha", messages: [] });
+
+    assert.deepEqual(result.json, {
+      model: "actual-model",
+      choices: [],
+      observedModel: "actual-model",
+      upstreamRequestId: "req-json",
+      headersFrozen: true,
+    });
+  });
+});
+
+await runAsync("model responseExpression validates SSE start model before exposing stream", async () => {
+  await withHTTPServer(async (_req, res) => {
+    res.writeHead(200, { "X-Upstream-Request-Id": "req-stream", "X-LiteLLM-Model-Name": "unexpected-model" });
+    res.end(`event: response.created\ndata: ${JSON.stringify({
+      type: "response.created",
+      response: { id: "resp_1", model: "unexpected-model", created_at: 1 },
+    })}\n\n`);
+  }, async (baseURL) => {
+    await assert.rejects(
+      passthroughStreamRequest({
+        name: "alpha",
+        provider: "openai-responses",
+        base_url: baseURL,
+        api_key: "test-key",
+        model: "upstream-alpha",
+        responseExpression: `(() => {
+          if (headers["x-upstream-request-id"] !== "req-stream") throw new Error("missing upstream header");
+          if (!Object.isFrozen(headers)) throw new Error("headers must be readonly");
+          const actualModel = headers["x-litellm-model-name"];
+          if (actualModel !== "expected-model") throw new Error("unexpected actual model: " + actualModel);
+          return response;
+        })()`,
+      }, { model: "alpha", input: "hello", stream: true }),
+      /responseExpression failed: unexpected actual model: unexpected-model/,
+    );
   });
 });
 

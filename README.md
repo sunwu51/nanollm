@@ -22,6 +22,7 @@ record:
 
 providers:
   # 普通共享供应商：集中保存协议、地址和 API Key
+  # 也可以不配置providers直接在model中指定base_url和api_key
   - name: deepseek
     provider: openai-chat
     base_url: https://api.deepseek.com/v1
@@ -54,7 +55,7 @@ models:
     model: glm5.1
     image: true # optional, default true; only effective for openai-chat provider
     ttfb_timeout: 3000 # optional, overrides server.ttfb_timeout
-    allowH2: false # optional, default false; enable HTTP/2 ALPN for this upstream
+    allow_h2: false # optional, default false; enable HTTP/2 ALPN for this upstream
     proxy: http://127.0.0.1:7890 # optional, overrides HTTPS_PROXY/HTTP_PROXY for this model
     headers:
       user-agent: nanollm
@@ -62,7 +63,7 @@ models:
       temperature: 1
       store: false
       text: '{"verbosity":"high"}'
-    bodyExpression: |
+    body_expression: |
       ({
         ...body,
         messages: body.messages?.map((message) => ({
@@ -216,7 +217,7 @@ Railway 从 Git 仓库部署时会自动使用仓库根目录的 `Dockerfile`。
 
 ### 动态请求体表达式
 
-`models[*].bodyExpression` 可以在请求发往上游前动态改写最终 request body。表达式运行时会拿到变量 `body`，并且必须同步返回新的 body；执行顺序是先应用 `body` 深度合并，再执行 `bodyExpression`。
+`models[*].body_expression` 可以在请求发往上游前动态改写最终 request body。表达式运行时会拿到变量 `body`，并且必须同步返回新的 body；执行顺序是先应用 `body` 深度合并，再执行 `body_expression`。旧字段 `bodyExpression` 仍兼容。
 
 ```yaml
 models:
@@ -225,7 +226,7 @@ models:
     base_url: https://example.com/v1
     api_key: YOUR_KEY1
     model: openai/gpt-5.4
-    bodyExpression: |
+    body_expression: |
       ({
         ...body,
         messages: body.messages?.map((message, index) => ({
@@ -233,6 +234,31 @@ models:
           content: index === 0 ? `${message.content}\nextra prompt` : message.content
         }))
       })
+```
+
+### 动态响应表达式
+
+`models[*].response_expression` 在上游响应转换为客户端协议之前执行，只对 JSON 和 SSE 响应生效。表达式会获得 `response` 以及只读的上游响应头对象 `headers`；header 名统一为小写，例如 `headers["x-request-id"]`。`headers` 仅用于观察和校验，不会自动转发或改写客户端响应头。旧字段 `responseExpression` 仍兼容。
+
+非流式 JSON 使用表达式返回值作为后续响应；流式响应会在向客户端发送数据前缓冲到带模型信息的启动事件。流式表达式用于观察或校验，返回值不会改写 SSE；抛出异常会终止当前候选并进入现有 fallback 流程。流式请求的响应缺少 `Content-Type` 时仍按 SSE 处理。
+
+```yaml
+models:
+  - name: gpt-5.4
+    provider: openai-responses
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY
+    model: gpt-5.4
+    response_expression: |
+      (() => {
+        const actualModel = headers["x-litellm-model-name"];
+        console.log("actual model:", actualModel);
+        console.log("upstream request id:", headers["x-request-id"]);
+        if (!actualModel?.startsWith("gpt-5.4")) {
+          throw new Error(`Unexpected upstream model: ${actualModel}`);
+        }
+        return response;
+      })()
 ```
 
 ### Anthropic 历史 thinking 签名
