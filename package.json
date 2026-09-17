@@ -6,6 +6,10 @@
   "bin": {
     "nanollm": "dist/cli.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sunwu51/nanollm.git"
+  },
   "files": [
     "dist",
     "native-bin",
