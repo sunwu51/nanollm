@@ -3,7 +3,9 @@ name: Release binaries
 on:
   push:
     branches: [master]
-    paths: [package.json]
+    paths:
+      - package.json
+      - .github/workflows/release-binaries.yml
   workflow_dispatch:
 
 permissions:
@@ -135,8 +137,6 @@ jobs:
         with:
           node-version: 24.9.0
           cache: npm
-      - name: Upgrade npm for trusted publishing
-        run: npm install --global npm@latest
       - run: npm ci
       - uses: actions/download-artifact@v4
         with:
