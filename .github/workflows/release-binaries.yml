@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   version:
@@ -128,14 +129,14 @@ jobs:
     needs: [version, build]
     if: needs.version.outputs.changed == 'true'
     runs-on: ubuntu-24.04
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24.9.0
           cache: npm
+      - name: Upgrade npm for trusted publishing
+        run: npm install --global npm@latest
       - run: npm ci
       - uses: actions/download-artifact@v4
         with:
@@ -170,7 +171,6 @@ jobs:
           cat smoke.log
           exit 1
       - name: Publish verified npm package
-        if: ${{ env.NODE_AUTH_TOKEN != '' }}
         shell: bash
         run: npm publish nanollm-*.tgz --access public
       - uses: actions/upload-artifact@v4

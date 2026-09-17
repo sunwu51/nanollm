@@ -16,11 +16,14 @@ export interface ModelConfig {
   subscription_provider?: string;
   image?: boolean;
   ttfb_timeout?: number;
-  allowH2?: boolean;
+  allow_h2?: boolean;
   proxy?: string;
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
   bodyExpression?: string;
+  responseExpression?: string;
+  body_expression?: string;
+  response_expression?: string;
   ignore_invalid_history?: boolean;
 }
 
@@ -74,19 +77,6 @@ function resolveEnvVars(value: string): string {
   return value.replace(/\$\{(\w+)\}/g, (_, key) => process.env[key] ?? "");
 }
 
-function resolveDeep(obj: unknown): unknown {
-  if (typeof obj === "string") return resolveEnvVars(obj);
-  if (Array.isArray(obj)) return obj.map(resolveDeep);
-  if (obj && typeof obj === "object") {
-    const result: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(obj)) {
-      result[k] = resolveDeep(v);
-    }
-    return result;
-  }
-  return obj;
-}
-
 function parseJSONLikeValue(value: unknown): unknown {
   if (typeof value !== "string") return value;
   const trimmed = value.trim();
@@ -135,6 +125,16 @@ function normalizeBoolean(value: unknown, fieldName: string, defaultValue: boole
   throw new Error(`'${fieldName}' must be a boolean`);
 }
 
+function normalizeExpressionAlias(model: ModelConfig, snakeKey: "body_expression" | "response_expression", camelKey: "bodyExpression" | "responseExpression"): string | undefined {
+  const snakeValue = model[snakeKey];
+  const camelValue = model[camelKey];
+  if (snakeValue !== undefined && camelValue !== undefined) {
+    throw new Error(`Model '${model.name || "<unknown>"}' cannot configure both '${snakeKey}' and '${camelKey}'`);
+  }
+  const value = snakeValue ?? camelValue;
+  return value === undefined || value === null || value === "" ? undefined : String(value);
+}
+
 function normalizeProxyUrl(value: unknown, fieldName: string): string | undefined {
   if (value === undefined || value === null || value === "") return undefined;
 
@@ -164,28 +164,30 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
     model.body && typeof model.body === "object"
       ? Object.fromEntries(Object.entries(model.body).map(([key, value]) => [key, parseJSONLikeValue(value)]))
       : undefined;
-  const bodyExpression =
-    model.bodyExpression === undefined || model.bodyExpression === null || model.bodyExpression === ""
-      ? undefined
-      : String(model.bodyExpression);
+  const bodyExpression = normalizeExpressionAlias(model, "body_expression", "bodyExpression");
+  const responseExpression = normalizeExpressionAlias(model, "response_expression", "responseExpression");
   const modelTTFBTimeout = normalizeTimeout(model.ttfb_timeout, `models.${model.name || "<unknown>"}.ttfb_timeout`);
   const ttfb_timeout = modelTTFBTimeout ?? (model.provider === "openai-image" ? DEFAULT_OPENAI_IMAGE_TTFB_TIMEOUT : defaultTTFBTimeout);
   const image = model.image === undefined ? true : !!model.image;
-  const allowH2 = normalizeBoolean(model.allowH2, `models.${model.name || "<unknown>"}.allowH2`, false);
+  const allow_h2 = normalizeBoolean(model.allow_h2, `models.${model.name || "<unknown>"}.allow_h2`, false);
   const ignore_invalid_history = normalizeBoolean(model.ignore_invalid_history, `models.${model.name || "<unknown>"}.ignore_invalid_history`, true);
   const proxy = normalizeProxyUrl(model.proxy, `models.${model.name || "<unknown>"}.proxy`);
 
-  return {
+  const normalized = {
     ...model,
     image,
-    allowH2,
+    allow_h2,
     ignore_invalid_history,
     proxy,
     ...(ttfb_timeout !== undefined ? { ttfb_timeout } : {}),
     ...(headers ? { headers } : {}),
     ...(body ? { body } : {}),
     ...(bodyExpression ? { bodyExpression } : {}),
+    ...(responseExpression ? { responseExpression } : {}),
   };
+  delete normalized.body_expression;
+  delete normalized.response_expression;
+  return normalized;
 }
 
 function getWildcardPrefix(name: string): string | undefined {
@@ -200,17 +202,16 @@ function assertValidModelNamePattern(name: string) {
   }
 }
 
-function parseDocument(rawText: string, options?: { resolveEnv?: boolean }): ParsedConfigDocument {
-  const parsed = parseYAML(rawText);
-  return (options?.resolveEnv ?? true ? resolveDeep(parsed) : parsed) as ParsedConfigDocument;
+function parseDocument(rawText: string): ParsedConfigDocument {
+  return parseYAML(rawText) as ParsedConfigDocument;
 }
 
 export function parseConfigDocument(rawText: string): ParsedConfigDocument {
-  return parseDocument(rawText, { resolveEnv: true });
+  return parseDocument(rawText);
 }
 
 export function parseSourceConfigDocument(rawText: string): ParsedConfigDocument {
-  return parseDocument(rawText, { resolveEnv: false });
+  return parseDocument(rawText);
 }
 
 export function materializeConfig(document: ParsedConfigDocument, options?: MaterializeConfigOptions): ServerConfig {
@@ -222,7 +223,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
     name: String(provider.name || "").trim(),
     provider: provider.provider,
     base_url: String(provider.base_url || "").trim(),
-    api_key: String(provider.api_key || ""),
+    api_key: resolveEnvVars(String(provider.api_key || "")),
   }));
   const providerNames = new Set<string>();
   for (const provider of providers) {
@@ -256,7 +257,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
       ? customProvider.provider === "openai-subscription"
         ? { ...sourceModel, custom_provider: customProviderName, subscription_provider: customProviderName, provider: "openai-responses", base_url: "https://chatgpt.com/backend-api/codex", api_key: "" }
         : { ...sourceModel, custom_provider: customProviderName, provider: customProvider.provider, base_url: customProvider.base_url, api_key: customProvider.api_key }
-      : sourceModel;
+      : { ...sourceModel, api_key: resolveEnvVars(String(sourceModel.api_key || "")) };
     return normalizeModelConfig(expanded as ModelConfig, defaultTTFBTimeout);
   });
   const fallback = document.fallback ?? {};

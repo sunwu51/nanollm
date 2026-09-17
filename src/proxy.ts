@@ -163,6 +163,51 @@ function applyModelBodyTransforms(config: ModelConfig, body: unknown): unknown {
   return applyModelBodyExpression(config, applyModelBodyOverrides(config, body));
 }
 
+function toReadonlyHeaderRecord(headers: Headers): Readonly<Record<string, string>> {
+  return Object.freeze(Object.fromEntries(headers.entries()));
+}
+
+function applyModelResponseExpression(config: ModelConfig, response: unknown, headers: Headers): unknown {
+  if (!config.responseExpression) return response;
+
+  let result: unknown;
+  try {
+    result = runInNewContext(`(${config.responseExpression})`, {
+      response,
+      headers: toReadonlyHeaderRecord(headers),
+      console,
+      Date,
+      JSON,
+      Math,
+      structuredClone,
+    }, {
+      filename: `responseExpression:${config.name}`,
+      timeout: 1000,
+    });
+  } catch (error) {
+    const message = isPlainObject(error) && typeof error.message === "string" ? error.message : String(error);
+    throw new Error(`Model '${config.name}' responseExpression failed: ${message}`);
+  }
+
+  if (result === undefined) throw new Error(`Model '${config.name}' responseExpression returned undefined`);
+  if (result && typeof (result as { then?: unknown }).then === "function") {
+    throw new Error(`Model '${config.name}' responseExpression must return synchronously`);
+  }
+  return structuredClone(result);
+}
+
+function extractStreamModel(provider: StreamFormat, event: unknown): string | undefined {
+  if (!isPlainObject(event)) return undefined;
+  if (provider === "openai-chat") return typeof event.model === "string" ? event.model : undefined;
+  if (provider === "openai-responses" && event.type === "response.created" && isPlainObject(event.response)) {
+    return typeof event.response.model === "string" ? event.response.model : undefined;
+  }
+  if (provider === "anthropic" && event.type === "message_start" && isPlainObject(event.message)) {
+    return typeof event.message.model === "string" ? event.message.model : undefined;
+  }
+  return undefined;
+}
+
 function enforceSubscriptionRequest(config: ModelConfig, body: unknown): unknown {
   if (!config.subscription_provider || !isPlainObject(body)) return body;
   return { ...body, store: false };
@@ -192,7 +237,8 @@ export function preparePassthroughBody(config: ModelConfig, rawBody: Record<stri
 }
 
 function isJsonContentType(headers: Headers): boolean {
-  return headers.get("content-type")?.toLowerCase().includes("application/json") ?? false;
+  const contentType = headers.get("content-type")?.toLowerCase() ?? "";
+  return contentType.includes("application/json") || contentType.includes("+json");
 }
 
 function isMultipartContentType(headers: Headers): boolean {
@@ -299,7 +345,7 @@ const upstreamAgents = {
 };
 
 export function createUpstreamDispatcher(config: ModelConfig, proxyUrl = resolveProxyUrl(config)) {
-  const allowH2 = config.allowH2 ?? false;
+  const allowH2 = config.allow_h2 ?? false;
   if (!proxyUrl) return allowH2 ? upstreamAgents.http2 : upstreamAgents.http1;
 
   return new ProxyAgent({
@@ -485,13 +531,14 @@ function reconstructStream(
 
 async function validateStreamContent(
   body: ReadableStream<Uint8Array>,
-  options: { attemptIndex: number },
+  options: { attemptIndex: number; config: ModelConfig; headers: Headers },
 ): Promise<ReadableStream<Uint8Array>> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const sseParser = new SSEParser();
   const bufferedChunks: Uint8Array[] = [];
   let totalBytes = 0;
+  let expressionApplied = !options.config.responseExpression;
 
   try {
     while (true) {
@@ -499,18 +546,32 @@ async function validateStreamContent(
 
       if (done) {
         const flushed = sseParser.flush();
-        if (flushed.length > 0) {
+        if (!expressionApplied) {
+          for (const event of flushed) {
+            let parsed: unknown;
+            try { parsed = JSON.parse(event.data); } catch { continue; }
+            const model = extractStreamModel(options.config.provider, parsed);
+            if (model === undefined) continue;
+            applyModelResponseExpression(options.config, parsed, options.headers);
+            expressionApplied = true;
+            break;
+          }
+        }
+        if (flushed.length > 0 && expressionApplied) {
           return reconstructStream(bufferedChunks, reader);
         }
         const bufferedText = bufferedChunks.map(c => decoder.decode(c, { stream: true })).join("") + decoder.decode();
+        const message = !expressionApplied
+          ? "Upstream SSE stream ended before responseExpression could find a model-bearing start event"
+          : "Upstream SSE stream ended with no real content (ping-only or empty)";
         setRecordedAttemptResponseBody({ index: options.attemptIndex, body: bufferedText });
         setRecordedAttemptError({
           index: options.attemptIndex,
-          message: "Upstream SSE stream ended with no real content (ping-only or empty)",
+          message,
           status: 200,
           upstream: bufferedText,
         });
-        const err = new Error("Upstream SSE stream ended with no real content (ping-only or empty)") as Error & { status: number; upstream: string };
+        const err = new Error(message) as Error & { status: number; upstream: string };
         err.status = 200;
         err.upstream = bufferedText;
         throw err;
@@ -522,20 +583,35 @@ async function validateStreamContent(
       const text = decoder.decode(value, { stream: true });
       const events = sseParser.push(text);
 
-      if (events.length > 0 || sseParser.hasBufferedRealData()) {
+      if (!expressionApplied) {
+        for (const event of events) {
+          let parsed: unknown;
+          try { parsed = JSON.parse(event.data); } catch { continue; }
+          const model = extractStreamModel(options.config.provider, parsed);
+          if (model === undefined) continue;
+          applyModelResponseExpression(options.config, parsed, options.headers);
+          expressionApplied = true;
+          break;
+        }
+      }
+
+      if (expressionApplied && (events.length > 0 || sseParser.hasBufferedRealData())) {
         return reconstructStream(bufferedChunks, reader);
       }
 
       if (totalBytes >= MAX_VALIDATION_BUFFER_BYTES) {
         const bufferedText = bufferedChunks.map(c => new TextDecoder().decode(c, { stream: true })).join("") + new TextDecoder().decode();
         setRecordedAttemptResponseBody({ index: options.attemptIndex, body: bufferedText });
+        const message = !expressionApplied
+          ? `Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes before responseExpression could find a model-bearing start event`
+          : `Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes with no real content`;
         setRecordedAttemptError({
           index: options.attemptIndex,
-          message: `Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes with no real content`,
+          message,
           status: 200,
           upstream: bufferedText,
         });
-        const err = new Error(`Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes with no real content`) as Error & { status: number; upstream: string };
+        const err = new Error(message) as Error & { status: number; upstream: string };
         err.status = 200;
         err.upstream = bufferedText;
         reader.cancel().catch(() => {});
@@ -543,6 +619,7 @@ async function validateStreamContent(
       }
     }
   } catch (error) {
+    reader.cancel(error).catch(() => {});
     if (error instanceof Error && "upstream" in error) throw error;
     throw error;
   }
@@ -595,12 +672,16 @@ export async function passthroughRawRequest(
     options,
     recordedRequestBody,
   );
-  const responseText = await response.text();
+  let responseText = await response.text();
   setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: responseText });
   let responseBody: unknown = responseText;
   try {
     responseBody = JSON.parse(responseText);
   } catch {}
+  if (isJsonContentType(response.headers)) {
+    responseBody = applyModelResponseExpression(config, responseBody, response.headers);
+    responseText = JSON.stringify(responseBody);
+  }
   return {
     body: responseBody,
     responseText,
@@ -621,7 +702,8 @@ export async function passthroughRequest(
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, { ...options, recordedRequestBody: body });
   const text = await response.text();
   setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
-  const json = JSON.parse(text);
+  const parsed = JSON.parse(text);
+  const json = isJsonContentType(response.headers) ? applyModelResponseExpression(config, parsed, response.headers) : parsed;
   const usage = normalizeUsage((json as Record<string, unknown>)?.usage as Record<string, unknown> | undefined);
   return { json, timing, usage };
 }
@@ -634,7 +716,7 @@ export async function passthroughStreamRequest(
   const body = preparePassthroughBody(config, rawBody, true);
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, { ...options, recordedRequestBody: body });
   if (!response.body) throw new Error("Upstream returned no streaming body");
-  const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0 });
+  const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0, config, headers: response.headers });
   return { body: validatedBody, headers: response.headers, timing };
 }
 
@@ -653,7 +735,8 @@ export async function forwardRequest(
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, { ...options, recordedRequestBody: body });
   const text = await response.text();
   setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
-  const json = JSON.parse(text);
+  const parsed = JSON.parse(text);
+  const json = isJsonContentType(response.headers) ? applyModelResponseExpression(config, parsed, response.headers) : parsed;
   const normalizedResponse = normalizeUpstreamResponse(config.provider, json);
   return { normalizedResponse, timing, usage: normalizedResponse.usage };
 }
@@ -670,6 +753,6 @@ export async function forwardStreamRequest(
   const body = enforceSubscriptionRequest(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, { ...options, recordedRequestBody: body });
   if (!response.body) throw new Error("Upstream returned no streaming body");
-  const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0 });
+  const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0, config, headers: response.headers });
   return { body: validatedBody, upstreamFormat: config.provider, timing };
 }
