@@ -34,7 +34,7 @@ import {
 } from "./src/converters/responses.js";
 import { createSSEConverter, createUsageCollector, formatDone, SSEParser } from "./src/converters/streams.js";
 import { createRequestId, getRequestId, runWithRequestId, withRequestId } from "./src/request-context.js";
-import { cacheResponseItems, resolveItemReferences } from "./src/response-cache.js";
+import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "./src/response-cache.js";
 import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
@@ -742,6 +742,26 @@ async function buildUsagePayload(c: Context | undefined, config: ServerConfig, o
   const modelQuery = c?.req.query("model") || undefined;
   const modelNames = config.models.map((model) => model.name);
   const selectedModel = modelQuery && modelNames.includes(modelQuery) ? modelQuery : undefined;
+  const pricedModels = selectedModel
+    ? config.models.filter((model) => model.name === selectedModel)
+    : config.models;
+  const modelUsage = await Promise.all(pricedModels.map(async (model) => {
+    const days = await usageStore.listDays({ ...range, modelName: model.name });
+    const metrics = days.reduce((total, day) => ({
+      day: range.end,
+      totalRequests: total.totalRequests + day.totalRequests,
+      successRequests: total.successRequests + day.successRequests,
+      failureRequests: total.failureRequests + day.failureRequests,
+      totalDurationMs: total.totalDurationMs + day.totalDurationMs,
+      durationSamples: total.durationSamples + day.durationSamples,
+      nonCacheInputTokens: total.nonCacheInputTokens + day.nonCacheInputTokens,
+      cacheWriteInputTokens: total.cacheWriteInputTokens + day.cacheWriteInputTokens,
+      cacheReadInputTokens: total.cacheReadInputTokens + day.cacheReadInputTokens,
+      outputTokens: total.outputTokens + day.outputTokens,
+      totalTokens: total.totalTokens + day.totalTokens,
+    }));
+    return { name: model.name, upstreamModel: model.model, metrics };
+  }));
 
   return {
     refreshedAt: now,
@@ -751,6 +771,7 @@ async function buildUsagePayload(c: Context | undefined, config: ServerConfig, o
     availableYears: getUsageYears(now),
     selectedModel: selectedModel ?? null,
     models: modelNames,
+    modelUsage,
     basePath: options?.basePath,
     days: await usageStore.listDays({ ...range, modelName: selectedModel }),
   };
@@ -874,6 +895,7 @@ function createRoute(incomingFormat: StreamFormat) {
               modelConfig.name,
               timing,
               candidateIndex + 1,
+              rawBody.store !== false,
             );
 
             const response = new Response(readable, { headers: responseHeaders });
@@ -882,7 +904,9 @@ function createRoute(incomingFormat: StreamFormat) {
           }
 
           recordModelSuccess(modelConfig.name, Date.now() - requestStartedAt, result.timing.ttfbMs, result.usage, requestStartedAt);
-          cacheResponseItems((result.json as any)?.output);
+          if (shouldCacheResponseItems(incomingFormat, rawBody.store)) {
+            cacheResponseItems((result.json as any)?.output);
+          }
           const response = buildJsonResponse(c.req.raw.headers, result.json);
           setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
           setRecordedClientResponseBody({ body: result.json });
@@ -1075,153 +1099,41 @@ function buildStreamReadable(
   modelName: string,
   timing: { startedAt: number; ttfbMs: number },
   attemptIndex: number,
+  storeResponseItems: boolean,
 ): ReadableStream<Uint8Array> {
-  if (incomingFormat === "openai-responses") {
-    return buildPipeStreamAndCache(
-      body,
-      path,
-      modelName,
-      timing,
-      upstreamFormat,
-      attemptIndex,
-      upstreamFormat !== incomingFormat ? createSSEConverter(upstreamFormat, incomingFormat) : undefined,
-    );
-  }
-
-  if (upstreamFormat === incomingFormat) {
-    return buildPipeStreamAndCache(body, path, modelName, timing, upstreamFormat, attemptIndex);
-  }
-
-  // Convert stream format
-  const converter = createSSEConverter(upstreamFormat, incomingFormat);
-  const usageCollector = createUsageCollector(upstreamFormat);
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  const started = Date.now();
-  let cancelled = false;
-  let finished = false;
-  let successRecorded = false;
-  let recordFinalized = false;
-  const cachedRequestId = getRequestId();
-  let cancelPromise: Promise<void> | undefined;
-
-  function settleSuccess(usage?: import("./src/converters/shared.js").NormalizedUsage) {
-    if (successRecorded) return;
-    successRecorded = true;
-    const totalDuration = Date.now() - timing.startedAt; const streamDuration = totalDuration - timing.ttfbMs; recordModelSuccess(modelName, totalDuration, timing.ttfbMs, usage, timing.startedAt, streamDuration);
-  }
-
-  function finalizeRecord() {
-    if (recordFinalized) return;
-    recordFinalized = true;
-    finalizeRecordedRequest({});
-  }
-
-  function closeAfterTerminalEvent(controller: ReadableStreamDefaultController<Uint8Array>): boolean {
-    if (!usageCollector.hasCompleted()) return false;
-    finished = true;
-    settleSuccess(usageCollector.getLatestUsage());
-    finalizeRecord();
-    console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (terminal event)`));
-    controller.close();
-    void reader.cancel("terminal SSE event received").catch((error) => {
-      console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`, cachedRequestId), error);
-    });
-    return true;
-  }
-
-  return new ReadableStream({
-    async pull(controller) {
-      if (finished) return;
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            finished = true;
-            if (cancelled) return;
-            for (const chunk of converter.flush()) {
-              const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
-              appendRecordedClientResponseBody({ chunk: outboundText });
-              controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
-            }
-            if (usageCollector.hasFailed()) {
-              throw new Error("Upstream stream reported an error");
-            }
-            const usage = usageCollector.finish();
-            settleSuccess(usage);
-            finalizeRecord();
-            console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms`));
-            controller.close();
-            return;
-          }
-
-          const text = decoder.decode(value, { stream: true });
-          appendRecordedAttemptResponseBody({ index: attemptIndex, chunk: text });
-          usageCollector.push(text);
-          for (const chunk of converter.push(text)) {
-            if (cancelled) return;
-            const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
-            appendRecordedClientResponseBody({ chunk: outboundText });
-            controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
-          }
-          if (closeAfterTerminalEvent(controller)) return;
-        }
-      } catch (error) {
-        finished = true;
-        const completed = usageCollector.hasCompleted();
-        if (shouldIgnoreStreamReadError(error, { cancelled, completed })) {
-          if (completed) {
-            settleSuccess(usageCollector.getLatestUsage());
-            finalizeRecord();
-            console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (reader released after completion)`));
-            try {
-              controller.close();
-            } catch {}
-          }
-          return;
-        }
-        recordModelFailure(modelName, Date.now() - timing.startedAt, timing.startedAt);
-        finalizeRecord();
-        console.error(orange(withRequestId(`[HTTP STREAM ERROR] path=${path} duration=${Date.now() - started}ms`)), error);
-        controller.error(error);
-      }
+  return buildManagedStream(
+    body,
+    path,
+    modelName,
+    timing,
+    upstreamFormat,
+    attemptIndex,
+    {
+      converter: upstreamFormat !== incomingFormat ? createSSEConverter(upstreamFormat, incomingFormat) : undefined,
+      cacheResponseItems: shouldCacheResponseItems(incomingFormat, storeResponseItems),
     },
-    cancel(reason) {
-      if (cancelled || finished) return cancelPromise;
-      cancelled = true;
-      if (usageCollector.hasCompleted()) {
-        settleSuccess(usageCollector.getLatestUsage());
-        finalizeRecord();
-        console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (client closed after completion)`, cachedRequestId));
-      } else {
-        finalizeRecord();
-        console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`, cachedRequestId));
-      }
-      cancelPromise = reader.cancel(reason).catch((error) => {
-        console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`, cachedRequestId), error);
-      });
-      return cancelPromise;
-    },
-  });
+  );
 }
 
 /**
- * Pipe upstream SSE stream, optionally converting format.
- * Caches output items from response.output_item.done events.
+ * Manages every upstream SSE stream through one lifecycle: optional protocol
+ * conversion, usage collection, recording, cancellation, and Responses item caching.
  */
-function buildPipeStreamAndCache(
+function buildManagedStream(
   body: ReadableStream<Uint8Array>,
   path: string,
   modelName: string,
   timing: { startedAt: number; ttfbMs: number },
   streamFormat: StreamFormat,
   attemptIndex: number,
-  converter?: ReturnType<typeof createSSEConverter>,
+  options: {
+    converter?: ReturnType<typeof createSSEConverter>;
+    cacheResponseItems: boolean;
+  },
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
-  const collector = new SSEParser();
+  const itemCollector = options.cacheResponseItems ? new SSEParser() : undefined;
   const usageCollector = createUsageCollector(streamFormat);
   const outputItems: unknown[] = [];
   const encoder = new TextEncoder();
@@ -1234,7 +1146,8 @@ function buildPipeStreamAndCache(
   let cancelPromise: Promise<void> | undefined;
 
   function collectItems(sseText: string) {
-    for (const { data } of collector.push(sseText)) {
+    if (!itemCollector) return;
+    for (const { data } of itemCollector.push(sseText)) {
       try {
         const event = JSON.parse(data);
         if (event.type === "response.output_item.done" && event.item) {
@@ -1259,7 +1172,7 @@ function buildPipeStreamAndCache(
   function closeAfterTerminalEvent(controller: ReadableStreamDefaultController<Uint8Array>): boolean {
     if (!usageCollector.hasCompleted()) return false;
     finished = true;
-    cacheResponseItems(outputItems);
+    if (options.cacheResponseItems) cacheResponseItems(outputItems);
     settleSuccess(usageCollector.getLatestUsage());
     finalizeRecord();
     console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (terminal event)`));
@@ -1279,23 +1192,25 @@ function buildPipeStreamAndCache(
           if (done) {
             finished = true;
             if (cancelled) return;
-            if (converter) {
-              for (const chunk of converter.flush()) {
+            if (options.converter) {
+              for (const chunk of options.converter.flush()) {
                 const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
                 collectItems(outboundText);
                 appendRecordedClientResponseBody({ chunk: outboundText });
                 controller.enqueue(typeof chunk === "string" ? encoder.encode(chunk) : chunk);
               }
             }
-            for (const { data } of collector.flush()) {
-              try {
-                const event = JSON.parse(data);
-                if (event.type === "response.output_item.done" && event.item) {
-                  outputItems.push(event.item);
-                }
-              } catch {}
+            if (itemCollector) {
+              for (const { data } of itemCollector.flush()) {
+                try {
+                  const event = JSON.parse(data);
+                  if (event.type === "response.output_item.done" && event.item) {
+                    outputItems.push(event.item);
+                  }
+                } catch {}
+              }
             }
-            cacheResponseItems(outputItems);
+            if (options.cacheResponseItems) cacheResponseItems(outputItems);
             if (usageCollector.hasFailed()) {
               throw new Error("Upstream stream reported an error");
             }
@@ -1310,8 +1225,8 @@ function buildPipeStreamAndCache(
           const text = decoder.decode(value, { stream: true });
           appendRecordedAttemptResponseBody({ index: attemptIndex, chunk: text });
           usageCollector.push(text);
-          if (converter) {
-            for (const chunk of converter.push(text)) {
+          if (options.converter) {
+            for (const chunk of options.converter.push(text)) {
               if (cancelled) return;
               const outboundText = typeof chunk === "string" ? chunk : decoder.decode(chunk);
               collectItems(outboundText);

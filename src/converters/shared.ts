@@ -95,6 +95,7 @@ export interface NormalizedUsage {
   totalTokens?: number;
   reasoningTokens?: number;
   cacheCreationInputTokens?: number;
+  cacheWriteInputTokens?: number;
   cacheReadInputTokens?: number;
 }
 
@@ -291,6 +292,10 @@ export function normalizeUsage(usage: Record<string, unknown> | null | undefined
     asNumber((usage.completion_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens) ??
     asNumber((usage.output_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens);
   const cacheCreationInputTokens = asNumber(usage.cache_creation_input_tokens);
+  const cacheWriteInputTokens =
+    cacheCreationInputTokens ??
+    asNumber((usage.prompt_tokens_details as Record<string, unknown> | undefined)?.cache_write_tokens) ??
+    asNumber((usage.input_tokens_details as Record<string, unknown> | undefined)?.cache_write_tokens);
   const cacheReadInputTokens =
     asNumber(usage.cache_read_input_tokens) ??
     asNumber(usage.prompt_cache_hit_tokens) ??
@@ -300,7 +305,7 @@ export function normalizeUsage(usage: Record<string, unknown> | null | undefined
   const nonCacheInputTokens = hasAnthropicCacheUsage
     ? providerInputTokens
     : providerInputTokens != null
-      ? Math.max(0, providerInputTokens - (cacheReadInputTokens ?? 0))
+      ? Math.max(0, providerInputTokens - (cacheReadInputTokens ?? 0) - (cacheWriteInputTokens ?? 0))
       : undefined;
   const inputTokens = hasAnthropicCacheUsage
     ? (nonCacheInputTokens ?? 0) + (cacheCreationInputTokens ?? 0) + (cacheReadInputTokens ?? 0)
@@ -316,6 +321,7 @@ export function normalizeUsage(usage: Record<string, unknown> | null | undefined
     totalTokens == null &&
     reasoningTokens == null &&
     cacheCreationInputTokens == null &&
+    cacheWriteInputTokens == null &&
     cacheReadInputTokens == null
   ) {
     return undefined;
@@ -328,6 +334,7 @@ export function normalizeUsage(usage: Record<string, unknown> | null | undefined
     totalTokens,
     reasoningTokens,
     cacheCreationInputTokens,
+    cacheWriteInputTokens,
     cacheReadInputTokens,
   };
 }
@@ -346,7 +353,13 @@ export function denormalizeUsageToOpenAIChat(usage: NormalizedUsage | undefined)
     ...(completionTokens != null ? { completion_tokens: completionTokens } : {}),
     ...(totalTokens != null ? { total_tokens: totalTokens } : {}),
     ...(usage.reasoningTokens != null ? { completion_tokens_details: { reasoning_tokens: usage.reasoningTokens } } : {}),
-    ...(usage.cacheReadInputTokens != null ? { prompt_tokens_details: { cached_tokens: usage.cacheReadInputTokens }, prompt_cache_hit_tokens: usage.cacheReadInputTokens } : {}),
+    ...(usage.cacheReadInputTokens != null || usage.cacheWriteInputTokens != null
+      ? { prompt_tokens_details: {
+          ...(usage.cacheReadInputTokens != null ? { cached_tokens: usage.cacheReadInputTokens } : {}),
+          ...(usage.cacheWriteInputTokens != null ? { cache_write_tokens: usage.cacheWriteInputTokens } : {}),
+        } }
+      : {}),
+    ...(usage.cacheReadInputTokens != null ? { prompt_cache_hit_tokens: usage.cacheReadInputTokens } : {}),
   };
 }
 
@@ -364,7 +377,12 @@ export function denormalizeUsageToOpenAIResponses(usage: NormalizedUsage | undef
     ...(outputTokens != null ? { output_tokens: outputTokens } : {}),
     ...(totalTokens != null ? { total_tokens: totalTokens } : {}),
     ...(usage.reasoningTokens != null ? { output_tokens_details: { reasoning_tokens: usage.reasoningTokens } } : {}),
-    ...(usage.cacheReadInputTokens != null ? { input_tokens_details: { cached_tokens: usage.cacheReadInputTokens } } : {}),
+    ...(usage.cacheReadInputTokens != null || usage.cacheWriteInputTokens != null
+      ? { input_tokens_details: {
+          ...(usage.cacheReadInputTokens != null ? { cached_tokens: usage.cacheReadInputTokens } : {}),
+          ...(usage.cacheWriteInputTokens != null ? { cache_write_tokens: usage.cacheWriteInputTokens } : {}),
+        } }
+      : {}),
   };
 }
 

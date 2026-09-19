@@ -11,6 +11,7 @@ export interface UsagePagePayload {
   availableYears: number[];
   selectedModel: string | null;
   models: string[];
+  modelUsage: Array<{ name: string; upstreamModel: string; metrics: UsageDayCell }>;
   days: UsageDayCell[];
   basePath?: string;
 }
@@ -261,6 +262,7 @@ export const USAGE_SCRIPT = String.raw`
       const USAGE_MONTHS_EL = document.getElementById("usage-months");
       const USAGE_SUMMARY_EL = document.getElementById("usage-summary");
       const USAGE_EQUIVALENT_COST_EL = document.getElementById("usage-equivalent-cost");
+      const USAGE_UNMATCHED_COST_EL = document.getElementById("usage-unmatched-cost");
       const USAGE_RANGE_EL = document.getElementById("usage-range");
       const USAGE_METRIC_EL = document.getElementById("usage-metric");
       const USAGE_MODEL_EL = document.getElementById("usage-model");
@@ -275,6 +277,9 @@ export const USAGE_SCRIPT = String.raw`
         weekday: "short",
       });
       let currentUsageMetric = "totalTokens";
+      const MODEL_PRICES_URL = "https://sunwu51.github.io/llm-official-prices/models.json";
+      const DEEPSEEK_FALLBACK_PRICE = { input: 0.15, output: 0.6, cache_read: 0.003 };
+      let modelPrices = null;
 
       function parseUsageDay(day) {
         const parts = day.split("-").map(Number);
@@ -300,7 +305,7 @@ export const USAGE_SCRIPT = String.raw`
 
       function getUsageMetricValue(day) {
         if (currentUsageMetric === "cacheHitRate") {
-          const input = Number(day.nonCacheInputTokens || 0) + Number(day.cacheReadInputTokens || 0);
+          const input = Number(day.nonCacheInputTokens || 0) + Number(day.cacheWriteInputTokens || 0) + Number(day.cacheReadInputTokens || 0);
           return input > 0 ? (Number(day.cacheReadInputTokens || 0) / input) * 100 : 0;
         }
         return Number(day[currentUsageMetric] || 0);
@@ -328,29 +333,59 @@ export const USAGE_SCRIPT = String.raw`
         return 4;
       }
 
+      function calculateModelCost(metrics, price) {
+        return (
+          Number(metrics.nonCacheInputTokens || 0) * Number(price.input || 0) +
+          Number(metrics.cacheReadInputTokens || 0) * Number(price.cache_read ?? price.input ?? 0) +
+          Number(metrics.cacheWriteInputTokens || 0) * Number(price.cache_write ?? price.input ?? 0) +
+          Number(metrics.outputTokens || 0) * Number(price.output || 0)
+        ) / 1000000;
+      }
+
+      function renderUsageCosts() {
+        if (!modelPrices) {
+          USAGE_EQUIVALENT_COST_EL.textContent = "正在加载模型价格…";
+          USAGE_UNMATCHED_COST_EL.textContent = "";
+          return;
+        }
+        const fallbackPrice = modelPrices["deepseek-v4-flash"] || DEEPSEEK_FALLBACK_PRICE;
+        let matchedCost = 0;
+        let unmatchedCost = 0;
+        const unmatchedModels = [];
+        for (const item of USAGE_DATA.modelUsage || []) {
+          const modelId = String(item.upstreamModel || "").toLowerCase();
+          const price = modelPrices[modelId];
+          if (price) matchedCost += calculateModelCost(item.metrics, price);
+          else {
+            unmatchedCost += calculateModelCost(item.metrics, fallbackPrice);
+            unmatchedModels.push(item.name);
+          }
+        }
+        USAGE_EQUIVALENT_COST_EL.innerHTML = "匹配到模型的估算花费：<strong>$" + formatEquivalentCost(matchedCost) + "</strong>";
+        USAGE_UNMATCHED_COST_EL.textContent = unmatchedModels.length > 0
+          ? "未匹配模型（" + unmatchedModels.join("、") + "）按 DeepSeek V4.1 Flash 等效价格估算：$" + formatEquivalentCost(unmatchedCost)
+          : "所有模型均已匹配价格；未匹配部分按 DeepSeek V4.1 Flash 等效价格估算：$0.00";
+      }
+
       function renderUsageSummary() {
         const totalRequests = USAGE_DATA.days.reduce((sum, day) => sum + (day.totalRequests || 0), 0);
         const totalTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.totalTokens || 0), 0);
         const inputTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.nonCacheInputTokens || 0), 0);
         const cachedTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.cacheReadInputTokens || 0), 0);
+        const cacheWriteTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.cacheWriteInputTokens || 0), 0);
         const outputTokens = USAGE_DATA.days.reduce((sum, day) => sum + (day.outputTokens || 0), 0);
-        const cacheHitRate = inputTokens + cachedTokens > 0 ? cachedTokens / (inputTokens + cachedTokens) * 100 : null;
+        const cacheHitRate = inputTokens + cacheWriteTokens + cachedTokens > 0
+          ? cachedTokens / (inputTokens + cacheWriteTokens + cachedTokens) * 100
+          : null;
         USAGE_SUMMARY_EL.innerHTML =
           "<span><strong>" + formatUsageCompact(totalRequests) + "</strong> Requests</span>" +
           "<span><strong>" + formatUsageCompact(totalTokens) + "</strong> Tokens</span>" +
           "<span><strong>" + formatUsageCompact(inputTokens) + "</strong> Input</span>" +
           "<span><strong>" + formatUsageCompact(cachedTokens) + "</strong> Cached</span>" +
+          "<span><strong>" + formatUsageCompact(cacheWriteTokens) + "</strong> Cache write</span>" +
           "<span><strong>" + formatUsageCompact(outputTokens) + "</strong> Output</span>";
         USAGE_SUMMARY_EL.innerHTML += "<span><strong>" + (cacheHitRate == null ? "--" : cacheHitRate.toFixed(1) + "%") + "</strong> Cache hit rate</span>";
-        const equivalentCost = (
-          cachedTokens * 0.04 +
-          inputTokens * 2 +
-          outputTokens * 8
-        ) / 1000000;
-        USAGE_EQUIVALENT_COST_EL.innerHTML =
-          "Equivalent cost at DeepSeek Flash peak pricing " +
-          "(¥0.04 / ¥2.00 / ¥8.00 per 1M cached input / input / output tokens): " +
-          "<strong>¥" + formatEquivalentCost(equivalentCost) + "</strong>";
+        renderUsageCosts();
       }
 
       function renderUsageMonths(cells) {
@@ -381,8 +416,9 @@ export const USAGE_SCRIPT = String.raw`
           ["Failed", formatUsageFull(day.failureRequests)],
           ["Input", formatUsageFull(day.nonCacheInputTokens)],
           ["Cached", formatUsageFull(day.cacheReadInputTokens)],
-          ["Cache hit rate", ((Number(day.nonCacheInputTokens || 0) + Number(day.cacheReadInputTokens || 0)) > 0
-            ? (Number(day.cacheReadInputTokens || 0) / (Number(day.nonCacheInputTokens || 0) + Number(day.cacheReadInputTokens || 0)) * 100).toFixed(1) + "%"
+          ["Cache write", formatUsageFull(day.cacheWriteInputTokens)],
+          ["Cache hit rate", ((Number(day.nonCacheInputTokens || 0) + Number(day.cacheWriteInputTokens || 0) + Number(day.cacheReadInputTokens || 0)) > 0
+            ? (Number(day.cacheReadInputTokens || 0) / (Number(day.nonCacheInputTokens || 0) + Number(day.cacheWriteInputTokens || 0) + Number(day.cacheReadInputTokens || 0)) * 100).toFixed(1) + "%"
             : "--")],
           ["Output", formatUsageFull(day.outputTokens)],
           ["Tokens", formatUsageFull(day.totalTokens)],
@@ -504,6 +540,16 @@ export const USAGE_SCRIPT = String.raw`
       currentUsageMetric = USAGE_METRIC_EL.value;
       renderUsageSummary();
       renderUsageHeatmap();
+      fetch(MODEL_PRICES_URL, { cache: "force-cache" })
+        .then((response) => {
+          if (!response.ok) throw new Error("HTTP " + response.status);
+          return response.json();
+        })
+        .then((prices) => { modelPrices = prices; renderUsageCosts(); })
+        .catch(() => {
+          modelPrices = {};
+          renderUsageCosts();
+        });
 `;
 
 export function UsageSection({ payload }: { payload: UsagePagePayload }) {
@@ -518,6 +564,7 @@ export function UsageSection({ payload }: { payload: UsagePagePayload }) {
               <p class="usage-note">Persistent usage history requires --storage sqlite; memory mode only shows data from the current process.</p>
               <div class="usage-summary" id="usage-summary" aria-label="usage summary"></div>
               <p class="usage-equivalent-cost" id="usage-equivalent-cost"></p>
+              <p class="usage-note" id="usage-unmatched-cost"></p>
             </div>
             <div class="usage-controls">
               <select class="usage-select" id="usage-range" aria-label="Time range">

@@ -448,7 +448,7 @@ const SCRIPT = String.raw`
       }
 
       function formatCacheHitRate(cell) {
-        const input = (cell.nonCacheInputTokens || 0) + (cell.cacheReadInputTokens || 0);
+        const input = (cell.nonCacheInputTokens || 0) + (cell.cacheWriteInputTokens || 0) + (cell.cacheReadInputTokens || 0);
         return input > 0 ? ((cell.cacheReadInputTokens || 0) / input * 100).toFixed(1) + "%" : "-";
       }
 
@@ -470,6 +470,7 @@ const SCRIPT = String.raw`
           ["平均首包", formatMetric(cell.avgTtfbMs)],
           ["平均总耗时", formatMetric(cell.avgDurationMs)],
           ["Input", formatToken(cell.nonCacheInputTokens)],
+          ["Cache write", formatToken(cell.cacheWriteInputTokens)],
           ["Cache", formatToken(cell.cacheReadInputTokens)],
           ["Cache 命中率", formatCacheHitRate(cell)],
           ["Output", formatToken(cell.outputTokens)],
@@ -577,12 +578,14 @@ const SCRIPT = String.raw`
       function summarizeSeries(series) {
         return series.reduce((acc, cell) => {
           acc.nonCacheInputTokens += cell.nonCacheInputTokens || 0;
+          acc.cacheWriteInputTokens += cell.cacheWriteInputTokens || 0;
           acc.cacheReadInputTokens += cell.cacheReadInputTokens || 0;
           acc.outputTokens += cell.outputTokens || 0;
           acc.totalStreamMs += cell.totalStreamMs || 0;
           return acc;
         }, {
           nonCacheInputTokens: 0,
+          cacheWriteInputTokens: 0,
           cacheReadInputTokens: 0,
           outputTokens: 0,
           totalStreamMs: 0,
@@ -593,6 +596,7 @@ const SCRIPT = String.raw`
         RANGE_TOTAL_EL.textContent = "";
         const entries = [
           ["Input", formatTokenM(summary.nonCacheInputTokens)],
+          ["Cache write", formatTokenM(summary.cacheWriteInputTokens)],
           ["Cache", formatTokenM(summary.cacheReadInputTokens)],
           ["Cache 命中率", formatCacheHitRate(summary)],
           ["Output", formatTokenM(summary.outputTokens)],
@@ -630,6 +634,7 @@ const SCRIPT = String.raw`
         ROWS_EL.textContent = "";
         const rangeTotal = {
           nonCacheInputTokens: 0,
+          cacheWriteInputTokens: 0,
           cacheReadInputTokens: 0,
           outputTokens: 0,
         };
@@ -639,6 +644,7 @@ const SCRIPT = String.raw`
           const visibleSeries = model.series.slice(startIndex).reverse();
           const usageSummary = summarizeSeries(visibleSeries);
           rangeTotal.nonCacheInputTokens += usageSummary.nonCacheInputTokens;
+          rangeTotal.cacheWriteInputTokens += usageSummary.cacheWriteInputTokens;
           rangeTotal.cacheReadInputTokens += usageSummary.cacheReadInputTokens;
           rangeTotal.outputTokens += usageSummary.outputTokens;
 
@@ -654,6 +660,7 @@ const SCRIPT = String.raw`
             : null;
           usage.textContent =
             "Input " + formatToken(usageSummary.nonCacheInputTokens) +
+            " | Cache write " + formatToken(usageSummary.cacheWriteInputTokens) +
             " | Cache " + formatToken(usageSummary.cacheReadInputTokens) +
             " (" + formatCacheHitRate(usageSummary) + ")" +
             " | Output " + formatToken(usageSummary.outputTokens) +

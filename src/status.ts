@@ -17,6 +17,7 @@ export interface RequestMetrics {
   totalStreamMs: number;
   streamSamples: number;
   nonCacheInputTokens: number;
+  cacheWriteInputTokens: number;
   cacheReadInputTokens: number;
   outputTokens: number;
 }
@@ -58,6 +59,7 @@ function createEmptyMetrics(): RequestMetrics {
     totalStreamMs: 0,
     streamSamples: 0,
     nonCacheInputTokens: 0,
+    cacheWriteInputTokens: 0,
     cacheReadInputTokens: 0,
     outputTokens: 0,
   };
@@ -103,6 +105,7 @@ export class StatusStore {
   private addUsage(metrics: RequestMetrics, usage?: NormalizedUsage) {
     if (!usage) return;
     metrics.nonCacheInputTokens += usage.nonCacheInputTokens ?? 0;
+    metrics.cacheWriteInputTokens += usage.cacheWriteInputTokens ?? usage.cacheCreationInputTokens ?? 0;
     metrics.cacheReadInputTokens += usage.cacheReadInputTokens ?? 0;
     metrics.outputTokens += usage.outputTokens ?? 0;
   }
@@ -214,6 +217,7 @@ function rowToMetrics(row: Record<string, unknown>): RequestMetrics {
     totalStreamMs: Number(row.total_stream_ms ?? 0),
     streamSamples: Number(row.stream_samples ?? 0),
     nonCacheInputTokens: Number(row.non_cache_input_tokens ?? 0),
+    cacheWriteInputTokens: Number(row.cache_write_input_tokens ?? 0),
     cacheReadInputTokens: Number(row.cache_read_input_tokens ?? 0),
     outputTokens: Number(row.output_tokens ?? 0),
   };
@@ -255,12 +259,17 @@ export class SqliteStatusStore implements StatusStoreLike {
         total_stream_ms REAL NOT NULL DEFAULT 0,
         stream_samples INTEGER NOT NULL DEFAULT 0,
         non_cache_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
         cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
         output_tokens INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (model_name, bucket_start)
       );
       CREATE INDEX IF NOT EXISTS idx_status_buckets_bucket_start ON status_buckets(bucket_start);
     `);
+    const columns = allRows<Record<string, unknown>>(await this.db.execute("PRAGMA table_info(status_buckets)"));
+    if (!columns.some((column) => String(column.name) === "cache_write_input_tokens")) {
+      await this.db.execute("ALTER TABLE status_buckets ADD COLUMN cache_write_input_tokens INTEGER NOT NULL DEFAULT 0");
+    }
     await this.pruneOldBuckets();
   }
 
@@ -300,9 +309,10 @@ export class SqliteStatusStore implements StatusStoreLike {
         total_stream_ms,
         stream_samples,
         non_cache_input_tokens,
+        cache_write_input_tokens,
         cache_read_input_tokens,
         output_tokens
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(model_name, bucket_start) DO UPDATE SET
         total_requests = total_requests + excluded.total_requests,
         success_requests = success_requests + excluded.success_requests,
@@ -313,6 +323,7 @@ export class SqliteStatusStore implements StatusStoreLike {
         total_stream_ms = total_stream_ms + excluded.total_stream_ms,
         stream_samples = stream_samples + excluded.stream_samples,
         non_cache_input_tokens = non_cache_input_tokens + excluded.non_cache_input_tokens,
+        cache_write_input_tokens = cache_write_input_tokens + excluded.cache_write_input_tokens,
         cache_read_input_tokens = cache_read_input_tokens + excluded.cache_read_input_tokens,
         output_tokens = output_tokens + excluded.output_tokens
     `,
@@ -328,6 +339,7 @@ export class SqliteStatusStore implements StatusStoreLike {
         delta.totalStreamMs ?? 0,
         delta.streamSamples ?? 0,
         delta.nonCacheInputTokens ?? 0,
+        delta.cacheWriteInputTokens ?? 0,
         delta.cacheReadInputTokens ?? 0,
         delta.outputTokens ?? 0,
       ],
@@ -352,6 +364,7 @@ export class SqliteStatusStore implements StatusStoreLike {
       totalDurationMs: durationMs,
       durationSamples: 1,
       nonCacheInputTokens: usage?.nonCacheInputTokens ?? 0,
+      cacheWriteInputTokens: usage?.cacheWriteInputTokens ?? usage?.cacheCreationInputTokens ?? 0,
       cacheReadInputTokens: usage?.cacheReadInputTokens ?? 0,
       outputTokens: usage?.outputTokens ?? 0,
       ...(typeof ttfbMs === "number" && Number.isFinite(ttfbMs) ? { totalTtfbMs: ttfbMs, ttfbSamples: 1 } : {}),

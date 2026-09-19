@@ -9,6 +9,7 @@ export interface UsageDayMetrics {
   totalDurationMs: number;
   durationSamples: number;
   nonCacheInputTokens: number;
+  cacheWriteInputTokens: number;
   cacheReadInputTokens: number;
   outputTokens: number;
   totalTokens: number;
@@ -78,6 +79,7 @@ function createEmptyUsageMetrics(): UsageDayMetrics {
     totalDurationMs: 0,
     durationSamples: 0,
     nonCacheInputTokens: 0,
+    cacheWriteInputTokens: 0,
     cacheReadInputTokens: 0,
     outputTokens: 0,
     totalTokens: 0,
@@ -87,10 +89,12 @@ function createEmptyUsageMetrics(): UsageDayMetrics {
 function buildTokenDelta(usage?: NormalizedUsage) {
   const nonCacheInputTokens = usage?.nonCacheInputTokens ?? 0;
   const cacheReadInputTokens = usage?.cacheReadInputTokens ?? 0;
+  const cacheWriteInputTokens = usage?.cacheWriteInputTokens ?? usage?.cacheCreationInputTokens ?? 0;
   const outputTokens = usage?.outputTokens ?? 0;
-  const totalTokens = usage?.totalTokens ?? nonCacheInputTokens + cacheReadInputTokens + outputTokens;
+  const totalTokens = usage?.totalTokens ?? nonCacheInputTokens + cacheWriteInputTokens + cacheReadInputTokens + outputTokens;
   return {
     nonCacheInputTokens,
+    cacheWriteInputTokens,
     cacheReadInputTokens,
     outputTokens,
     totalTokens,
@@ -106,6 +110,7 @@ function rowToUsageDayCell(row: Record<string, unknown>): UsageDayCell {
     totalDurationMs: Number(row.total_duration_ms ?? 0),
     durationSamples: Number(row.duration_samples ?? 0),
     nonCacheInputTokens: Number(row.non_cache_input_tokens ?? 0),
+    cacheWriteInputTokens: Number(row.cache_write_input_tokens ?? 0),
     cacheReadInputTokens: Number(row.cache_read_input_tokens ?? 0),
     outputTokens: Number(row.output_tokens ?? 0),
     totalTokens: Number(row.total_tokens ?? 0),
@@ -142,6 +147,7 @@ export class UsageStore implements UsageStoreLike {
     metrics.totalDurationMs += durationMs;
     metrics.durationSamples += 1;
     metrics.nonCacheInputTokens += tokenDelta.nonCacheInputTokens;
+    metrics.cacheWriteInputTokens += tokenDelta.cacheWriteInputTokens;
     metrics.cacheReadInputTokens += tokenDelta.cacheReadInputTokens;
     metrics.outputTokens += tokenDelta.outputTokens;
     metrics.totalTokens += tokenDelta.totalTokens;
@@ -172,6 +178,7 @@ export class UsageStore implements UsageStoreLike {
         target.totalDurationMs += metrics.totalDurationMs;
         target.durationSamples += metrics.durationSamples;
         target.nonCacheInputTokens += metrics.nonCacheInputTokens;
+        target.cacheWriteInputTokens += metrics.cacheWriteInputTokens;
         target.cacheReadInputTokens += metrics.cacheReadInputTokens;
         target.outputTokens += metrics.outputTokens;
         target.totalTokens += metrics.totalTokens;
@@ -200,6 +207,7 @@ export class SqliteUsageStore implements UsageStoreLike {
         total_duration_ms REAL NOT NULL DEFAULT 0,
         duration_samples INTEGER NOT NULL DEFAULT 0,
         non_cache_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
         cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
         output_tokens INTEGER NOT NULL DEFAULT 0,
         total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -208,6 +216,10 @@ export class SqliteUsageStore implements UsageStoreLike {
       CREATE INDEX IF NOT EXISTS idx_usage_days_day ON usage_days(day);
       CREATE INDEX IF NOT EXISTS idx_usage_days_model_day ON usage_days(model_name, day);
     `);
+    const columns = allRows<Record<string, unknown>>(await this.db.execute("PRAGMA table_info(usage_days)"));
+    if (!columns.some((column) => String(column.name) === "cache_write_input_tokens")) {
+      await this.db.execute("ALTER TABLE usage_days ADD COLUMN cache_write_input_tokens INTEGER NOT NULL DEFAULT 0");
+    }
     await this.backfillFromStatusBuckets();
   }
 
@@ -236,10 +248,11 @@ export class SqliteUsageStore implements UsageStoreLike {
         total_duration_ms,
         duration_samples,
         non_cache_input_tokens,
+        cache_write_input_tokens,
         cache_read_input_tokens,
         output_tokens,
         total_tokens
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(day, model_name) DO UPDATE SET
         total_requests = total_requests + excluded.total_requests,
         success_requests = success_requests + excluded.success_requests,
@@ -247,6 +260,7 @@ export class SqliteUsageStore implements UsageStoreLike {
         total_duration_ms = total_duration_ms + excluded.total_duration_ms,
         duration_samples = duration_samples + excluded.duration_samples,
         non_cache_input_tokens = non_cache_input_tokens + excluded.non_cache_input_tokens,
+        cache_write_input_tokens = cache_write_input_tokens + excluded.cache_write_input_tokens,
         cache_read_input_tokens = cache_read_input_tokens + excluded.cache_read_input_tokens,
         output_tokens = output_tokens + excluded.output_tokens,
         total_tokens = total_tokens + excluded.total_tokens
@@ -260,6 +274,7 @@ export class SqliteUsageStore implements UsageStoreLike {
         delta.totalDurationMs ?? 0,
         delta.durationSamples ?? 0,
         delta.nonCacheInputTokens ?? 0,
+        delta.cacheWriteInputTokens ?? 0,
         delta.cacheReadInputTokens ?? 0,
         delta.outputTokens ?? 0,
         delta.totalTokens ?? 0,
@@ -302,6 +317,7 @@ export class SqliteUsageStore implements UsageStoreLike {
             SUM(total_duration_ms) AS total_duration_ms,
             SUM(duration_samples) AS duration_samples,
             SUM(non_cache_input_tokens) AS non_cache_input_tokens,
+            SUM(cache_write_input_tokens) AS cache_write_input_tokens,
             SUM(cache_read_input_tokens) AS cache_read_input_tokens,
             SUM(output_tokens) AS output_tokens,
             SUM(total_tokens) AS total_tokens
@@ -322,6 +338,7 @@ export class SqliteUsageStore implements UsageStoreLike {
             SUM(total_duration_ms) AS total_duration_ms,
             SUM(duration_samples) AS duration_samples,
             SUM(non_cache_input_tokens) AS non_cache_input_tokens,
+            SUM(cache_write_input_tokens) AS cache_write_input_tokens,
             SUM(cache_read_input_tokens) AS cache_read_input_tokens,
             SUM(output_tokens) AS output_tokens,
             SUM(total_tokens) AS total_tokens
@@ -359,6 +376,10 @@ export class SqliteUsageStore implements UsageStoreLike {
       WHERE type = 'table' AND name = 'status_buckets'
     `));
     if (!hasStatusBuckets) return;
+    const statusColumns = allRows<Record<string, unknown>>(await this.db.execute("PRAGMA table_info(status_buckets)"));
+    const cacheWriteColumn = statusColumns.some((column) => String(column.name) === "cache_write_input_tokens")
+      ? "cache_write_input_tokens"
+      : "0 AS cache_write_input_tokens";
 
     const rows = allRows<Record<string, unknown>>(await this.db.execute(`
       SELECT
@@ -369,6 +390,7 @@ export class SqliteUsageStore implements UsageStoreLike {
         total_duration_ms,
         duration_samples,
         non_cache_input_tokens,
+        ${cacheWriteColumn},
         cache_read_input_tokens,
         output_tokens
       FROM status_buckets
@@ -387,6 +409,7 @@ export class SqliteUsageStore implements UsageStoreLike {
       const successRequests = Number(row.success_requests ?? 0);
       const nonCacheInputTokens = Number(row.non_cache_input_tokens ?? 0);
       const cacheReadInputTokens = Number(row.cache_read_input_tokens ?? 0);
+      const cacheWriteInputTokens = Number(row.cache_write_input_tokens ?? 0);
       const outputTokens = Number(row.output_tokens ?? 0);
       metrics.totalRequests += totalRequests;
       metrics.successRequests += successRequests;
@@ -394,9 +417,10 @@ export class SqliteUsageStore implements UsageStoreLike {
       metrics.totalDurationMs += Number(row.total_duration_ms ?? 0);
       metrics.durationSamples += Number(row.duration_samples ?? 0);
       metrics.nonCacheInputTokens += nonCacheInputTokens;
+      metrics.cacheWriteInputTokens += cacheWriteInputTokens;
       metrics.cacheReadInputTokens += cacheReadInputTokens;
       metrics.outputTokens += outputTokens;
-      metrics.totalTokens += nonCacheInputTokens + cacheReadInputTokens + outputTokens;
+      metrics.totalTokens += nonCacheInputTokens + cacheWriteInputTokens + cacheReadInputTokens + outputTokens;
       byModelDay.set(key, metrics);
     }
 
@@ -411,10 +435,11 @@ export class SqliteUsageStore implements UsageStoreLike {
           total_duration_ms,
           duration_samples,
           non_cache_input_tokens,
+          cache_write_input_tokens,
           cache_read_input_tokens,
           output_tokens,
           total_tokens
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(day, model_name) DO NOTHING
       `,
       args: [
@@ -426,6 +451,7 @@ export class SqliteUsageStore implements UsageStoreLike {
         metrics.totalDurationMs,
         metrics.durationSamples,
         metrics.nonCacheInputTokens,
+        metrics.cacheWriteInputTokens,
         metrics.cacheReadInputTokens,
         metrics.outputTokens,
         metrics.totalTokens,
