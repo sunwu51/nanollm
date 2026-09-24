@@ -494,7 +494,7 @@ async function upstreamFetchToUrl(
 
 // ─── Stream content validation ──────────────────────────────────────────────
 
-const MAX_VALIDATION_BUFFER_BYTES = 64 * 1024;
+const MAX_VALIDATION_BUFFER_BYTES = 1024 * 1024;
 
 function reconstructStream(
   bufferedChunks: Uint8Array[],
@@ -595,11 +595,13 @@ async function validateStreamContent(
       }
 
       if (totalBytes >= MAX_VALIDATION_BUFFER_BYTES) {
+        if (!expressionApplied) {
+          console.error(`[RESPONSE EXPRESSION] ${options.config.name}: upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes before a model-bearing start event was found; skipping responseExpression and forwarding stream as-is`);
+          return reconstructStream(bufferedChunks, reader);
+        }
         const bufferedText = bufferedChunks.map(c => new TextDecoder().decode(c, { stream: true })).join("") + new TextDecoder().decode();
         setRecordedAttemptResponseBody({ index: options.attemptIndex, body: bufferedText });
-        const message = !expressionApplied
-          ? `Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes before responseExpression could find a model-bearing start event`
-          : `Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes with no real content`;
+        const message = `Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes with no real content`;
         setRecordedAttemptError({
           index: options.attemptIndex,
           message,

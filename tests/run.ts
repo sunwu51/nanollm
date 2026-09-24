@@ -3949,6 +3949,37 @@ await runAsync("model responseExpression validates SSE start model before exposi
   });
 });
 
+await runAsync("model responseExpression logs and forwards SSE stream when no start model is found within buffer limit", async () => {
+  const delta = "x".repeat(64 * 1024);
+  const events = Array.from({ length: 20 }, (_, i) => `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta, sequence_number: i })}\n\n`);
+  const expected = events.join("");
+  const originalError = console.error;
+  const errors: string[] = [];
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    await withHTTPServer(async (_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      for (const event of events) res.write(event);
+      res.end();
+    }, async (baseURL) => {
+      const result = await passthroughStreamRequest({
+        name: "alpha",
+        provider: "openai-responses",
+        base_url: baseURL,
+        api_key: "test-key",
+        model: "upstream-alpha",
+        responseExpression: `(() => { throw new Error("must not run"); })()`,
+      }, { model: "alpha", input: "hello", stream: true });
+      const text = await new Response(result.body).text();
+      assert.equal(text, expected);
+    });
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /\[RESPONSE EXPRESSION\] alpha: .*exceeded 1048576 bytes/);
+});
+
 await runAsync("wildcard downstream model replacement is used by converted requests", async () => {
   let upstreamBody: any;
   await withHTTPServer(async (req, res) => {
