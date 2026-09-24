@@ -208,11 +208,6 @@ function extractStreamModel(provider: StreamFormat, event: unknown): string | un
   return undefined;
 }
 
-function enforceSubscriptionRequest(config: ModelConfig, body: unknown): unknown {
-  if (!config.subscription_provider || !isPlainObject(body)) return body;
-  return { ...body, store: false };
-}
-
 const OPENAI_RESPONSES_UNSTORED_ITEM_ID_TYPES = new Set(["message", "reasoning", "function_call", "custom_tool_call"]);
 
 function stripOpenAIResponsesUnstoredItemIds(config: ModelConfig, body: unknown): unknown {
@@ -229,10 +224,10 @@ function stripOpenAIResponsesUnstoredItemIds(config: ModelConfig, body: unknown)
   return changed ? { ...body, input } : body;
 }
 
-export function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unknown>, stream: boolean): unknown {
+function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unknown>, stream: boolean): unknown {
   return stripOpenAIResponsesUnstoredItemIds(
     config,
-    enforceSubscriptionRequest(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream })),
+    applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream }),
   );
 }
 
@@ -499,7 +494,7 @@ async function upstreamFetchToUrl(
 
 // ─── Stream content validation ──────────────────────────────────────────────
 
-const MAX_VALIDATION_BUFFER_BYTES = 64 * 1024;
+const MAX_VALIDATION_BUFFER_BYTES = 1024 * 1024;
 
 function reconstructStream(
   bufferedChunks: Uint8Array[],
@@ -600,11 +595,13 @@ async function validateStreamContent(
       }
 
       if (totalBytes >= MAX_VALIDATION_BUFFER_BYTES) {
+        if (!expressionApplied) {
+          console.error(`[RESPONSE EXPRESSION] ${options.config.name}: upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes before a model-bearing start event was found; skipping responseExpression and forwarding stream as-is`);
+          return reconstructStream(bufferedChunks, reader);
+        }
         const bufferedText = bufferedChunks.map(c => new TextDecoder().decode(c, { stream: true })).join("") + new TextDecoder().decode();
         setRecordedAttemptResponseBody({ index: options.attemptIndex, body: bufferedText });
-        const message = !expressionApplied
-          ? `Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes before responseExpression could find a model-bearing start event`
-          : `Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes with no real content`;
+        const message = `Upstream SSE stream exceeded ${MAX_VALIDATION_BUFFER_BYTES} bytes with no real content`;
         setRecordedAttemptError({
           index: options.attemptIndex,
           message,
@@ -731,7 +728,7 @@ export async function forwardRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = enforceSubscriptionRequest(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
+  const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), false, { ...options, recordedRequestBody: body });
   const text = await response.text();
   setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: text });
@@ -750,7 +747,7 @@ export async function forwardStreamRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = enforceSubscriptionRequest(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
+  const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
   const { response, timing } = await upstreamFetch(config, JSON.stringify(body), true, { ...options, recordedRequestBody: body });
   if (!response.body) throw new Error("Upstream returned no streaming body");
   const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0, config, headers: response.headers });

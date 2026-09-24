@@ -11,6 +11,10 @@ type CacheEntry = {
 
 const cache = new Map<string, CacheEntry>();
 
+export function shouldCacheResponseItems(incomingFormat: string, store: unknown): boolean {
+  return incomingFormat === "openai-responses" && store !== false;
+}
+
 function pruneExpired(now = Date.now()) {
   for (const [key, entry] of cache) {
     if (now - entry.cachedAt > TTL_MS) {

@@ -28,8 +28,8 @@ import { renderAdminConfigPage } from "../src/admin-config-page.js";
 import { ConfigManager } from "../src/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
-import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, preparePassthroughBody, resolveProxyUrl } from "../src/proxy.js";
-import { cacheResponseItems, resolveItemReferences } from "../src/response-cache.js";
+import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
+import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "../src/response-cache.js";
 import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/response-compression.js";
 import { renderRecordPage } from "../src/record-page.js";
 import { renderStatusPage } from "../src/status-page.js";
@@ -59,11 +59,20 @@ import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/status.js"
 import { shouldIgnoreStreamReadError } from "../src/stream-errors.js";
 import { extractErrorCauses, formatErrorWithCauses } from "../src/error-details.js";
 import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/usage.js";
+import { normalizeUsage } from "../src/converters/shared.js";
 import { openSqliteStorage } from "../src/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../src/turso-migration.js";
 
 function createTestSqliteClient(path: string): Client {
   return createClient({ url: `file:${path}`, intMode: "number", timeout: 5000 });
+}
+
+function removeTestDir(path: string) {
+  try {
+    rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+  }
 }
 
 function run(name: string, fn: () => void) {
@@ -2446,7 +2455,7 @@ run("anthropic response usage total includes cache read and write when converted
     input_tokens: 1000,
     output_tokens: 100,
     total_tokens: 1100,
-    input_tokens_details: { cached_tokens: 500 },
+    input_tokens_details: { cached_tokens: 500, cache_write_tokens: 200 },
   });
 });
 
@@ -2483,6 +2492,39 @@ run("openai chat usage keeps anthropic non-cache input separate when converted",
     cache_read_input_tokens: 600,
     server_tool_use: null,
   });
+});
+
+run("usage normalization separates cache write from ordinary OpenAI input", () => {
+  const chat = normalizeUsage({
+    prompt_tokens: 1000,
+    completion_tokens: 100,
+    prompt_tokens_details: { cached_tokens: 600, cache_write_tokens: 200 },
+  });
+  assert.equal(chat?.inputTokens, 1000);
+  assert.equal(chat?.nonCacheInputTokens, 200);
+  assert.equal(chat?.cacheReadInputTokens, 600);
+  assert.equal(chat?.cacheWriteInputTokens, 200);
+  assert.equal(chat?.totalTokens, 1100);
+
+  const responses = normalizeUsage({
+    input_tokens: 900,
+    output_tokens: 90,
+    input_tokens_details: { cached_tokens: 500, cache_write_tokens: 100 },
+  });
+  assert.equal(responses?.nonCacheInputTokens, 300);
+  assert.equal(responses?.cacheReadInputTokens, 500);
+  assert.equal(responses?.cacheWriteInputTokens, 100);
+
+  const anthropic = normalizeUsage({
+    input_tokens: 300,
+    output_tokens: 100,
+    cache_creation_input_tokens: 200,
+    cache_read_input_tokens: 500,
+  });
+  assert.equal(anthropic?.nonCacheInputTokens, 300);
+  assert.equal(anthropic?.cacheWriteInputTokens, 200);
+  assert.equal(anthropic?.cacheReadInputTokens, 500);
+  assert.equal(anthropic?.inputTokens, 1000);
 });
 
 run("anthropic thinking budget 4000 maps to chat medium reasoning_effort", () => {
@@ -3809,27 +3851,6 @@ await runAsync("openai responses passthrough drops persisted item ids when store
   });
 });
 
-run("subscription responses always disable upstream storage after model body transforms", () => {
-  const body = preparePassthroughBody({
-    name: "subscription-model",
-    provider: "openai-responses",
-    subscription_provider: "codex-subscription",
-    base_url: "https://chatgpt.com/backend-api/codex",
-    api_key: "",
-    model: "gpt-5",
-    body: { store: true },
-    bodyExpression: "({ ...body, store: true })",
-  }, {
-    model: "subscription-model",
-    store: true,
-    input: "hello",
-  }, true) as Record<string, unknown>;
-
-  assert.equal(body.store, false);
-  assert.equal(body.stream, true);
-  assert.equal(body.model, "gpt-5");
-});
-
 await runAsync("model bodyExpression rewrites passthrough upstream request body", async () => {
   let upstreamBody: any;
   await withHTTPServer(async (req, res) => {
@@ -3926,6 +3947,37 @@ await runAsync("model responseExpression validates SSE start model before exposi
       /responseExpression failed: unexpected actual model: unexpected-model/,
     );
   });
+});
+
+await runAsync("model responseExpression logs and forwards SSE stream when no start model is found within buffer limit", async () => {
+  const delta = "x".repeat(64 * 1024);
+  const events = Array.from({ length: 20 }, (_, i) => `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta, sequence_number: i })}\n\n`);
+  const expected = events.join("");
+  const originalError = console.error;
+  const errors: string[] = [];
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    await withHTTPServer(async (_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      for (const event of events) res.write(event);
+      res.end();
+    }, async (baseURL) => {
+      const result = await passthroughStreamRequest({
+        name: "alpha",
+        provider: "openai-responses",
+        base_url: baseURL,
+        api_key: "test-key",
+        model: "upstream-alpha",
+        responseExpression: `(() => { throw new Error("must not run"); })()`,
+      }, { model: "alpha", input: "hello", stream: true });
+      const text = await new Response(result.body).text();
+      assert.equal(text, expected);
+    });
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /\[RESPONSE EXPRESSION\] alpha: .*exceeded 1048576 bytes/);
 });
 
 await runAsync("wildcard downstream model replacement is used by converted requests", async () => {
@@ -4034,6 +4086,7 @@ await runAsync("status store aggregates success rate and averages by five-minute
   store.recordAttempt("alpha", bucketStart + 5_000);
   store.recordSuccess("alpha", 120, 40, {
     nonCacheInputTokens: 1200,
+    cacheWriteInputTokens: 200,
     cacheReadInputTokens: 300,
     outputTokens: 450,
   }, bucketStart + 5_000);
@@ -4048,6 +4101,7 @@ await runAsync("status store aggregates success rate and averages by five-minute
   assert.equal(cell.avgTtfbMs, 40);
   assert.equal(cell.avgDurationMs, 210);
   assert.equal(cell.nonCacheInputTokens, 1200);
+  assert.equal(cell.cacheWriteInputTokens, 200);
   assert.equal(cell.cacheReadInputTokens, 300);
   assert.equal(cell.outputTokens, 450);
   assert.equal(getHealthTone(cell.successRate, cell.totalRequests), "orange");
@@ -4126,7 +4180,7 @@ await runAsync("sqlite status store persists sparse buckets for a month while UI
     );
   } finally {
     db.close();
-    rmSync(dir, { recursive: true, force: true });
+    removeTestDir(dir);
   }
 });
 
@@ -4150,7 +4204,39 @@ await runAsync("sqlite status store lists only model names with recent buckets",
     assert.deepEqual(await store.listModelNames(now), ["alpha", "beta"]);
   } finally {
     db.close();
-    rmSync(dir, { recursive: true, force: true });
+    removeTestDir(dir);
+  }
+});
+
+await runAsync("sqlite status store migrates cache write column for existing databases", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-status-migrate-"));
+  const db = createTestSqliteClient(join(dir, "status.sqlite3"));
+  try {
+    await db.executeMultiple(`
+      CREATE TABLE status_buckets (
+        model_name TEXT NOT NULL, bucket_start INTEGER NOT NULL,
+        total_requests INTEGER NOT NULL DEFAULT 0, success_requests INTEGER NOT NULL DEFAULT 0,
+        total_ttfb_ms REAL NOT NULL DEFAULT 0, ttfb_samples INTEGER NOT NULL DEFAULT 0,
+        total_duration_ms REAL NOT NULL DEFAULT 0, duration_samples INTEGER NOT NULL DEFAULT 0,
+        total_stream_ms REAL NOT NULL DEFAULT 0, stream_samples INTEGER NOT NULL DEFAULT 0,
+        non_cache_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (model_name, bucket_start)
+      )
+    `);
+    const now = Date.now();
+    await db.execute({
+      sql: "INSERT INTO status_buckets (model_name, bucket_start, total_requests) VALUES (?, ?, ?)",
+      args: ["old", Math.floor(now / 300000) * 300000, 1],
+    });
+    const store = new SqliteStatusStore(db);
+    assert.equal((await store.getModelSeries("old", now)).at(-1)?.cacheWriteInputTokens, 0);
+    store.recordAttempt("new", now);
+    store.recordSuccess("new", 10, 1, { cacheWriteInputTokens: 7 }, now);
+    assert.equal((await store.getModelSeries("new", now)).at(-1)?.cacheWriteInputTokens, 7);
+  } finally {
+    db.close();
+    removeTestDir(dir);
   }
 });
 
@@ -4162,6 +4248,7 @@ await runAsync("usage store aggregates daily attempts, success usage, and failur
   store.recordAttempt("alpha", timestamp);
   store.recordSuccess("alpha", 120, {
     nonCacheInputTokens: 100,
+    cacheWriteInputTokens: 10,
     cacheReadInputTokens: 25,
     outputTokens: 40,
   }, timestamp);
@@ -4181,15 +4268,16 @@ await runAsync("usage store aggregates daily attempts, success usage, and failur
   assert.equal(all.failureRequests, 1);
   assert.equal(all.totalDurationMs, 250);
   assert.equal(all.nonCacheInputTokens, 105);
+  assert.equal(all.cacheWriteInputTokens, 10);
   assert.equal(all.cacheReadInputTokens, 25);
   assert.equal(all.outputTokens, 47);
-  assert.equal(all.totalTokens, 185);
+  assert.equal(all.totalTokens, 195);
 
   const alpha = (await store.listDays({ start: day, end: day, modelName: "alpha" }))[0];
   assert.equal(alpha.totalRequests, 2);
   assert.equal(alpha.successRequests, 1);
   assert.equal(alpha.failureRequests, 1);
-  assert.equal(alpha.totalTokens, 165);
+  assert.equal(alpha.totalTokens, 175);
 });
 
 await runAsync("sqlite usage store persists daily aggregates and supports dense range queries", async () => {
@@ -4203,6 +4291,7 @@ await runAsync("sqlite usage store persists daily aggregates and supports dense 
     store.recordAttempt("alpha", timestamp);
     store.recordSuccess("alpha", 100, {
       nonCacheInputTokens: 10,
+      cacheWriteInputTokens: 4,
       cacheReadInputTokens: 2,
       outputTokens: 3,
     }, timestamp);
@@ -4215,7 +4304,8 @@ await runAsync("sqlite usage store persists daily aggregates and supports dense 
     assert.equal(cell.totalRequests, 2);
     assert.equal(cell.successRequests, 1);
     assert.equal(cell.failureRequests, 1);
-    assert.equal(cell.totalTokens, 15);
+    assert.equal(cell.cacheWriteInputTokens, 4);
+    assert.equal(cell.totalTokens, 19);
 
     const range = await restarted.listDays({ start: "2026-01-01", end: "2026-01-03", modelName: "alpha" });
     assert.equal(range.length, 3);
@@ -4225,7 +4315,34 @@ await runAsync("sqlite usage store persists daily aggregates and supports dense 
     assert.equal(range[1].totalRequests, 2);
   } finally {
     db.close();
-    rmSync(dir, { recursive: true, force: true });
+    removeTestDir(dir);
+  }
+});
+
+await runAsync("sqlite usage store migrates cache write column for existing databases", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-usage-migrate-"));
+  const db = createTestSqliteClient(join(dir, "usage.sqlite3"));
+  try {
+    await db.executeMultiple(`
+      CREATE TABLE usage_days (
+        day TEXT NOT NULL, model_name TEXT NOT NULL,
+        total_requests INTEGER NOT NULL DEFAULT 0, success_requests INTEGER NOT NULL DEFAULT 0,
+        failure_requests INTEGER NOT NULL DEFAULT 0, total_duration_ms REAL NOT NULL DEFAULT 0,
+        duration_samples INTEGER NOT NULL DEFAULT 0, non_cache_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, model_name)
+      );
+      INSERT INTO usage_days (day, model_name, total_requests) VALUES ('2026-01-02', 'old', 1);
+    `);
+    const store = new SqliteUsageStore(db);
+    assert.equal((await store.getModelDay("old", "2026-01-02"))?.cacheWriteInputTokens, 0);
+    const timestamp = new Date(2026, 0, 2, 10, 0, 0).getTime();
+    store.recordAttempt("new", timestamp);
+    store.recordSuccess("new", 10, { cacheWriteInputTokens: 7 }, timestamp);
+    assert.equal((await store.getModelDay("new", "2026-01-02"))?.cacheWriteInputTokens, 7);
+  } finally {
+    db.close();
+    removeTestDir(dir);
   }
 });
 
@@ -4327,7 +4444,7 @@ await runAsync("sqlite usage store backfills old daily aggregates from status bu
     assert.equal(alphaAfterRestart?.totalTokens, 27);
   } finally {
     db.close();
-    rmSync(dir, { recursive: true, force: true });
+    removeTestDir(dir);
   }
 });
 
@@ -4424,7 +4541,7 @@ await runAsync("turso auto migration copies sqlite data only once per migration 
   } finally {
     source.close();
     target.close();
-    rmSync(dir, { recursive: true, force: true });
+    removeTestDir(dir);
   }
 });
 
@@ -4644,7 +4761,7 @@ await runAsync("sqlite record store persists records and trims when max size shr
   } finally {
     useMemoryRecordStore();
     db.close();
-    rmSync(dir, { recursive: true, force: true });
+    removeTestDir(dir);
   }
 });
 
@@ -4680,7 +4797,7 @@ await runAsync("sqlite record store restores compacted images after restart", as
   } finally {
     useMemoryRecordStore();
     db.close();
-    rmSync(dir, { recursive: true, force: true });
+    removeTestDir(dir);
   }
 });
 
@@ -4696,6 +4813,7 @@ await runAsync("status page renders fallback group priority panel without top hi
     availableYears: [2026, 2025],
     selectedModel: "alpha",
     models: ["alpha", "beta"],
+    modelUsage: [],
     days: [
       {
         day: "2026-01-01",
@@ -4705,6 +4823,7 @@ await runAsync("status page renders fallback group priority panel without top hi
         totalDurationMs: 100,
         durationSamples: 1,
         nonCacheInputTokens: 10,
+        cacheWriteInputTokens: 0,
         cacheReadInputTokens: 2,
         outputTokens: 3,
         totalTokens: 15,
@@ -4717,6 +4836,7 @@ await runAsync("status page renders fallback group priority panel without top hi
         totalDurationMs: 0,
         durationSamples: 0,
         nonCacheInputTokens: 0,
+        cacheWriteInputTokens: 0,
         cacheReadInputTokens: 0,
         outputTokens: 0,
         totalTokens: 0,
@@ -4729,6 +4849,7 @@ await runAsync("status page renders fallback group priority panel without top hi
         totalDurationMs: 220,
         durationSamples: 2,
         nonCacheInputTokens: 20,
+        cacheWriteInputTokens: 0,
         cacheReadInputTokens: 4,
         outputTokens: 6,
         totalTokens: 30,
@@ -4756,6 +4877,10 @@ await runAsync("status page renders fallback group priority panel without top hi
   assert.match(html, /Selected year/);
   assert.match(html, /Requests/);
   assert.match(html, /Cached/);
+  assert.match(html, /\["Cache write", formatToken\(cell\.cacheWriteInputTokens\)\]/);
+  assert.match(html, /\["Cache write", formatTokenM\(summary\.cacheWriteInputTokens\)\]/);
+  assert.match(html, /\| Cache write /);
+  assert.match(html, /未匹配部分按 DeepSeek V4.1 Flash 等效价格估算：\$0\.00/);
   assert.match(html, /\/status\?range=year&amp;year=2025&amp;model=alpha/);
   assert.match(html, /Fallback Groups/);
   assert.match(html, /id="groups"/);
@@ -5048,6 +5173,13 @@ run("reader release errors are ignored only for cancelled or completed streams",
   assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: true, completed: false }), true);
   assert.equal(shouldIgnoreStreamReadError(releasedReaderError, { cancelled: false, completed: false }), false);
   assert.equal(shouldIgnoreStreamReadError(new Error("socket hang up"), { cancelled: false, completed: true }), false);
+});
+
+run("response item cache honors the client store flag", () => {
+  assert.equal(shouldCacheResponseItems("openai-responses", undefined), true);
+  assert.equal(shouldCacheResponseItems("openai-responses", true), true);
+  assert.equal(shouldCacheResponseItems("openai-responses", false), false);
+  assert.equal(shouldCacheResponseItems("openai-chat", true), false);
 });
 
 run("response item cache evicts oldest entries after 500 items", () => {
