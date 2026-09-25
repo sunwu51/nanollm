@@ -379,6 +379,46 @@ const STYLE = /* css */ String.raw`
         font-family: "Consolas", "SFMono-Regular", "Menlo", monospace;
         font-size: 12px;
       }
+      dialog.model-test-dialog {
+        width: min(720px, calc(100vw - 32px));
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        padding: 20px;
+        background: var(--panel);
+        color: var(--text);
+        box-shadow: var(--shadow);
+      }
+      dialog.model-test-dialog::backdrop {
+        background: rgba(47, 39, 29, 0.35);
+      }
+      .model-test-body {
+        display: grid;
+        gap: 12px;
+      }
+      .model-test-body textarea {
+        min-height: 90px;
+        resize: vertical;
+      }
+      .model-test-reply,
+      .model-test-raw {
+        margin: 0;
+        padding: 12px 14px;
+        border-radius: 12px;
+        background: #fffdf9;
+        border: 1px solid var(--border);
+        font-family: "Consolas", "SFMono-Regular", "Menlo", monospace;
+        font-size: 13px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 260px;
+        overflow: auto;
+      }
+      .model-test-actions {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+      }
       @media (max-width: 960px) {
         .quick-links,
         .field-grid,
@@ -931,6 +971,112 @@ const SCRIPT = /* js */ String.raw`
         return provider + " · " + upstreamModel + " · " + baseUrl;
       }
 
+      function getEffectiveModelProvider(model) {
+        if (model.connection_mode !== "custom") return model.provider;
+        const provider = formState.providers.find((item) => item.name === model.custom_provider);
+        return provider?.provider === "openai-subscription" ? "openai-responses" : provider?.provider;
+      }
+
+      function openModelTestDialog(model) {
+        const name = (model.name || "").trim();
+        const dialog = document.createElement("dialog");
+        dialog.className = "model-test-dialog";
+        const body = document.createElement("div");
+        body.className = "model-test-body";
+
+        const heading = document.createElement("h3");
+        heading.textContent = "测试模型：" + (name || "未命名模型");
+        body.appendChild(heading);
+
+        const note = document.createElement("div");
+        note.className = "helper";
+        note.textContent = "使用服务端当前已保存的配置发送一次流式请求" + (dirty ? "；页面上还有未保存的修改，不会参与本次测试。" : "。");
+        body.appendChild(note);
+
+        const input = document.createElement("textarea");
+        input.value = "你只需要回复ok";
+        body.appendChild(input);
+
+        const status = document.createElement("div");
+        status.className = "status";
+        body.appendChild(status);
+
+        const reply = document.createElement("pre");
+        reply.className = "model-test-reply";
+        reply.hidden = true;
+        body.appendChild(reply);
+
+        const rawWrap = document.createElement("details");
+        rawWrap.hidden = true;
+        const rawSummary = document.createElement("summary");
+        rawSummary.textContent = "原始响应";
+        const raw = document.createElement("pre");
+        raw.className = "model-test-raw";
+        rawWrap.append(rawSummary, raw);
+        body.appendChild(rawWrap);
+
+        const actions = document.createElement("div");
+        actions.className = "model-test-actions";
+        const closeButton = createActionButton("关闭", "ghost", () => dialog.close());
+        const sendButton = createActionButton("发送", "", async () => {
+          if (!name) { status.className = "status error"; status.textContent = "请先填写模型名称并保存配置。"; return; }
+          sendButton.disabled = true;
+          status.className = "status warn";
+          status.textContent = "请求中...";
+          reply.hidden = true;
+          rawWrap.hidden = true;
+          try {
+            const response = await fetch("/admin/models/" + encodeURIComponent(name) + "/test", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ message: input.value }),
+            });
+            const text = await response.text();
+            let payload; try { payload = JSON.parse(text); } catch { payload = { error: text.slice(0, 240) }; }
+            const meta = [
+              payload.status ? "HTTP " + payload.status : "",
+              typeof payload.durationMs === "number" ? payload.durationMs + "ms" : "",
+              payload.upstreamModel ? "上游模型 " + payload.upstreamModel : "",
+            ].filter(Boolean).join(" · ");
+            status.textContent = "";
+            status.className = "status " + (payload.ok ? "success" : "error");
+            status.appendChild(document.createTextNode((payload.ok ? "成功" : "失败：" + (typeof payload.error === "string" ? payload.error : JSON.stringify(payload.error))) + (meta ? " · " + meta : "")));
+            if (payload.requestId) {
+              status.appendChild(document.createTextNode(" · "));
+              const link = document.createElement("a");
+              link.href = "/record?requestId=" + encodeURIComponent(payload.requestId);
+              link.target = "_blank";
+              link.rel = "noopener";
+              link.textContent = "查看记录";
+              status.appendChild(link);
+            }
+            if (payload.ok) {
+              reply.hidden = false;
+              reply.textContent = payload.reply || "(未解析到文本回复，请查看原始响应)";
+            }
+            if (payload.raw) {
+              rawWrap.hidden = false;
+              rawWrap.open = !payload.ok || !payload.reply;
+              raw.textContent = payload.raw;
+            }
+          } catch (error) {
+            status.className = "status error";
+            status.textContent = error instanceof Error ? error.message : String(error);
+          } finally {
+            sendButton.disabled = false;
+          }
+        });
+        actions.append(closeButton, sendButton);
+        body.appendChild(actions);
+
+        dialog.appendChild(body);
+        document.body.appendChild(dialog);
+        dialog.addEventListener("close", () => dialog.remove(), { once: true });
+        dialog.showModal();
+        input.focus();
+        input.select();
+      }
+
       function renderModels() {
         modelsContainer.textContent = "";
         if (formState.models.length === 0) {
@@ -985,6 +1131,9 @@ const SCRIPT = /* js */ String.raw`
           head.appendChild(toggle);
           const actions = document.createElement("div");
           actions.className = "card-actions";
+          if (getEffectiveModelProvider(model) !== "openai-image") {
+            actions.appendChild(createActionButton("测试", "secondary", () => openModelTestDialog(model)));
+          }
           actions.appendChild(
             createActionButton("复刻", "secondary", () => {
               const id = nextId("model");

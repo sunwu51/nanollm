@@ -47,6 +47,25 @@ ${USAGE_STYLE}
         --shadow: 0 18px 48px rgba(74, 53, 26, 0.14);
       }
       * { box-sizing: border-box; }
+      .back-admin {
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        z-index: 100;
+        padding: 8px 14px;
+        border-radius: 999px;
+        border: 1px solid rgba(140, 90, 47, 0.28);
+        background: rgba(255, 250, 242, 0.95);
+        color: #8c5a2f;
+        font-size: 13px;
+        font-weight: 700;
+        text-decoration: none;
+        box-shadow: 0 6px 18px rgba(58, 43, 24, 0.12);
+      }
+      .back-admin:hover {
+        background: #8c5a2f;
+        color: #fff9f1;
+      }
       body {
         margin: 0;
         font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -57,6 +76,11 @@ ${USAGE_STYLE}
       }
       .page {
         padding: 20px;
+      }
+      @media (max-width: 900px) {
+        .page {
+          padding-top: 60px;
+        }
       }
       .usage-top {
         margin-bottom: 18px;
@@ -720,6 +744,7 @@ function StatusPage({ payload }: { payload: StatusPagePayload }) {
         <style dangerouslySetInnerHTML={{ __html: STYLE }} />
       </head>
       <body>
+    <a class="back-admin" href="/admin">← Admin</a>
     <main class="page">
       <div class="usage-top">
         <UsageSection payload={{ ...payload.usage, basePath: "/status" }} />

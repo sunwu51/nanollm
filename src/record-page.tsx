@@ -36,6 +36,25 @@ const STYLE = /* css */ String.raw`
         --danger: #be4a38;
       }
       * { box-sizing: border-box; }
+      .back-admin {
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        z-index: 100;
+        padding: 8px 14px;
+        border-radius: 999px;
+        border: 1px solid rgba(140, 90, 47, 0.28);
+        background: rgba(255, 250, 242, 0.95);
+        color: #8c5a2f;
+        font-size: 13px;
+        font-weight: 700;
+        text-decoration: none;
+        box-shadow: 0 6px 18px rgba(58, 43, 24, 0.12);
+      }
+      .back-admin:hover {
+        background: #8c5a2f;
+        color: #fff9f1;
+      }
       body {
         margin: 0;
         font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -203,6 +222,11 @@ const STYLE = /* css */ String.raw`
       }
       .recent-key {
         width: 260px;
+      }
+      .recent-key.active {
+        background: #f6e4cc;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 2px rgba(140, 90, 47, 0.35);
       }
       .recent-key small {
         display: block;
@@ -565,6 +589,13 @@ const SCRIPT = String.raw`
       }
 
       let recentExpanded = false;
+      let selectedRequestId = null;
+
+      function markActiveRecent() {
+        recentEl.querySelectorAll(".recent-key").forEach((button) => {
+          button.classList.toggle("active", button.dataset.requestId === selectedRequestId);
+        });
+      }
 
       function getSourceBadgeLabel(source) {
         if (source === "claudecode") return "CC";
@@ -594,7 +625,8 @@ const SCRIPT = String.raw`
       function renderRecentButton(item) {
         const button = document.createElement("button");
         button.type = "button";
-        button.className = "recent-key";
+        button.className = "recent-key" + (item.requestId === selectedRequestId ? " active" : "");
+        button.dataset.requestId = item.requestId;
 
         const titleRow = document.createElement("div");
         titleRow.className = "recent-title-row";
@@ -1666,12 +1698,16 @@ const SCRIPT = String.raw`
         const response = await fetch("/record/" + encodeURIComponent(requestId), { cache: "no-store" });
         const payload = await response.json();
         if (!response.ok) {
+          selectedRequestId = null;
+          markActiveRecent();
           if (payload.summary) {
             setSummary(payload.summary);
           }
           renderError(payload.error || "查询失败");
           return;
         }
+        selectedRequestId = requestId;
+        markActiveRecent();
         if (payload.summary) {
           setSummary(payload.summary);
         }
@@ -1707,6 +1743,7 @@ function RecordPage({ summary }: { summary: RecordSummary }) {
         <style dangerouslySetInnerHTML={{ __html: STYLE }} />
       </head>
       <body>
+    <a class="back-admin" href="/admin">← Admin</a>
     <main class="page">
       <section class={panelClass} id="record-panel">
         <h1>Request Record</h1>

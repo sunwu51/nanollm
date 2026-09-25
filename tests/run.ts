@@ -25,6 +25,7 @@ import {
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/auth.js";
 import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/config.js";
 import { renderAdminConfigPage } from "../src/admin-config-page.js";
+import { buildModelTestRequest, extractModelTestReply } from "../src/model-test.js";
 import { ConfigManager } from "../src/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
@@ -4890,6 +4891,7 @@ await runAsync("status page renders fallback group priority panel without top hi
   assert.match(html, /"fallbackGroups":\[\{"name":"group-a","members":\["beta","alpha"\]\}\]/);
   assert.match(html, /renderFallbackGroups/);
   assert.match(html, /class="layout"/);
+  assert.match(html, /<a class="back-admin" href="\/admin">/);
   assert.match(html, /fetch\("\/status\/data"/);
   assert.doesNotMatch(html, /AUTH_TOKEN_KEY = "nanollmAuthToken"/);
   assert.doesNotMatch(html, /sessionStorage\.setItem\(/);
@@ -4923,6 +4925,9 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /复制合并 JSON/);
   assert.match(html, /createReplayControls/);
   assert.match(html, /\/record\/" \+ encodeURIComponent\(record\.requestId\) \+ "\/replay"/);
+  assert.match(html, /\.recent-key\.active \{/);
+  assert.match(html, /<a class="back-admin" href="\/admin">/);
+  assert.match(html, /selectedRequestId = requestId;\s*markActiveRecent\(\);/);
   assert.match(html, /Sensitive client headers are not replayed; provider auth uses current config\./);
   assert.match(html, /Replay disabled while in progress/);
   assert.match(html, /Replay created new record/);
@@ -4985,6 +4990,40 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.doesNotMatch(html, /停止采样/);
 });
 
+run("model test builds provider-native streaming requests", () => {
+  const chat = buildModelTestRequest("openai-chat", "alpha", "hi");
+  assert.equal(chat.path, "/v1/chat/completions");
+  assert.deepEqual(chat.body, { model: "alpha", messages: [{ role: "user", content: "hi" }], stream: true });
+  const responses = buildModelTestRequest("openai-responses", "beta", "hi");
+  assert.equal(responses.path, "/v1/responses");
+  assert.equal(responses.body.stream, true);
+  assert.deepEqual(responses.body.input, [{ role: "user", content: [{ type: "input_text", text: "hi" }] }]);
+  const anthropic = buildModelTestRequest("anthropic", "gamma", "hi");
+  assert.equal(anthropic.path, "/v1/messages");
+  assert.equal(anthropic.body.max_tokens, 1024);
+  assert.throws(() => buildModelTestRequest("openai-image", "img", "hi"), /not supported/);
+});
+
+run("model test extracts reply text from client SSE bodies", () => {
+  const sse = (events: unknown[]) => events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+  assert.equal(extractModelTestReply("openai-chat", sse([
+    { choices: [{ delta: { role: "assistant" } }] },
+    { choices: [{ delta: { content: "o" } }] },
+    { choices: [{ delta: { content: "k" } }] },
+  ]) + "data: [DONE]\n\n"), "ok");
+  assert.equal(extractModelTestReply("openai-responses", sse([
+    { type: "response.created", response: { model: "m" } },
+    { type: "response.reasoning_summary_text.delta", delta: "think" },
+    { type: "response.output_text.delta", delta: "o" },
+    { type: "response.output_text.delta", delta: "k" },
+  ])), "ok");
+  assert.equal(extractModelTestReply("anthropic", sse([
+    { type: "message_start", message: { model: "m" } },
+    { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hmm" } },
+    { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "ok" } },
+  ])), "ok");
+});
+
 run("admin page relies on server cookie auth instead of client-side token storage", () => {
   const html = renderAdminConfigPage({
     version: 1,
@@ -5033,6 +5072,10 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.match(html, /connection_mode/);
   assert.match(html, /model\.connection_mode === "custom"/);
   assert.match(html, /previousName\) \{/);
+  assert.match(html, /function openModelTestDialog/);
+  assert.match(html, /"\/admin\/models\/" \+ encodeURIComponent\(name\) \+ "\/test"/);
+  assert.match(html, /getEffectiveModelProvider\(model\) !== "openai-image"/);
+  assert.match(html, /你只需要回复ok/);
   assert.match(html, /删除供应商/);
   assert.match(html, /不能覆盖 name\/provider\/base_url\/api_key\/model/);
   assert.match(html, /"image":false/);

@@ -20,6 +20,7 @@ import { renderStatusPage } from "./src/status-page.js";
 import { SqliteUsageStore, UsageStore, addLocalDays, formatLocalDay, getUsageYears, parseLocalDay, type UsageStoreLike } from "./src/usage.js";
 import { renderRecordPage } from "./src/record-page.js";
 import { renderAdminConfigPage } from "./src/admin-config-page.js";
+import { buildModelTestRequest, DEFAULT_MODEL_TEST_MESSAGE, extractModelTestReply } from "./src/model-test.js";
 import { getHTTPLogLevel, shouldEmitLog } from "./src/http-log.js";
 import { buildJsonResponse, buildNonStreamResponse } from "./src/response-compression.js";
 import {
@@ -676,6 +677,47 @@ async function replayRecordedRequest(record: RecordEntry, config: ServerConfig) 
     status: response.status,
     body,
     requestId: replayRequestId,
+  };
+}
+
+const MODEL_TEST_RAW_LIMIT = 20000;
+
+async function testConfiguredModel(name: string, message: string, config: ServerConfig) {
+  const model = resolveModel(config, name);
+  if (!model) {
+    return { ok: false as const, status: 404, error: `模型 '${name}' 不在当前生效的配置中，请先保存配置。` };
+  }
+  if (model.provider === "openai-image") {
+    return { ok: false as const, status: 400, error: "openai-image 模型不支持消息测试。" };
+  }
+
+  const { path, body } = buildModelTestRequest(model.provider, model.name, message);
+  const headers = new Headers({ "content-type": "application/json", "user-agent": "nanollm-admin-model-test" });
+  if (config.auth?.token) headers.set("authorization", `Bearer ${config.auth.token}`);
+
+  const requestId = createRequestId();
+  const started = Date.now();
+  const response = await runWithRequestId(requestId, async () => app.fetch(new Request(`http://127.0.0.1:${config.port}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  })));
+  const raw = await response.text();
+  const durationMs = Date.now() - started;
+  const isStream = (response.headers.get("content-type") ?? "").includes("text/event-stream");
+  const reply = response.ok && isStream ? extractModelTestReply(model.provider, raw) : "";
+  const errorBody = response.ok ? undefined : (raw ? tryParseJSON(raw) : null);
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    requestId,
+    provider: model.provider,
+    upstreamModel: model.model,
+    durationMs,
+    reply,
+    error: response.ok ? undefined : (errorBody?.error?.message ?? errorBody?.error ?? `HTTP ${response.status}`),
+    raw: raw.length > MODEL_TEST_RAW_LIMIT ? raw.slice(0, MODEL_TEST_RAW_LIMIT) + "\n...(truncated)" : raw,
   };
 }
 
@@ -1379,6 +1421,17 @@ app.get("/admin/config", (c) => {
   return c.redirect(target, 302);
 });
 app.get("/admin/config/data", (c) => c.json(buildConfigAdminPayload()));
+app.post("/admin/models/:name/test", async (c) => {
+  let body: { message?: unknown } = {};
+  try { body = await c.req.json(); } catch {}
+  const message = typeof body.message === "string" && body.message.trim() ? body.message : DEFAULT_MODEL_TEST_MESSAGE;
+  try {
+    const result = await testConfiguredModel(c.req.param("name"), message, configManager.getActiveSnapshot().effectiveConfig);
+    return c.json(result, result.ok ? 200 : result.status);
+  } catch (error) {
+    return c.json({ ok: false, error: error instanceof Error ? error.message : String(error) }, 500);
+  }
+});
 app.post("/admin/config/apply", async (c) => {
   let body: { config?: unknown; baseVersion?: unknown };
   try {

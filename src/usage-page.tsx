@@ -27,7 +27,8 @@ export const USAGE_STYLE = /* css */ String.raw`
         --usage-level-2: #40c463;
         --usage-level-3: #30a14e;
         --usage-level-4: #216e39;
-        --usage-blue: #0969da;
+        --usage-accent: #8c5a2f;
+        --usage-accent-soft: rgba(140, 90, 47, 0.1);
         --usage-shadow: var(--shadow, 0 18px 48px rgba(74, 53, 26, 0.14));
         color: var(--usage-text);
       }
@@ -176,6 +177,7 @@ export const USAGE_STYLE = /* css */ String.raw`
       .usage-years {
         display: grid;
         gap: 8px;
+        padding-top: 52px;
       }
       .usage-year-link {
         display: block;
@@ -186,12 +188,12 @@ export const USAGE_STYLE = /* css */ String.raw`
         font-size: 14px;
       }
       .usage-year-link:hover {
-        color: var(--usage-text);
-        background: rgba(208, 215, 222, 0.35);
+        color: var(--usage-accent);
+        background: var(--usage-accent-soft);
       }
       .usage-year-link.active {
-        background: var(--usage-blue);
-        color: #fff;
+        background: var(--usage-accent);
+        color: #fff9f1;
         font-weight: 600;
       }
       .usage-tooltip {
@@ -237,6 +239,7 @@ export const USAGE_STYLE = /* css */ String.raw`
         .usage-years {
           display: flex;
           overflow-x: auto;
+          padding-top: 0;
         }
         .usage-year-link {
           min-width: 82px;
