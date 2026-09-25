@@ -2589,7 +2589,7 @@ run("chat medium reasoning maps to anthropic adaptive thinking", () => {
     messages: [{ role: "user", content: "hi" }],
   });
 
-  assert.equal(anthropic.max_tokens, 10240);
+  assert.equal(anthropic.max_tokens, 32000);
   assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
 });
 
