@@ -582,13 +582,13 @@ async function buildUsagePayload(c: Context | undefined, config: ServerConfig, o
   const queryYear = selectedYear ?? new Date(now).getFullYear();
   const range = normalizeUsageDayRange(c?.req.query("start"), c?.req.query("end"), queryYear, selectedRange, now);
   const modelQuery = c?.req.query("model") || undefined;
-  const modelNames = config.models.map((model) => model.name);
+  const configuredModels = new Map(config.models.map((model) => [model.name, model]));
+  const historicalModelNames = await usageStore.listModelNames(range);
+  const modelNames = [...new Set([...config.models.map((model) => model.name), ...historicalModelNames])].sort();
   const selectedModel = modelQuery && modelNames.includes(modelQuery) ? modelQuery : undefined;
-  const pricedModels = selectedModel
-    ? config.models.filter((model) => model.name === selectedModel)
-    : config.models;
-  const modelUsage = await Promise.all(pricedModels.map(async (model) => {
-    const days = await usageStore.listDays({ ...range, modelName: model.name });
+  const usageModelNames = selectedModel ? [selectedModel] : modelNames;
+  const modelUsage = await Promise.all(usageModelNames.map(async (modelName) => {
+    const days = await usageStore.listDays({ ...range, modelName });
     const metrics = days.reduce((total, day) => ({
       day: range.end,
       totalRequests: total.totalRequests + day.totalRequests,
@@ -602,7 +602,7 @@ async function buildUsagePayload(c: Context | undefined, config: ServerConfig, o
       outputTokens: total.outputTokens + day.outputTokens,
       totalTokens: total.totalTokens + day.totalTokens,
     }));
-    return { name: model.name, upstreamModel: model.model, metrics };
+    return { name: modelName, upstreamModel: configuredModels.get(modelName)?.model ?? modelName, metrics };
   }));
 
   return {

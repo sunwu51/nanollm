@@ -4829,6 +4829,7 @@ await runAsync("usage store aggregates daily attempts, success usage, and failur
   assert.equal(alpha.successRequests, 1);
   assert.equal(alpha.failureRequests, 1);
   assert.equal(alpha.totalTokens, 175);
+  assert.deepEqual(await store.listModelNames({ start: day, end: day }), ["alpha", "beta"]);
 });
 
 await runAsync("sqlite usage store persists daily aggregates and supports dense range queries", async () => {
@@ -4864,6 +4865,7 @@ await runAsync("sqlite usage store persists daily aggregates and supports dense 
     assert.equal(range[0].totalRequests, 0);
     assert.equal(range[1].day, "2026-01-02");
     assert.equal(range[1].totalRequests, 2);
+    assert.deepEqual(await restarted.listModelNames({ start: "2026-01-01", end: "2026-01-03" }), ["alpha"]);
   } finally {
     db.close();
     removeTestDir(dir);
