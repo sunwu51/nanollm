@@ -58,7 +58,8 @@ import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
 import { shouldIgnoreStreamReadError } from "./src/stream-errors.js";
 import { handleServerStartupError } from "./src/startup-error.js";
-import { openSqliteStorage } from "./src/sqlite.js";
+import { installGracefulShutdown } from "./src/shutdown.js";
+import { openSqliteStorage, waitForClientWrites } from "./src/sqlite.js";
 import { buildAdminConfigForm, buildAdminConfigFormFromEffectiveConfig, buildYamlTextFromAdminForm, type AdminConfigForm } from "./src/admin-config-form.js";
 import { extractErrorCauses, formatErrorWithCauses } from "./src/error-details.js";
 import { bootstrapSubscriptionProviders, configureSubscriptionStorage, fetchSubscriptionModels, fetchSubscriptionUsage, getCachedSubscriptionCredential, pollDeviceLogin, resetSubscriptionUsage, startDeviceLogin } from "./src/openai-subscription.js";
@@ -147,6 +148,14 @@ const apiCors = cors({
   origin: "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
   allowHeaders: ["Content-Type", "Authorization"],
+});
+
+app.use("*", async (c, next) => {
+  if (shutdown.isShuttingDown()) {
+    c.header("Connection", "close");
+    return c.json({ error: "Server is shutting down" }, 503);
+  }
+  return next();
 });
 
 app.use("*", async (c, next) => {
@@ -1440,10 +1449,17 @@ server.once("error", (error: Error & { code?: string }) => {
   });
 });
 
-server.once("close", () => {
-  configManager.dispose();
-  void flushRecording();
-  sqliteStorage?.client.close();
+const shutdown = installGracefulShutdown({
+  server,
+  stopBackgroundWork: () => configManager.dispose(),
+  cleanup: async () => {
+    if (sqliteStorage) await waitForClientWrites(sqliteStorage.client);
+    await flushRecording();
+    if (sqliteStorage) {
+      await waitForClientWrites(sqliteStorage.client);
+      sqliteStorage.client.close();
+    }
+  },
 });
 
 export { server };
