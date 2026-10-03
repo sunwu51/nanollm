@@ -5299,6 +5299,68 @@ await runAsync("record store deduplicates image data URLs and restores them for 
   await stopRecording();
 });
 
+await runAsync("record store compacts generated images in responses and image_generation_call inputs", async () => {
+  await startRecording({ maxSize: 3 });
+  const base64 = "c".repeat(1024 * 256);
+  const dataUrl = `data:image/webp;base64,${base64}`;
+  const generated = { id: "ig_1", type: "image_generation_call", status: "completed", output_format: "webp", result: base64 };
+
+  const jsonRequestId = "image004-1234-5678-9abc-def012345678";
+  beginRecordedRequest({
+    requestId: jsonRequestId,
+    path: "/v1/responses",
+    headers: {},
+    body: { model: "alpha", input: [{ role: "user", content: "draw" }, generated] },
+    stream: false,
+  });
+  ensureRecordedAttempt({
+    requestId: jsonRequestId,
+    index: 1,
+    provider: "openai-responses",
+    modelName: "alpha",
+    url: "https://example.com/v1/responses",
+    requestHeaders: {},
+    requestBody: JSON.stringify({ model: "upstream-alpha", input: [generated] }),
+  });
+  setRecordedAttemptResponseBody({ requestId: jsonRequestId, index: 1, body: JSON.stringify({ output: [generated] }) });
+  setRecordedClientResponseBody({ requestId: jsonRequestId, body: { output: [generated] } });
+  finalizeRecordedRequest({ requestId: jsonRequestId });
+
+  const compactJson = await getRecordedRequest(jsonRequestId);
+  const requestRef = (compactJson?.clientRequest.body as any).input[1].result;
+  assert.equal(requestRef.mediaType, "image/webp");
+  assert.equal(requestRef.base64Only, true);
+  assert.equal(await getRecordedImage(requestRef.__nanollm_record_image_ref), dataUrl);
+  assert.equal((compactJson?.attempts[0].request.body as any).input[0].result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  assert.equal((compactJson?.attempts[0].response.body as any).output[0].result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  assert.equal((compactJson?.clientResponse.body as any).output[0].result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  const replayable = await getRecordedRequest(jsonRequestId, { hydrateImages: true });
+  assert.equal((replayable?.clientRequest.body as any).input[1].result, base64);
+
+  const streamRequestId = "image005-1234-5678-9abc-def012345678";
+  beginRecordedRequest({ requestId: streamRequestId, path: "/v1/responses", headers: {}, body: { model: "alpha", stream: true }, stream: true });
+  const partial = { type: "response.image_generation_call.partial_image", output_format: "webp", partial_image_b64: "d".repeat(4096) };
+  const sse = [
+    `event: response.image_generation_call.partial_image\r\ndata: ${JSON.stringify(partial)}\r\n\r\n`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", item: generated })}\n\n`,
+    `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { output: [generated] } })}\n\n`,
+  ].join("");
+  for (let offset = 0; offset < sse.length; offset += 7000) {
+    appendRecordedClientResponseBody({ requestId: streamRequestId, chunk: sse.slice(offset, offset + 7000) });
+  }
+  finalizeRecordedRequest({ requestId: streamRequestId });
+
+  const streamed = String((await getRecordedRequest(streamRequestId))?.clientResponse.body);
+  assert.doesNotMatch(streamed, /cccccccc|dddddddd/);
+  assert.match(streamed, /event: response\.image_generation_call\.partial_image\r\ndata: \{.*\}\r\n\r\n/);
+  const events = streamed.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => JSON.parse(line.slice(5)));
+  assert.equal(events.length, 3);
+  assert.equal(await getRecordedImage(events[0].partial_image_b64.__nanollm_record_image_ref), `data:image/webp;base64,${partial.partial_image_b64}`);
+  assert.equal(events[1].item.result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  assert.equal(events[2].response.output[0].result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  await stopRecording();
+});
+
 await runAsync("record summary keeps fallback actual model and failure status", async () => {
   await startRecording();
   const requestId = "fedcba98-7654-3210-abcd-ef1234567890";
@@ -5463,6 +5525,21 @@ await runAsync("sqlite record store restores compacted images after restart", as
     assert.equal(await getRecordedImage(compactImage.__nanollm_record_image_ref), image);
     const replayable = await getRecordedRequest(requestId, { hydrateImages: true });
     assert.equal((replayable?.clientRequest.body as any).input[0].content[0].image_url, image);
+
+    const streamRequestId = "image006-1234-5678-9abc-def012345678";
+    const generated = { type: "image_generation_call", output_format: "png", result: "e".repeat(1024 * 64) };
+    beginRecordedRequest({ requestId: streamRequestId, path: "/v1/responses", headers: {}, body: { model: "alpha", stream: true }, stream: true });
+    appendRecordedClientResponseBody({ requestId: streamRequestId, chunk: `data: ${JSON.stringify({ type: "response.output_item.done", item: generated })}\n\n` });
+    finalizeRecordedRequest({ requestId: streamRequestId });
+    await stopRecording();
+    db.close();
+
+    db = createTestSqliteClient(dbPath);
+    useSqliteRecordStore(db);
+    await startRecording({ maxSize: 2 });
+    const streamed = String((await getRecordedRequest(streamRequestId))?.clientResponse.body);
+    const ref = JSON.parse(streamed.trim().slice(5)).item.result.__nanollm_record_image_ref;
+    assert.equal(await getRecordedImage(ref), `data:image/png;base64,${generated.result}`);
   } finally {
     useMemoryRecordStore();
     db.close();
