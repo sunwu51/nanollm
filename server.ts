@@ -63,7 +63,7 @@ import { installGracefulShutdown } from "./src/core/shutdown.js";
 import { JobConfigStore } from "./src/jobs/jobs.js";
 import { MemoryJobRunStore, SqliteJobRunStore } from "./src/jobs/job-run-store.js";
 import { JobScheduler } from "./src/jobs/job-scheduler.js";
-import { modelRequestExecutor } from "./src/jobs/job-executor.js";
+import { createModelRequestExecutor } from "./src/jobs/job-executor.js";
 import { createJobRoutes } from "./src/jobs/job-routes.js";
 import { renderJobsPage } from "./src/jobs/jobs-page.js";
 import { openSqliteStorage, waitForClientWrites } from "./src/storage/sqlite.js";
@@ -245,22 +245,28 @@ const jobModelCatalog = new JobModelCatalog(() => configManager.getActiveSnapsho
   const headers: Record<string, string> = {}; applyClaudeSubscriptionHeaders(headers);
   return fetchClaudeSubscriptionModels(provider.name, provider.proxy, headers);
 });
+// Scheduled jobs call the gateway's own /v1 routes in-process, so they are recorded and counted in
+// status/usage exactly like client requests. The job's catalog-resolved model (possibly a
+// `subscription:` name that /v1 cannot look up) is pinned to the request id for getCandidateModels.
+const jobRequestModels = new Map<string, ModelConfig>();
+const jobRequestExecutor = createModelRequestExecutor(async (model, request) => {
+  const config = configManager.getActiveSnapshot().effectiveConfig;
+  const requestId = getRequestId() ?? createRequestId();
+  const headers = new Headers({ "content-type": "application/json" });
+  if (!model.subscription_provider && !model.claude_subscription_provider) headers.set("user-agent", "nanollm-scheduled-job");
+  if (config.auth?.token) headers.set("authorization", `Bearer ${config.auth.token}`);
+  jobRequestModels.set(requestId, model);
+  try {
+    return await app.fetch(new Request(`http://127.0.0.1:${config.port}${request.path}`, { method: "POST", headers, body: JSON.stringify(request.body) }));
+  } finally {
+    jobRequestModels.delete(requestId);
+  }
+});
 const jobScheduler = new JobScheduler(jobConfigStore, jobRunStore,
   () => configManager.getActiveSnapshot().effectiveConfig.models,
-  [{ ...modelRequestExecutor, execute: async (job, model, signal) => {
-    const started = Date.now();
-    return runWithRequestId(createRequestId(), async () => {
-      recordModelAttempt(model.name, started);
-      try {
-        const result = await modelRequestExecutor.execute(job, model, signal);
-        recordModelSuccess(model.name, Date.now() - started, result.metrics?.ttfb_ms, result.metrics?.usage, started);
-        return result;
-      } catch (error) {
-        recordModelFailure(model.name, Date.now() - started, started);
-        throw error;
-      }
-    });
-  } }], Date.now, 2, name => jobModelCatalog.resolve(name));
+  // The whole execution, including reading the stream, stays in the request context so the record is finalized under this id.
+  [{ ...jobRequestExecutor, execute: (job, model, signal, context) => runWithRequestId(context?.requestId ?? createRequestId(), () => jobRequestExecutor.execute(job, model, signal)) }],
+  Date.now, 2, name => jobModelCatalog.resolve(name));
 await jobScheduler.initialize();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
@@ -356,6 +362,8 @@ function orange(message: string): string {
 }
 
 function getCandidateModels(config: ServerConfig, primaryModel: string): ModelConfig[] {
+  const pinned = jobRequestModels.get(getRequestId() ?? "");
+  if (pinned?.name === primaryModel) return [pinned];
   const now = Date.now();
   const isFallbackGroup = primaryModel in config.fallback;
   if (isFallbackGroup) {

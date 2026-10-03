@@ -28,7 +28,7 @@ docs/                Reference docs
 3. `proxy/proxy` calls the upstream. Subscription providers obtain tokens and headers through `subscriptions/*`.
 4. The response (or SSE stream) is converted back (`converters/responses`, `converters/streams`) and returned, with errors shaped by `core/error-details` and `core/stream-errors`.
 5. `storage/record`, `storage/status` and `storage/usage` persist what happened. `pages/*` render it.
-6. `jobs/*` runs the same upstream path on a cron schedule using `proxy/proxy` and stores results through `jobs/job-run-store`.
+6. `jobs/*` runs model requests on a cron schedule. `server.ts` gives the job executor a sender that calls the app's own `/v1` routes in-process, so job calls go through steps 1-5 (recording, status, usage) like client requests. The job's resolved model is pinned to the request id, so `subscription:` targets work without being exposed to `/v1` clients. Results are stored through `jobs/job-run-store`, and each attempt keeps its `request_id` for linking to the record.
 
 ## Modules
 
@@ -40,7 +40,7 @@ docs/                Reference docs
 | `subscriptions` | `openai-subscription`, `claude-subscription`, `claude-subscription-body`, `claude-billing`, `codex-version`, `subscription-client-compat`, `oauth-transport` | OAuth credential storage/refresh, client identity constants, Claude body transform, Rust helper transport |
 | `storage` | `sqlite`, `record`, `status`, `usage` | libsql client with write queue, request records, status buckets, usage by day |
 | `jobs` | `jobs`, `job-run-store`, `job-executor`, `job-scheduler`, `job-routes`, `job-model-catalog`, `jobs-page` | Job config store, run history, executor, cron scheduler, HTTP routes, model name resolution, page |
-| `pages` | `admin-config-page`, `admin-config-form`, `record-page`, `status-page`, `usage-page` | HTML renderers and admin form payload handling |
+| `pages` | `admin-config-page`, `admin-config-form`, `record-page`, `status-page`, `usage-page`, `logo` | HTML renderers, admin form payload handling, and the shared logo/favicon (`assets/logo.svg`) |
 
 ## Dependency rules
 

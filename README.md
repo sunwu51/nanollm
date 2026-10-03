@@ -1,59 +1,83 @@
+<div align="center">
+
+<img src="assets/logo.svg" alt="nanollm" width="96" height="96" />
+
 # nanollm
 
-一个类似`litellm`的llm模型代理服务，主打一个轻量和本地化，适合个人本地聚合多个模型的场景。
+**A lightweight, local-first LLM gateway: one endpoint for all your model providers**
+
+Compatible with OpenAI Chat / Responses, Anthropic Messages and the OpenAI image API, with fallback groups, Codex / Claude subscriptions, usage statistics and scheduled model jobs.
+
+[![npm version](https://img.shields.io/npm/v/nanollm?color=7c5cff)](https://www.npmjs.com/package/nanollm)
+[![npm downloads](https://img.shields.io/npm/dm/nanollm?color=14b8a6)](https://www.npmjs.com/package/nanollm)
+[![license](https://img.shields.io/npm/l/nanollm)](package.json)
+[![GitHub stars](https://img.shields.io/github/stars/sunwu51/nanollm?style=social)](https://github.com/sunwu51/nanollm)
+
+**English** · [简体中文](README-cn.md)
+
+[Features](#features) · [Quick start](#quick-start) · [Full config](#full-configuration-example) · [Web UI](#web-ui) · [Deployment](#deployment) · [Architecture](docs/architecture.md)
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/nanollm)
 
-支持的功能：
-- 1 可以配置`chat/completions`(下面称chat)、`responses`、`messages`三种文本接口，以及 OpenAI 图片`images/generations`和`images/edits`接口（暂不支持google接口）的模型供应商，并且同时对外暴露这些接口，带`/v1`前缀。
-- 2 可以配置修改请求中的`headers`和`body`，传自定义数据，其中`body`支持深度合并。
-- 3 可以配置兜底方案，设置兜底分组，如果调用的模型下游接口失败，并且在某个分组中，则会尝试分组其他模型。
-- 4 支持配置文件热更新和本地管理页：`models`、`fallback`、`server.ttfb_timeout`、`record.max_size` 保存后立即生效，`server.port` 和 `server.auth.token` 写回后需重启进程。
+</div>
 
-## Configure
+---
 
-### 定时模型任务
+nanollm is a `litellm`-like proxy for LLM APIs. It stays small and runs locally, which makes it a good fit for aggregating several model providers on your own machine.
 
-在 `/admin` 点击 **/jobs**，或打开 `/jobs`，新建任务、选择具体模型、填写一条用户消息及五段 cron。调度时区需要明确指定；页面可预览未来 5 次运行时间。Pelican 和简单回复是可编辑的快捷模板，不是固定的任务类型。
+## Features
 
-任务配置保存在主配置旁的 `jobs.yaml`，两种存储模式都使用这个文件。文件不存在时没有任务，首次保存时创建；手动修改会自动加载。文件格式错误时暂停后续调度并在页面提示，修复后恢复，正在运行的任务继续使用自己的配置快照。保存、启用任务不会立即调用模型；首次执行按照下一次 cron 时间，也可点击 **立即运行**。
+- **Multiple protocols**: configure providers for `chat/completions` (chat), `responses` and `messages` text APIs plus the OpenAI image APIs (`images/generations`, `images/edits`), and expose all of them under the `/v1` prefix. The three text protocols are converted into each other; see [docs/converters.md](docs/converters.md). Google APIs are not supported yet.
+- **Request rewriting**: modify request `headers` and `body` (the body is deep-merged), or use `body_expression` / `response_expression` for dynamic rewriting.
+- **Fallback groups**: if the model you call fails upstream and belongs to a fallback group, the other members of the group are tried.
+- **Subscription providers**: use an OpenAI Codex subscription or a Claude Pro/Max subscription as a provider after logging in from the admin page.
+- **Hot reload and admin page**: `/admin` is a form-based config editor with model connectivity tests and upstream model listing. `models`, `fallback`, `server.ttfb_timeout` and `record.max_size` apply immediately after saving; `server.port` and `server.auth.token` are written back and need a restart.
+- **Monitoring and usage**: `/status` shows model health and daily token usage; `/record` keeps recent requests and can replay them, which is very useful for debugging.
+- **Scheduled model jobs**: `/jobs` calls several models on a cron schedule, stores the outputs, and supports history comparison and manual review.
+- **Optional persistence**: in-memory by default; `--storage sqlite` uses a local SQLite file or a remote libSQL/quicSQL service.
+- **Security and operations**: optional Bearer key auth, graceful shutdown on SIGTERM/SIGINT, Docker / Railway deployment and per-platform binaries.
+
+## Quick start
+
+**1. Create a minimal config.** Create `config.yaml` with just a port. No providers or models are needed up front:
 
 ```yaml
-version: 1
-jobs:
-  - id: hourly-pelican
-    name: 每小时 Pelican 绘图
-    enabled: true
-    type: model_request
-    schedule:
-      cron: "0 * * * *"
-      timezone: Asia/Singapore
-    models: [my-text-model] # config.yaml 中已保存的具体文本模型名称
-    request:
-      message: >
-        Generate an SVG animation embedded in HTML of a pelican riding a bicycle.
-        Return only the code, with no explanation.
-    execution:
-      timeout_ms: 300000
-      overlap_policy: skip
-      max_attempts: 1
-      max_output_bytes: 262144
-    retention:
-      max_runs: 24
+server:
+  port: 3000
 ```
 
-执行器按模型自身协议构造一条 user 消息并管理流式请求。模型调用直接使用所选连接，不走 fallback；支持已配置的文本模型及 OpenAI、Claude 订阅供应商目录中的模型。订阅模型无需额外写入 config.yaml，目录加载错误会在表单提示。模型上的 body、headers、表达式等现有覆盖配置继续生效。任务请求消耗供应商额度，计入模型调用状态与用量统计。
+**2. Start it.**
 
-- **memory（默认）**：执行记录、原始文本作品、审核标记及备注保存在内存。重启后清空，Job 配置保留。每任务默认保留最近 24 条已结束记录；全部任务历史另有 64 MiB 内存上限，达到上限时清理最旧的已结束记录。正在执行的记录不参与清理。
-- **SQLite**：新增 `job_runs` 表，保留规则同样按每任务的 `max_runs` 执行，作品随记录一起保存和淘汰。重启保留历史，将未结束记录标记为 interrupted。记录按 jobs.yaml 的绝对路径隔离，使用相同路径才能恢复对应历史。
+```bash
+npx nanollm@latest --config /path/to/config.yaml
+```
 
-每个任务包含 1–20 个具体模型，单模型输出默认最多 256 KiB，可设置 1–1024 KiB。保留次数可设置 1–168；最多尝试 1–5 次，超时可设置 1 秒至 1 小时。输出截断或超过大小限制不自动重试，其他调用失败按照配置重试，可能产生额外费用。
+If there is a `config.yaml` in the current directory you can simply run `npx nanollm`; the path can also be set with the `CONFIG_PATH` environment variable. The npm package does not ship a config file, so you need to create your own.
 
-第一版用于单实例部署，最多同时运行 2 个任务，同一模型连接串行调用。上次任务未结束时跳过新的定时触发；资源繁忙时，其他到期任务等待可用位置。停用只停止后续调度，取消当前运行是单独操作；重启不补停机期间的任务。
+**3. Configure in the admin page.** Open `http://localhost:3000/admin` and add providers, models, fallback groups and so on. Clicking "Save and apply" takes effect immediately and **writes the result back to `config.yaml`**, so you never have to edit the file by hand (hand edits are still picked up automatically). Before exposing the service beyond your machine, set up [Bearer key authentication](#bearer-key-authentication).
 
-页面支持任务列表、编辑、执行历史、多模型结果、HTML/SVG 隔离预览、原始代码及历史并排对比。人工审核支持“待审核 / 正常 / 疑似异常”和备注，仅供展示，不改变路由、fallback 或调度。Pelican 作品不自动评分，调用失败单独显示。删除任务默认保留历史，也可选择同时删除记录、作品与审核信息。
+**4. Call it.** Once models are configured they are available through these endpoints:
 
-Example:
+| Endpoint | Description |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI Chat API |
+| `POST /v1/responses` | OpenAI Responses API |
+| `POST /v1/messages` | Anthropic Messages API |
+| `POST /v1/images/generations`, `/v1/images/edits` | OpenAI image APIs (passed through as is) |
+| `POST /v1/alpha/search` (and `/alpha/search`) | Codex alpha search passthrough; only the `model` field is rewritten and expressions do not apply |
+| `GET /v1/models` | Models exposed by the gateway |
+| `/admin`, `/status`, `/record`, `/jobs` | Config admin, monitoring and usage, request records, scheduled jobs |
+| `GET /health` | Health check (never requires auth) |
+
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "content-type: application/json" \
+  -d '{"model":"glm5.1","messages":[{"role":"user","content":"hello"}]}'
+```
+
+## Full configuration example
+
+Beyond the minimal config above, every option can be written in `config.yaml` (and edited in `/admin`). Below is a full example covering the common scenarios; you do not need to copy it all, just take what you need:
 
 ```yaml
 server:
@@ -64,38 +88,37 @@ record:
   max_size: 100 # optional, default 10
 
 providers:
-  # 普通共享供应商：集中保存协议、地址和 API Key
-  # 也可以不配置providers直接在model中指定base_url和api_key
+  # Shared provider: keeps protocol, URL and API key in one place.
+  # You can also skip providers and set base_url and api_key on each model.
   - name: deepseek
     provider: openai-chat
     base_url: https://api.deepseek.com/v1
     api_key: ${DEEPSEEK_API_KEY}
 
-  # OpenAI Codex 订阅：不配置 base_url 和 api_key
+  # OpenAI Codex subscription: no base_url or api_key
   - name: codex-subscription
     provider: openai-subscription
 
-  # Claude Pro/Max 订阅：不配置 base_url 和 api_key，在 /admin 登录
+  # Claude Pro/Max subscription: no base_url or api_key, log in from /admin
   - name: claude-subscription
     provider: claude-subscription
 
 models:
   - name: gpt-5.4-a
-    # responses规范
+    # responses protocol
     provider: openai-responses
     base_url: https://example.com/v1
     api_key: YOUR_KEY1
     model: openai/gpt-5.4
 
   - name: gpt-5.4-b
-    # responses规范
     provider: openai-responses
     base_url: https://example.com/v1
     api_key: YOUR_KEY1
     model: openai/gpt-5.4
-      
+
   - name: glm5.1
-    # chat/completions规范
+    # chat/completions protocol
     provider: openai-chat
     base_url: https://example.com/v1
     api_key: YOUR_KEY2
@@ -118,17 +141,17 @@ models:
           updatedAt: Date.now()
         }))
       })
-  
+
   - name: claude-sonnet-4-6
-    # messages规范
+    # messages protocol
     provider: anthropic
     base_url: https://example.com/v1
     api_key: ${YOUR_KEY3_FROM_ENV_VAR}
     model: claude-sonnet-4-6
-    ignore_invalid_history: true # optional, default true; Anthropic转换时丢弃空signature的thinking历史
+    ignore_invalid_history: true # optional, default true; drop thinking blocks with an empty signature when converting to Anthropic
 
   - name: gpt-image-1
-    # OpenAI 图片接口规范（images/generations、images/edits）
+    # OpenAI image API (images/generations, images/edits)
     provider: openai-image
     base_url: https://example.com/v1
     api_key: YOUR_KEY4
@@ -148,22 +171,9 @@ fallback:
     - gpt-5.4-b
     - glm5.1
 ```
-Run the proxy server:
-```bash
-npx nanollm --config /path/to/config.yaml
-```
 
-### 二进制打包说明
+The models exposed by the gateway are every `models[i].name` plus every fallback group name. The example above exposes eight models:
 
-GitHub release 按平台提供压缩包。每个压缩包同时包含 nanollm 主程序和 `nanollm-oauth-transport`，解压后必须将两个可执行文件放在同一目录运行。Rust helper 用于 OpenAI subscription 的 OAuth 请求。
-
-npm 发布包包含 Windows x64、Linux x64 和 macOS arm64 三个平台的 helper，`npx nanollm@<version>` 会根据当前平台自动选择。发布工作流会先安装生成的 tarball，确认 helper 路径可解析并完成服务健康检查；配置了仓库 secret `NPM_TOKEN` 时，验证通过的 tarball 会自动发布到 npm。直接从源码运行 `npm publish` 时也会检查三个 helper 是否齐全，避免发布残缺包。
-
-主程序仍使用 `@yao-pkg/pkg` 的 enhanced SEA 模式构建，以兼容当前 `@libsql/client` 在本地 sqlite 模式下对 `@libsql/*` 原生包的动态加载。
-
-`package.json` 里的 `pkg.assets` 显式包含了 `node_modules/@libsql/**/*`，让打包产物在首次运行时可以把对应平台的 `.node` 原生文件解压到本地缓存后再加载；否则独立二进制在 `--storage sqlite` 模式下会报 `Cannot find module '@libsql/<platform>'`。
-
-对外提供的模型为所有`models[i].name`和`fallback.[group_name]`例如上面demo配置就提供了
 ```
 gpt-5.4-a
 gpt-5.4-b
@@ -174,45 +184,14 @@ deepseek-shared
 codex-subscription-model
 gpt-5.4
 ```
-这样8个模型，其中`gpt-5.4`是兜底分组名，当使用这个模型的时候，会在下属列表的模型中寻找可用的模型，尝试顺序为按`max(0, 最近5min失败次数-1)`升序；如果分数相同，则保持配置里的原始顺序。
 
-### Bearer Key 认证
+`gpt-5.4` is a fallback group. When it is requested, the members are tried in ascending order of `max(0, failures in the last 5 minutes - 1)`; members with the same score keep their configured order. Values written as `${ENV_NAME}` are replaced with the environment variable of the same name when the config is loaded.
 
-如果你希望给整个 nanollm 网关加一层访问认证，可以配置：
+## Configuration guide
 
-```yaml
-server:
-  auth:
-    token: ${NANOLLM_AUTH_TOKEN}
-```
+### Shared providers
 
-- `server.auth.token` 为空或不配置时，认证关闭。
-- 运行中，修改 `server.auth.token` 会写回配置文件，但和 `server.port` 一样需要重启进程后才会真正生效。
-- 一旦配置，除了 `/health` 以外，其余入口都要求认证，包括 `/`、`/status`、`/record`、`/admin`、`/v1/models` 和 `/v1/*`。
-- 认证只保护访问 nanollm 本身，不会替代或覆盖 `models[*].api_key`，也不会转发到上游模型供应商。
-
-API 客户端使用标准 Bearer header：
-
-```bash
-curl http://localhost:3000/v1/models \
-  -H "Authorization: Bearer $NANOLLM_AUTH_TOKEN"
-```
-
-如果你用 OpenAI SDK 或兼容客户端，把这个 token 当成访问 nanollm 的 API key 即可。
-
-浏览器打开页面时，可以用一次性 URL token 入口：
-
-```text
-http://localhost:3000/admin?token=YOUR_TOKEN
-http://localhost:3000/status?token=YOUR_TOKEN
-http://localhost:3000/record?token=YOUR_TOKEN
-```
-
-首次用 `?token=` 或 Bearer header 认证成功后，nanollm 会写入同源认证 cookie。之后同一浏览器里直接访问 `/admin`、`/status`、`/record`，以及这些页面内部的 `fetch` 请求，都不需要再重复带 `?token=`。
-
-### 共享供应商配置
-
-多个模型使用相同的协议、上游地址和 API Key 时，可以在顶层 `providers` 中集中配置，然后通过 `models[*].custom_provider` 引用：
+When several models use the same protocol, upstream URL and API key, define them once under top-level `providers` and reference them with `models[*].custom_provider`:
 
 ```yaml
 providers:
@@ -230,18 +209,11 @@ models:
     model: deepseek-reasoner
 ```
 
-`providers[*].name` 必须唯一，引用的供应商必须存在。配置了 `custom_provider` 的模型不需要再写 `provider`、`base_url` 和 `api_key`；运行时会从供应商配置展开这些连接字段。模型自身的其他高级字段仍然按原方式配置。
+`providers[*].name` must be unique and referenced providers must exist. A model with `custom_provider` must not also set `provider`, `base_url` or `api_key`; those fields are expanded from the provider at runtime. All other model fields work as usual. Ordinary shared providers support `openai-chat`, `openai-responses`, `anthropic` and `openai-image`.
 
-两种模型连接方式互斥：
+### OpenAI subscription
 
-- 直接连接：模型配置 `provider`、`base_url`、`api_key`。
-- 共享供应商：模型只配置 `custom_provider`，不能同时配置上述三个直接连接字段。
-
-普通共享供应商的 `provider` 支持 `openai-chat`、`openai-responses`、`anthropic` 和 `openai-image`。
-
-#### OpenAI subscription
-
-Codex 订阅只能在顶层 `providers` 中配置，不能直接写成模型的 `provider`：
+A Codex subscription can only be declared under top-level `providers`, not as a model's `provider`:
 
 ```yaml
 providers:
@@ -254,17 +226,15 @@ models:
     model: gpt-5
 ```
 
-`openai-subscription` 不接受 `base_url` 或 `api_key`。保存配置后，在 `/admin` 展开该供应商并点击“登录”，按页面显示的 Device Code 完成授权。登录成功后，页面会显示“已登录”，并提供“重新登录”和“查询用量”。
+`openai-subscription` accepts neither `base_url` nor `api_key`. After saving the config, expand the provider in `/admin`, click "Login" and finish the Device Code flow shown on the page. Once logged in, the page shows "logged in" with "Re-login" and "Query usage" actions.
 
-凭据以明文 JSON 保存到 `<config.yaml 所在目录>/openai-subscription/<uuid>.json`，内容包含 access token、refresh token、过期时间、账户 ID 和供应商名称等信息。nanollm 会在 token 到期前自动刷新并更新该文件，因此该目录需要限制访问并持久化。
+Credentials are stored as plain JSON in `<directory of config.yaml>/openai-subscription/<uuid>.json` (access token, refresh token, expiry, account ID, provider name). nanollm refreshes the token before it expires and updates the file, so restrict access to that directory and keep it on persistent storage. On Railway with `/data/config.yaml`, the credentials live in `/data/openai-subscription/<uuid>.json`; mounting a volume at `/data` keeps both the config and the login state.
 
-Railway 使用 `/data/config.yaml` 时，凭据位于 `/data/openai-subscription/<uuid>.json`。将 volume 挂载到 `/data` 即可同时保存配置和登录状态，服务端可以直接通过管理页完成 Device Code 登录。
+Codex subscription requests pass through the client's `originator` and `User-Agent` when both are present; otherwise a matching pair of Codex CLI defaults is used. These defaults live in `src/subscriptions/subscription-client-compat.ts`; edit that file when upgrading the compatible version.
 
-Codex 订阅请求会透传客户端同时提供的 `originator` 与 `User-Agent`；缺少其中任一项时使用一组配对的 Codex CLI 默认值。默认版本、`originator` 和 UA 在 `src/subscriptions/subscription-client-compat.ts` 中维护，升级兼容版本时修改该文件。
+### Claude subscription
 
-#### Claude subscription
-
-Claude Pro / Max 订阅同样只能在顶层 `providers` 中配置，模型通过 `custom_provider` 引用，按 Anthropic Messages 协议（`/v1/messages`）调用上游：
+Claude Pro / Max subscriptions are also declared under `providers`, referenced through `custom_provider`, and called with the Anthropic Messages protocol (`/v1/messages`):
 
 ```yaml
 providers:
@@ -277,19 +247,48 @@ models:
     model: claude-sonnet-4-5
 ```
 
-`claude-subscription` 不接受 `base_url` 或 `api_key`。Claude 没有 Device Code 登录，流程是：保存配置后在 `/admin` 展开该供应商并点击“登录”，在新打开的 Claude 授权页完成授权；浏览器随后跳转到 `https://platform.claude.com/oauth/code/callback?code=...&state=...`，把地址栏中的完整 URL（或该页面显示的 `code#state`）粘贴回管理页弹窗并点击“完成登录”。登录会话 10 分钟内有效。登录成功后同样显示“已登录”、“重新登录”和“查询用量”（5 小时 / 7 天窗口利用率）。
+`claude-subscription` accepts neither `base_url` nor `api_key`. Claude has no Device Code flow: after saving, expand the provider in `/admin`, click "Login", and authorize on the Claude page that opens. The browser then redirects to `https://platform.claude.com/oauth/code/callback?code=...&state=...`; paste the full URL (or the `code#state` value shown on that page) back into the dialog and click "Complete login". A login session is valid for 10 minutes. After login, the page offers "Re-login" and "Query usage" (5-hour and 7-day window utilization).
 
-Claude Code 的兼容版本与默认 User-Agent，以及 Codex CLI 的默认身份常量，集中保存在 `src/subscriptions/subscription-client-compat.ts`；升级对应 CLI 兼容版本时请同步更新这里的版本及 Claude beta 标识。Claude 请求若客户端未传 `x-claude-code-session-id`，网关会按 UTC 日期与请求中的 `x-forwarded-for` 首个地址（或 `x-real-ip`、`cf-connecting-ip`）生成当日稳定值，IP 部分以 SHA-256 摘要形式写入。
+Credentials are stored as plain JSON in `<directory of config.yaml>/claude-subscription/<uuid>.json` (access token, refresh token, expiry, scopes, subscription type, account email) and refreshed 5 minutes before expiry. Requests use `Authorization: Bearer` and mimic Claude Code headers: `anthropic-beta` always includes `oauth-2025-04-20` and `claude-code-20250219` (merged with the client's betas); missing `Accept`, `User-Agent`, `x-app`, `x-stainless-*` and `anthropic-dangerous-direct-browser-access` get defaults, streaming requests add `x-stainless-helper-method: stream`, and every request without `x-client-request-id` gets a fresh UUID. Client headers and the model's `headers` override these defaults. If the client did not send `x-claude-code-session-id`, the gateway derives a per-UTC-day stable value from the first address in `x-forwarded-for` (or `x-real-ip`, `cf-connecting-ip`); the IP is only hashed with SHA-256.
 
-凭据以明文 JSON 保存到 `<config.yaml 所在目录>/claude-subscription/<uuid>.json`（access token、refresh token、过期时间、scopes、订阅类型、账户邮箱等），在到期前 5 分钟自动刷新。请求上游时使用 `Authorization: Bearer`，并参考 Claude Code 的请求头：`anthropic-beta` 总是包含 `oauth-2025-04-20` 与 `claude-code-20250219`（与客户端传入的 beta 合并）；缺失时补 `Accept`、`User-Agent`、`x-app`、`x-stainless-*` 和 `anthropic-dangerous-direct-browser-access` 默认值，流式请求补 `x-stainless-helper-method: stream`，每个缺少 `x-client-request-id` 的请求生成新 UUID。客户端传入的这些头以及模型配置中的 `headers` 可覆盖默认值。
+When the request has no billing system block, a text block `x-anthropic-billing-header: cc_version=<CLI version>.<fingerprint>; cc_entrypoint=cli;` is prepended to `system`. The fingerprint is computed from the first user message, and the CLI version comes from the outgoing `claude-cli/*` User-Agent or the default version; `cch` is never added. The compatible Claude Code and Codex CLI identities are kept in `src/subscriptions/subscription-client-compat.ts`.
 
-Claude 订阅请求若没有现成的 billing system block，会在最终请求体的 `system` 数组前插入 `x-anthropic-billing-header: cc_version=<CLI版本>.<指纹>; cc_entrypoint=cli;` 文本。指纹按首条用户消息计算，CLI 版本取最终出站 `claude-cli/*` UA 的版本或上述默认版本；不会添加 `cch`。
+### Bearer key authentication
 
-Railway 从 Git 仓库部署时会自动使用仓库根目录的 `Dockerfile`。Docker 构建阶段会编译 Linux x64 Rust helper，最终运行镜像只包含 Node.js、nanollm 和编译好的 helper，不需要在运行容器中安装 Rust，也不依赖 GitHub Release 下载。保持启动命令为空即可使用 Dockerfile 中的默认命令；volume 挂载目录设置为 `/data`。
+To protect the whole gateway, configure:
 
-### 动态请求体表达式
+```yaml
+server:
+  auth:
+    token: ${NANOLLM_AUTH_TOKEN}
+```
 
-`models[*].body_expression` 可以在请求发往上游前动态改写最终 request body。表达式运行时会拿到变量 `body`，并且必须同步返回新的 body；执行顺序是先应用 `body` 深度合并，再执行 `body_expression`。旧字段 `bodyExpression` 仍兼容。
+- An empty or missing `server.auth.token` disables authentication.
+- Changing `server.auth.token` from the admin page writes it back to the file but, like `server.port`, only takes effect after a restart.
+- Once set, every entry except `/health` requires authentication: `/`, `/status`, `/record`, `/admin`, `/jobs`, `/v1/models` and `/v1/*`.
+- Authentication only protects access to nanollm. It does not replace `models[*].api_key` and is never forwarded to upstream providers.
+
+API clients use a standard Bearer header, so with the OpenAI SDK or any compatible client just use the token as the API key:
+
+```bash
+curl http://localhost:3000/v1/models \
+  -H "Authorization: Bearer $NANOLLM_AUTH_TOKEN"
+```
+
+In a browser you can authenticate once through a URL token:
+
+```text
+http://localhost:3000/admin?token=YOUR_TOKEN
+http://localhost:3000/status?token=YOUR_TOKEN
+http://localhost:3000/record?token=YOUR_TOKEN
+http://localhost:3000/jobs?token=YOUR_TOKEN
+```
+
+After the first successful `?token=` or Bearer authentication, nanollm sets a same-origin auth cookie, so later visits to `/admin`, `/status`, `/record` and `/jobs`, and the `fetch` calls made by those pages, no longer need `?token=`.
+
+### Dynamic request body expression
+
+`models[*].body_expression` rewrites the final request body before it is sent upstream. The expression receives `body` and must synchronously return the new body. The `body` deep merge is applied first, then `body_expression`. The legacy `bodyExpression` field is still accepted.
 
 ```yaml
 models:
@@ -308,11 +307,11 @@ models:
       })
 ```
 
-### 动态响应表达式
+### Dynamic response expression
 
-`models[*].response_expression` 在上游响应转换为客户端协议之前执行，只对 JSON 和 SSE 响应生效。表达式会获得 `response` 以及只读的上游响应头对象 `headers`；header 名统一为小写，例如 `headers["x-request-id"]`。`headers` 仅用于观察和校验，不会自动转发或改写客户端响应头。旧字段 `responseExpression` 仍兼容。
+`models[*].response_expression` runs before the upstream response is converted to the client protocol and only applies to JSON and SSE responses. It receives `response` and a read-only object `headers` with the upstream response headers (names are lower-cased, e.g. `headers["x-request-id"]`). `headers` is for observation and validation only; it is never forwarded or used to rewrite client headers. The legacy `responseExpression` field is still accepted.
 
-非流式 JSON 使用表达式返回值作为后续响应；流式响应会在向客户端发送数据前缓冲到带模型信息的启动事件。流式表达式用于观察或校验，返回值不会改写 SSE；抛出异常会终止当前候选并进入现有 fallback 流程。流式请求的响应缺少 `Content-Type` 时仍按 SSE 处理。
+For non-streaming JSON the return value becomes the response. Streaming responses are buffered until the startup event that carries the model information; streaming expressions are for observation or validation only, their return value does not rewrite the SSE stream, and a thrown error aborts the current candidate and enters the normal fallback flow. A streaming response without a `Content-Type` is still treated as SSE.
 
 ```yaml
 models:
@@ -333,11 +332,9 @@ models:
       })()
 ```
 
-### Anthropic 历史 thinking 签名
+### Anthropic history thinking signatures
 
-`models[*].ignore_invalid_history` 目前只影响 `provider: anthropic` 的协议转换，默认值为 `true`。当 OpenAI Chat/Responses 历史消息里的明文 reasoning 被转换到 Anthropic Messages 时，如果对应 `thinking` block 没有 `signature` 或 `signature` 为空字符串，默认会丢弃该 `thinking` block，避免 Anthropic 上游校验空签名时报错。
-
-如果需要保留旧行为，可以显式设置为 `false`，这时无签名 thinking 会继续带着空字符串 `signature` 发往 Anthropic 上游：
+`models[*].ignore_invalid_history` only affects `provider: anthropic` conversions and defaults to `true`. When plain-text reasoning from OpenAI Chat/Responses history is converted to Anthropic Messages and the resulting `thinking` block has a missing or empty `signature`, the block is dropped by default so the Anthropic upstream does not reject the empty signature. Set it to `false` to keep the old behavior and send such blocks with an empty-string `signature`:
 
 ```yaml
 models:
@@ -349,14 +346,14 @@ models:
     ignore_invalid_history: false
 ```
 
-### OpenAI 图片接口
+### OpenAI image API
 
-`provider: openai-image` 用于代理 OpenAI 图片接口，对外暴露两个入口：
+`provider: openai-image` proxies the OpenAI image API and exposes two endpoints:
 
-- `POST /v1/images/generations` — 图片生成
-- `POST /v1/images/edits` — 图片编辑（支持 `multipart/form-data` 上传）
+- `POST /v1/images/generations`: image generation
+- `POST /v1/images/edits`: image editing (supports `multipart/form-data` uploads)
 
-请求会按原始内容透传给上游，nanollm 不做协议转换，只负责注入鉴权、改写 `headers`、路由和兜底。上游路径会根据入口拼成 `${base_url}/images/generations` 或 `${base_url}/images/edits`。
+Requests are passed through unchanged; nanollm does no protocol conversion and only injects authentication, rewrites `headers`, routes and falls back. The upstream URL is `${base_url}/images/generations` or `${base_url}/images/edits`.
 
 ```yaml
 models:
@@ -367,14 +364,12 @@ models:
     model: gpt-image-1
 ```
 
-注意：
-
-- 图片接口只能命中 `provider: openai-image` 的模型；如果请求的模型（或 fallback 分组里的候选模型）不是该 provider，会返回 `cannot handle image requests` 错误。
-- 图片请求同样参与 fallback 兜底和 `/status` 健康统计，行为与文本接口一致。
+- Image endpoints can only hit models with `provider: openai-image`. If the requested model (or a candidate in its fallback group) is not of that provider, a `cannot handle image requests` error is returned.
+- Image requests take part in fallback and in the `/status` health statistics just like text requests.
 
 ### HTTP proxy
 
-`models[*].proxy` 可以为单个模型配置请求下游供应商时使用的 HTTP proxy URL；`providers[*].proxy` 可以为引用该供应商（`custom_provider`）的所有模型配置默认 proxy：
+`models[*].proxy` sets the HTTP proxy URL used to reach the upstream for one model, and `providers[*].proxy` sets a default for all models that reference the provider through `custom_provider`:
 
 ```yaml
 providers:
@@ -391,19 +386,11 @@ models:
     proxy: http://127.0.0.1:7891 # optional, overrides providers[*].proxy
 ```
 
-代理优先级为：
+Priority: `models[*].proxy` > `providers[*].proxy` (only for models using `custom_provider`) > `HTTPS_PROXY` > `HTTP_PROXY` > direct connection. An empty or missing `proxy` falls through to the next level. `http://` and `https://` proxy URLs are supported, and `proxy` can be edited on the provider and model cards in the admin page.
 
-1. `models[*].proxy`
-2. `providers[*].proxy`（仅对使用 `custom_provider` 的模型生效）
-3. `HTTPS_PROXY`
-4. `HTTP_PROXY`
-5. 直连
+### Wildcard model names
 
-当 `proxy` 为空字符串或未配置时，会继续回退到下一级；当前支持 `http://` 和 `https://` 代理 URL。管理页面的供应商和模型卡片中都可以直接编辑 `proxy`。
-
-### 模型名通配符 `*`
-
-`models[*].name` 支持后缀通配写法，可以把一类未显式配置的模型名路由到同一个上游配置：
+`models[*].name` supports a trailing wildcard, which routes a family of unlisted model names to one upstream config:
 
 ```yaml
 models:
@@ -430,139 +417,152 @@ fallback:
     - gpt-5.5-a
 ```
 
-规则：
+Rules:
 
-- `*` 必须只出现一次，并且只能放在结尾。合法例子：`gpt-*`、`claude-*`、`*`；非法例子：`gpt-*-x`、`g*p*t`、`gpt**`。
-- 匹配优先级是：精确 fallback 分组名 > 精确 model 名 > 通配 model 名。
-- 如果多个通配 model 都能匹配，选择 `*` 前缀最长的那个；前缀长度相同则按 `models` 配置顺序。
-- 单独的 `*` 可以匹配任意请求模型名，适合作为最后兜底。
-- `/v1/models` 会直接展示配置中的通配名称，例如 `gpt-*` 和 `*`。
+- `*` must appear exactly once and only at the end. Valid: `gpt-*`, `claude-*`, `*`. Invalid: `gpt-*-x`, `g*p*t`, `gpt**`.
+- Match priority: exact fallback group name > exact model name > wildcard model name.
+- If several wildcard models match, the one with the longest prefix before `*` wins; equal prefixes follow the order in `models`.
+- A lone `*` matches any requested model name, which makes it a good last resort.
+- `/v1/models` lists the wildcard names as configured, such as `gpt-*` and `*`.
 
-以上面配置为例：
+With the config above: `gpt-5.5` hits the fallback group, `gpt-5.5-a` hits the model of the same name, `gpt-5.6` hits `gpt-*`, and `llama-4` hits `*`.
 
-- 请求 `gpt-5.5`：优先命中 fallback 分组 `gpt-5.5`。
-- 请求 `gpt-5.5-a`：命中同名 model `gpt-5.5-a`。
-- 请求 `gpt-5.6`：没有同名分组或同名 model，于是命中 `gpt-*`。
-- 请求 `llama-4`：命中最后的 `*`。
+On a wildcard hit, every `*` in the upstream `model` is replaced with the part captured by `name`. For `name: gpt-*`, request `gpt-5.6` and `model: openai/gpt-*`, the upstream model is `openai/gpt-5.6`. Without a `*` in `model` the fixed name is always used.
 
-通配命中时，下游 `model` 字段里的 `*` 会被替换为请求中被 `models[*].name` 捕获的部分。例如：
+### Image compatibility option for `openai-chat`
 
-- `name: gpt-*`
-- 请求模型名：`gpt-5.6`
-- 捕获部分：`5.6`
-- `model: openai/gpt-*`
-- 实际发给上游的 `model`：`openai/gpt-5.6`
+`models[*].image` only applies to `provider: openai-chat` and smooths over differences in image input support between OpenAI-compatible chat services. It defaults to `true`.
 
-如果下游 `model` 中没有 `*`，则始终使用固定模型名；如果下游 `model` 中有多个 `*`，会全部替换为同一个捕获部分。
-
-### `openai-chat` 的图片兼容选项
-
-`models[*].image` 目前只对 `provider: openai-chat` 生效，主要用于兼容不同 OpenAI-compatible chat 服务对图片输入的支持差异。默认值为 `true`。
-
-- `image: true`（默认）：如果请求中包含图片，转为 chat 接口时保留 OpenAI chat 多模态 `content` 数组，例如：
+- `image: true` (default): requests containing images keep the OpenAI chat multimodal `content` array:
 
 ```json
 {
   "role": "user",
   "content": [
-    { "type": "text", "text": "请解释这张图" },
+    { "type": "text", "text": "Explain this picture" },
     { "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } }
   ]
 }
 ```
 
-- `image: false`：用于 DeepSeek 等只接受 `content: string` 的 chat 上游；图片、文件、音频等非文本内容会降级为字符串描述，文本内容用换行拼接，例如：
+- `image: false`: for upstreams such as DeepSeek that only accept `content: string`. Images, files, audio and other non-text content are downgraded to text descriptions and joined with newlines:
 
 ```json
 {
   "role": "user",
-  "content": "请解释这张图\nAttached image: https://example.com/cat.png"
+  "content": "Explain this picture\nAttached image: https://example.com/cat.png"
 }
 ```
 
-注意：`image: false` 当前不影响 `provider: openai-responses` 或 `provider: anthropic`，这两类上游仍按各自协议保留图片结构。
+`image: false` does not affect `openai-responses` or `anthropic` upstreams, which keep image structures in their own protocols.
 
-也可以指定配置文件运行：
-```bash
-npx nanollm --config /path/to/config.yaml
+## Web UI
+
+### Config admin: `/admin`
+
+A local configuration page at `http://localhost:3000/admin`.
+
+- Edit the common settings with forms: global settings, providers, models and fallback groups. `server.port` is shown read-only.
+- Typical flow: add or edit providers and models, arrange the fallback group members, then click "Save and apply".
+- Each model card can send a test message to verify connectivity, and after entering a provider URL and key you can fetch the upstream model list to pick models from.
+- Subscription providers (`openai-subscription`, `claude-subscription`) are logged in, re-logged in and queried for usage here.
+- Shortcuts lead to `/status` and `/record` so you can check model health and recent requests after saving.
+- "Discard unsaved changes" drops your edits; "Refresh from server" reloads the file if it was changed externally.
+- Saving converts the form into YAML, validates it and writes the config file atomically.
+- `models`, `fallback`, `server.ttfb_timeout` and `record.max_size` hot-reload for new requests; `server.port` and `server.auth.token` are written back but need a restart.
+- Advanced fields on existing models that are not shown in the form are preserved on save.
+- If you edit `config.yaml` by hand, nanollm detects and loads the change. Invalid content is rejected: the last valid config stays active and the error is shown in the admin page.
+
+Note: `/admin` is designed for single-user local management. Do not expose it to a LAN or the public internet without setting `server.auth.token`.
+
+### Monitoring and usage: `/status`
+
+`http://localhost:3000/status` shows model health. Below it is a daily token usage view (total tokens, output tokens, cache hit rate and estimated cost) that can be switched between the last 7 days, 30 days and a calendar year.
+
+By default this data lives in memory and disappears when the process exits. With `--storage sqlite`, `/status` keeps one month of sparse 5-minute buckets in SQLite (the page still shows the last 6 hours) and usage data is persisted as well.
+
+### Request records: `/record`
+
+`http://localhost:3000/record` lists sampled requests and is very useful for debugging. By default only the latest 10 requests are kept; change it with `record.max_size`. A recorded request can be replayed (sensitive client headers are not replayed, and provider authentication uses the current config).
+
+Images in requests (`data:image/...;base64,...`) are stored once per content hash. The record page shows image references and sizes, and replay restores the original images, so a multi-turn tool conversation that keeps carrying the same image stores it only once. Copy a `__nanollm_record_image_ref` value and open `GET /record/images/{hash}` to view the original; that endpoint uses the same authentication as `/record`. With `--storage sqlite` the latest `record.max_size` records are persisted.
+
+### Scheduled model jobs: `/jobs`
+
+Open `/jobs` (or click **/jobs** in `/admin`), create a job, pick concrete models, enter one user message and a five-field cron expression. The schedule time zone must be explicit, and the page previews the next 5 run times. "Pelican" and "simple reply" are editable templates, not fixed job types.
+
+Job config is saved in `jobs.yaml` next to the main config and is used by both storage modes. Without the file there are no jobs; it is created on first save, and manual edits are reloaded automatically. If the file is malformed, scheduling is paused and the page shows the error until it is fixed; running jobs keep using their own config snapshot. Saving or enabling a job does not call a model immediately: the first run happens at the next cron time, or click **Run now**.
+
+```yaml
+version: 1
+jobs:
+  - id: hourly-pelican
+    name: Hourly pelican drawing
+    enabled: true
+    type: model_request
+    schedule:
+      cron: "0 * * * *"
+      timezone: Asia/Singapore
+    models: [my-text-model] # concrete text model names saved in config.yaml
+    request:
+      message: >
+        Generate an SVG animation embedded in HTML of a pelican riding a bicycle.
+        Return only the code, with no explanation.
+    execution:
+      timeout_ms: 300000
+      overlap_policy: skip
+      max_attempts: 1
+      max_output_bytes: 262144
+    retention:
+      max_runs: 24
 ```
 
-如果希望 `/status` 和 `/record` 跨进程重启保留最近数据，可以启用 SQLite 存储：
+The executor builds one user message in each model's own protocol and manages the streaming request. Calls use the selected connection directly and do not go through fallback. Configured text models and models from the OpenAI and Claude subscription catalogs are supported; subscription models do not need to be added to config.yaml, and catalog loading errors are shown in the form. Existing per-model overrides (body, headers, expressions) still apply. Job requests consume provider quota and count towards model call status and usage statistics.
+
+- **memory (default)**: runs, raw text outputs, review marks and notes are kept in memory and cleared on restart (job config is kept). By default the latest 24 finished runs per job are kept; all job history also shares a 64 MiB memory cap, and when it is reached the oldest finished runs are dropped. Running runs are never evicted.
+- **SQLite**: adds a `job_runs` table. Retention follows each job's `max_runs`, and outputs are stored and evicted together with their runs. History survives restarts, and unfinished runs are marked `interrupted`. Records are isolated by the absolute path of `jobs.yaml`, so history is only restored when the same path is used.
+
+Each job has 1–20 concrete models. Output per model defaults to at most 256 KiB (configurable from 1 to 1024 KiB), retention can be 1–168 runs, attempts 1–5, and the timeout from 1 second to 1 hour. Truncated or oversized output is not retried automatically; other call failures are retried as configured, which may cost extra.
+
+The first version targets single-instance deployments: at most 2 jobs run at the same time, and calls to one model connection are serialized. If the previous run of a job has not finished, the new scheduled trigger is skipped; when resources are busy, other due jobs wait for a free slot. Disabling a job only stops future scheduling (cancelling the current run is a separate action), and runs missed during downtime are not made up.
+
+The page offers a job list, editing, run history, multi-model results, sandboxed HTML/SVG preview, raw code, and side-by-side comparison with earlier runs. Manual review supports "unreviewed / normal / suspect" plus a note; it is for display only and does not change routing, fallback or scheduling. Pelican outputs are not scored automatically and call failures are shown separately. Deleting a job keeps its history by default, or you can delete the runs, outputs and reviews with it.
+
+## Storage
+
+Without `--storage` the default is `memory`: `/status`, usage and `/record` data is lost when the process exits. To keep recent data across restarts, enable SQLite:
+
 ```bash
 npx nanollm --config /path/to/config.yaml --storage sqlite
 ```
 
-不传 `--storage` 时默认使用 `memory`，行为与旧版本一致。
+With `--storage sqlite` and no remote SQLite URL, a local SQLite file at `~/.nanollm/nanollm.sqlite3` is used. An existing local database file can be reused as is; no format migration is needed.
 
-当 `--storage sqlite` 且未配置远程 SQLite URL 时，会继续使用本地 SQLite 文件，路径固定为 `~/.nanollm/nanollm.sqlite3`。现有本地数据库文件可以直接复用，不需要迁移格式。
-
-如果希望把 SQLite 存储切到远程 libSQL/quicSQL 服务，可以配置以下环境变量：
+To store data in a remote libSQL/quicSQL service instead, set these environment variables:
 
 ```bash
 export NANOLLM_SQLITE_URL="https://your-sqlite.example.com/app/"
-export NANOLLM_SQLITE_AUTH_TOKEN="your-token" # 无鉴权的内网服务可省略
+export NANOLLM_SQLITE_AUTH_TOKEN="your-token" # can be omitted for an unauthenticated private service
 npx nanollm --config /path/to/config.yaml --storage sqlite
 ```
 
-URL 可以是 HTTP(S) 的 libSQL/quicSQL 服务地址，也可以不配置而使用本地文件。配置 `NANOLLM_SQLITE_URL` 后，`--storage sqlite` 会通过 HTTP 连接远程 SQLite；需要鉴权时额外设置 `NANOLLM_SQLITE_AUTH_TOKEN`。
+The URL is the address of an HTTP(S) libSQL/quicSQL service. Before every real database request over HTTP(S)/libSQL, nanollm first runs a read-only `SELECT 1` probe on a separate connection. A failed probe is retried after 1, 2, 4 and then 5 seconds (staying at 5 seconds) up to 20 times, with a 5-second timeout per probe, and the real request is sent as soon as a probe succeeds. A batch of SQL statements is probed once as a whole, keeping transaction and batch semantics. A failed real request is never resent automatically, to avoid double counting when a write was committed but its response was lost. Exhausted probes or failed writes are logged; this is not a durable delivery queue. Probes only run when there is a database operation, so no background heartbeat keeps the database awake. The Railway template enables Serverless for sqld while nanollm stays running, so viewing records and statistics may wait for the database to wake up.
 
-本程序不再在正常启动流程中执行远程数据库自动迁移。需要迁移已有本地文件时，请先使用仓库中的一次性迁移脚本完成复制和校验，再配置远程 SQLite URL。
+### Data migration
 
-HTTP(S)/libSQL 连接每次发送正式数据库请求前，先用独立连接执行只读 `SELECT 1` 探测。
-探测失败时按 1、2、4、5 秒（随后保持 5 秒）等待重试，最多 20 次，每次探测超时为 5 秒；
-探测成功后立即发送正式请求。批量 SQL 整批探测一次，保持事务和批处理语义。
-正式请求失败不会自动重发，避免已提交但响应丢失时重复累加统计；探测耗尽或正式写入失败会记录错误，
-这不是保证最终送达的持久化任务队列。探测仅在有数据库操作时触发，不会通过后台心跳阻止休眠。
-Railway 模板为 sqld 开启 Serverless，nanollm 保持常驻；查看记录和统计时也可能等待数据库唤醒。
+Normal startup never migrates databases. Use the one-off scripts in the repository when you need to move data.
 
-如果当前目录就有 `config.yaml`，也可以直接运行：
-```bash
-npx nanollm
-```
+**Local SQLite file → remote SQLite service** (for example a `nanollm.sqlite3` that used to live on a Railway volume):
 
-注意：npm 发布包不会包含作者本地的 `config.yaml`，需要你自己准备配置文件。
-
-## Project Structure
-
-代码按功能分为 `src/core`、`converters`、`proxy`、`subscriptions`、`storage`、`jobs`、`pages` 七个模块，入口为 `server.ts`。模块职责、依赖规则与请求流程见 [docs/architecture.md](docs/architecture.md)。
-
-## Config Admin
-
-提供了 `http://localhost:3000/admin` 的本地配置管理页。
-
-- 页面使用表单方式编辑常用配置项：全局设置、模型列表和 fallback 分组；`server.port` 仅展示当前运行值，不提供页面编辑。
-- 常见使用方式是：先在 `/admin` 中新增或修改模型，再调整 fallback 分组成员顺序，最后点击“保存并应用”立即生效。
-- 页面内提供跳转到 `/status` 和 `/record` 的快捷入口，方便保存后继续查看当前模型状态和最近请求记录。
-- 如果只是想放弃当前改动，可以点击“撤销未保存修改”；如果配置文件已被外部改动，可以点击“从服务端刷新”重新加载最新内容。
-- 点击保存后会先把表单数据转换成 YAML、校验配置，再原子写回配置文件。
-- `models`、`fallback`、`server.ttfb_timeout`、`record.max_size` 会立即热更新到新请求。
-- `server.port` 和 `server.auth.token` 会写回文件，但需要重启进程后才会真正生效。
-- 已有模型上未在表单中展开的高级字段会在保存时自动保留。
-- 如果你在外部手动修改 `config.yaml`，服务也会自动检测并加载新配置；若新内容非法，则继续保留上一份有效配置并在管理页显示错误。
-
-注意：`/admin/config` 设计目标是本机单用户管理，不建议暴露到局域网或公网。
-
-## Monitor
-
-提供了`http://localhost:3000/status`的监控页面，可以查看模型健康状态。
-
-提供了`http://localhost:3000/record`的采样记录页面，可以查看请求记录，对debug非常有用（默认只保留最新10次请求，可通过`record.max_size`配置修改）。请求中的 `data:image/...;base64,...` 图片会按内容哈希去重保存；记录页显示图片引用和大小，点击回放时服务会自动还原原始图片。这样多轮工具调用重复携带同一图片时，只保留一份图片数据。可复制记录中的 `__nanollm_record_image_ref` 值，并通过 `GET /record/images/{hash}` 查看原图；该接口使用与 `/record` 相同的鉴权。
-
-默认情况下，上述数据都只存在内存中，进程结束即消失。使用 `--storage sqlite` 启动后，`/status` 会在 SQLite 中保留最近 1 个月的稀疏 5 分钟统计 bucket（页面仍只展示最近 6 小时），`/record` 会持久化最近 `record.max_size` 条请求记录。
-
-### Remote SQLite Migration
-
-如果你之前在 Railway 上通过 volume 保存了 `nanollm.sqlite3`，可以使用一次性迁移脚本复制到兼容的远程 SQLite 服务：
-
-1. 准备一个新的远程 SQLite 数据库，并拿到 URL / token（无鉴权内网服务不需要 token）。
-2. 从 Railway volume 导出现有的 SQLite 文件。
-3. 运行迁移脚本，把本地 SQLite 文件同步到远程服务：
+1. Prepare a new remote SQLite database and get its URL and token (no token is needed for an unauthenticated private service).
+2. Export the existing SQLite file from the Railway volume.
+3. Run the migration script:
 
 ```bash
 npm run migrate:turso -- --from /path/to/nanollm.sqlite3
 ```
 
-也可以显式传 URL / token：
+or pass the URL and token explicitly:
 
 ```bash
 npm run migrate:turso -- \
@@ -571,4 +571,51 @@ npm run migrate:turso -- \
   --token your-token
 ```
 
-脚本会复制当前库里的表结构、数据和索引，适合一次性迁入兼容的远程 SQLite 服务。完成后配置 `NANOLLM_SQLITE_URL` 和可选的 `NANOLLM_SQLITE_AUTH_TOKEN`，继续使用 `--storage sqlite` 启动即可。
+The script copies tables, data and indexes, which suits a one-time move into a compatible remote service. Afterwards set `NANOLLM_SQLITE_URL` (and optionally `NANOLLM_SQLITE_AUTH_TOKEN`) and keep starting with `--storage sqlite`.
+
+**Turso → self-hosted sqld / quicSQL**: run `npm run migrate:storage -- --help`; the procedure and caveats are in [.railway/storage-migration.md](.railway/storage-migration.md).
+
+## Deployment
+
+### Railway / Docker
+
+Railway builds from the repository's root `Dockerfile` automatically. The Docker build compiles the Linux x64 Rust helper, and the final image only contains Node.js, nanollm and the compiled helper, so Rust is not needed at runtime and nothing is downloaded from GitHub Releases. Leave the start command empty to use the Dockerfile default, and mount a volume at `/data`, which holds both the config and subscription login credentials. The one-click template is described in [.railway/README.md](.railway/README.md).
+
+### Graceful shutdown
+
+On `SIGTERM` / `SIGINT`, nanollm stops accepting new connections and background work, waits for in-flight requests, cuts streaming connections that are still open after the drain deadline, and flushes queued database writes before exiting. The overall timeout defaults to 25 seconds and can be changed with `NANOLLM_SHUTDOWN_TIMEOUT_MS`.
+
+### Binary packages
+
+GitHub releases ship one archive per platform. Each archive contains the nanollm executable and `nanollm-oauth-transport`; after extracting, keep both executables in the same directory. The Rust helper performs the OAuth requests for OpenAI subscriptions.
+
+The npm package bundles helpers for Windows x64, Linux x64 and macOS arm64, and `npx nanollm@<version>` picks the one for the current platform. The release workflow installs the generated tarball, checks that the helper path resolves and that the service passes a health check, and publishes the verified tarball to npm when the repository secret `NPM_TOKEN` is set. Running `npm publish` from source also checks that all three helpers are present so an incomplete package is never published.
+
+The main program is still built with `@yao-pkg/pkg` in enhanced SEA mode so that the dynamic loading of `@libsql/*` native packages by the current `@libsql/client` in local SQLite mode keeps working. `pkg.assets` in `package.json` explicitly includes `node_modules/@libsql/**/*`, so the packaged binary can extract the platform's `.node` file into a local cache on first run; without it a standalone binary fails with `Cannot find module '@libsql/<platform>'` in `--storage sqlite` mode.
+
+## Environment variables
+
+| Variable | Description |
+| --- | --- |
+| `CONFIG_PATH` | Config file path, same as `--config` |
+| `PORT` | Listening port; takes priority over `server.port` in the config |
+| `LOG_LEVEL` | Log level: `debug`, `info` (default) or `error` |
+| `NANOLLM_SQLITE_URL` / `NANOLLM_SQLITE_AUTH_TOKEN` | Remote libSQL/quicSQL URL and token, only used with `--storage sqlite` |
+| `NANOLLM_SHUTDOWN_TIMEOUT_MS` | Graceful shutdown timeout, default 25000 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | Default proxy for upstream providers (see the HTTP proxy section for priority) |
+
+## Project structure
+
+The code is split into seven modules: `src/core`, `converters`, `proxy`, `subscriptions`, `storage`, `jobs` and `pages`, with `server.ts` as the entry point. See [docs/architecture.md](docs/architecture.md) for responsibilities, dependency rules and the request flow, and [docs/converters.md](docs/converters.md) for the protocol conversion details.
+
+```bash
+npm install
+npm run dev        # start with file watching
+npm run typecheck  # type check
+npm test           # run tests
+npm run build      # build to dist/
+```
+
+## License
+
+ISC

@@ -1,4 +1,5 @@
 import { renderToString } from "hono/jsx/dom/server";
+import { LOGO_DATA_URI } from "./logo.js";
 function serializeForScript(value: unknown): string {
   return JSON.stringify(value)
     .replaceAll("<", "\\u003c")
@@ -2626,6 +2627,7 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>nanollm config admin</title>
+        <link rel="icon" type="image/svg+xml" href={LOGO_DATA_URI} />
         <style dangerouslySetInnerHTML={{ __html: STYLE }} />
       </head>
       <body>

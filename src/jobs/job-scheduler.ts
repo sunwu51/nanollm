@@ -123,13 +123,13 @@ export class JobScheduler {
       const executor = this.executors.get(run.job_snapshot.type); if (!executor) throw new Error("任务执行器不存在");
       for (let index = 1; index <= run.job_snapshot.execution.max_attempts; index++) {
         parent.throwIfAborted();
-        const attempt: JobResult["attempts"][number] = { attempt: index, status: "running", started_at: this.now(), finished_at: null, error: null };
+        const attempt: JobResult["attempts"][number] = { attempt: index, status: "running", started_at: this.now(), finished_at: null, error: null, request_id: randomUUID() };
         result.attempts.push(attempt); await this.save(run);
         const timeout = new AbortController();
         const timer = setTimeout(() => timeout.abort(new Error("模型调用超过任务超时限制")), run.job_snapshot.execution.timeout_ms);
         const signal = AbortSignal.any([parent, timeout.signal]);
         try {
-          const output: ExecutionOutput = await abortable(executor.execute(run.job_snapshot, model, signal), signal);
+          const output: ExecutionOutput = await abortable(executor.execute(run.job_snapshot, model, signal, { requestId: attempt.request_id! }), signal);
           signal.throwIfAborted();
           result.output = output.output; result.metrics = output.metrics; result.status = attempt.status = "succeeded"; result.error = null;
         } catch (error) {

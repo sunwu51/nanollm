@@ -25,7 +25,7 @@ export interface JobReview { status: "unreviewed" | "normal" | "suspect"; note: 
 export interface JobResult {
   model_name: string; provider: string | null; upstream_model: string | null; connection_fingerprint: string | null;
   status: ResultStatus; started_at: number | null; finished_at: number | null;
-  attempts: Array<{ attempt: number; status: ResultStatus; started_at: number; finished_at: number | null; error: JobError | null }>;
+  attempts: Array<{ attempt: number; status: ResultStatus; started_at: number; finished_at: number | null; error: JobError | null; request_id?: string }>;
   output: JobOutput | null; metrics: { ttfb_ms?: number; usage?: NormalizedUsage } | null;
   evaluation: null; review: JobReview; error: JobError | null;
 }

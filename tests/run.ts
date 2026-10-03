@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import vm from "node:vm";
 import os from "node:os";
 import { dirname, join } from "node:path";
 import { createClient, type Client } from "@libsql/client";
@@ -5602,7 +5603,8 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /\/record\/" \+ encodeURIComponent\(record\.requestId\) \+ "\/replay"/);
   assert.match(html, /\.recent-key\.active \{/);
   assert.match(html, /<a class="back-admin" href="\/admin">/);
-  assert.match(html, /selectedRequestId = requestId;\s*markActiveRecent\(\);/);
+  assert.match(html, /selectedRequestId = payload\.record\.requestId;/);
+  assert.match(html, /id="recent-pager"/);
   assert.match(html, /Sensitive client headers are not replayed; provider auth uses current config\./);
   assert.match(html, /Replay disabled while in progress/);
   assert.match(html, /Replay created new record/);
@@ -5622,7 +5624,8 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /placeholder="例如 6dfae2ab-1234-5678-9abc-def012345678"/);
   assert.match(html, /grid-template-columns: 1fr/);
   assert.match(html, /recent-key/);
-  assert.match(html, /recent-toggle/);
+  assert.doesNotMatch(html, /recent-toggle/);
+  assert.match(html, /\.recent-pager button\.current \{/);
   assert.match(html, /recent-title-row/);
   assert.match(html, /recent-title/);
   assert.match(html, /recent-model-row/);
@@ -5652,10 +5655,10 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /actualModel\.textContent = "-> " \+ \(item\.actualModel \|\| "-"\)/);
   assert.match(html, /meta\.textContent = item\.path \+ " · " \+ new Date\(item\.createdAt\)\.toLocaleTimeString\("zh-CN"\)/);
   assert.match(html, /renderRecentList/);
-  assert.match(html, /items\.slice\(0, 10\)/);
+  assert.match(html, /items\.slice\(start, start \+ 12\)/);
   assert.match(html, /model\.textContent = item\.model \|\| "-"/);
-  assert.match(html, /more\.textContent = "\.\.\."/);
-  assert.match(html, /collapse\.textContent = "<"/);
+  assert.doesNotMatch(html, /more\.textContent = "\.\.\."/);
+  assert.doesNotMatch(html, /collapse\.textContent = "<"/);
   assert.match(html, /function flushEvent\(/);
   assert.match(html, /const lines = normalized\.split\("\\n"\)/);
   assert.match(html, /currentDataLines\[currentDataLines\.length - 1\] \+= "\\n" \+ line/);
@@ -5668,7 +5671,7 @@ run("record page renders query UI and JSON tree viewer", () => {
 run("model test builds provider-native streaming requests", () => {
   const chat = buildModelTestRequest("openai-chat", "alpha", "hi");
   assert.equal(chat.path, "/v1/chat/completions");
-  assert.deepEqual(chat.body, { model: "alpha", messages: [{ role: "user", content: "hi" }], stream: true });
+  assert.deepEqual(chat.body, { model: "alpha", messages: [{ role: "user", content: "hi" }], stream: true, stream_options: { include_usage: true } });
   const responses = buildModelTestRequest("openai-responses", "beta", "hi");
   assert.equal(responses.path, "/v1/responses");
   assert.equal(responses.body.stream, true);
@@ -5765,6 +5768,187 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.match(html, /attachCardDrag\(card, head, "fallback", \(\) => formState\.fallbackGroups, group\)/);
   assert.match(html, /"image":false/);
   assert.match(html, /"X-Test":"ok"/);
+});
+
+class FakeRecordPageElement {
+  children: FakeRecordPageElement[] = [];
+  parent?: FakeRecordPageElement;
+  className = "";
+  dataset: Record<string, string> = {};
+  style: Record<string, string> = {};
+  disabled = false;
+  scrolledIntoView = false;
+  private text = "";
+  private listeners = new Map<string, Array<() => void>>();
+
+  constructor(readonly tagName: string, private readonly doc: { activeElement?: FakeRecordPageElement }) {}
+
+  get textContent(): string {
+    return this.text + this.children.map((child) => child.textContent).join("");
+  }
+
+  set textContent(value: string) {
+    this.children = [];
+    this.text = value;
+  }
+
+  get classList() {
+    const names = () => new Set(this.className.split(/\s+/).filter(Boolean));
+    return {
+      contains: (name: string) => names().has(name),
+      add: (name: string) => { this.className = [...names(), name].join(" "); },
+      remove: (name: string) => { this.className = [...names()].filter((item) => item !== name).join(" "); },
+      toggle: (name: string, force?: boolean) => {
+        const set = names();
+        if (force ?? !set.has(name)) set.add(name); else set.delete(name);
+        this.className = [...set].join(" ");
+      },
+    };
+  }
+
+  appendChild(child: FakeRecordPageElement) {
+    child.parent = this;
+    this.children.push(child);
+    return child;
+  }
+
+  append(...children: Array<FakeRecordPageElement | string>) {
+    for (const child of children) {
+      if (typeof child === "string") this.text += child; else this.appendChild(child);
+    }
+  }
+
+  remove() {
+    if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this);
+  }
+
+  setAttribute(name: string, value: string) {
+    (this as unknown as Record<string, unknown>)[name] = value;
+  }
+
+  addEventListener(type: string, listener: () => void) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  click() {
+    if (!this.disabled) this.listeners.get("click")?.forEach((listener) => listener());
+  }
+
+  focus() {
+    this.doc.activeElement = this;
+  }
+
+  scrollIntoView() {
+    this.scrolledIntoView = true;
+  }
+
+  // Only class selectors (".a.b") are needed by the record page script.
+  querySelectorAll(selector: string): FakeRecordPageElement[] {
+    const classes = selector.split(".").filter(Boolean);
+    const found: FakeRecordPageElement[] = [];
+    const visit = (node: FakeRecordPageElement) => {
+      for (const child of node.children) {
+        if (classes.every((name) => child.classList.contains(name))) found.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return found;
+  }
+
+  querySelector(selector: string) {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+}
+
+type RecentKey = NonNullable<Parameters<typeof renderRecordPage>[0]["recentKeys"]>[number];
+
+function makeRecentKeys(count: number): RecentKey[] {
+  return Array.from({ length: count }, (_, index) => ({
+    key: `key-${index}`,
+    requestId: `req${String(index).padStart(3, "0")}-0000-0000`,
+    path: "/v1/messages",
+    model: "claude-sonnet-4-6",
+    source: "claudecode" as const,
+    status: "success" as const,
+    createdAt: Date.UTC(2026, 3, 20) - index * 1000,
+  }));
+}
+
+function makeRecordFor(item: RecentKey) {
+  return {
+    requestId: item.requestId,
+    key: item.key,
+    createdAt: item.createdAt,
+    stream: false,
+    clientRequest: { path: item.path, headers: {}, body: {}, source: item.source, status: item.status },
+    attempts: [],
+    clientResponse: { status: 200, headers: {}, body: {} },
+  };
+}
+
+/** Run the record page's inline script against a fake DOM, opening it with the given `?requestId=` search. */
+async function runRecordPageScript(recentKeys: RecentKey[], search: string, record: unknown) {
+  const summary = { enabled: true, capturedCount: recentKeys.length, limit: 100, sessionStartedAt: Date.UTC(2026, 3, 20), recentKeys };
+  const script = /<script>([\s\S]*)<\/script>/.exec(renderRecordPage(summary))?.[1];
+  assert.ok(script, "record page script");
+  const doc: { activeElement?: FakeRecordPageElement } = {};
+  const elements = new Map<string, FakeRecordPageElement>();
+  const fetchedUrls: string[] = [];
+  const replacedUrls: string[] = [];
+  vm.runInContext(script, vm.createContext({
+    document: {
+      getElementById(id: string) {
+        if (!elements.has(id)) elements.set(id, new FakeRecordPageElement("div", doc));
+        return elements.get(id);
+      },
+      createElement: (tagName: string) => new FakeRecordPageElement(tagName, doc),
+    },
+    window: { location: { search } },
+    history: { replaceState: (_state: unknown, _title: string, url: string) => replacedUrls.push(url) },
+    fetch: async (url: string) => {
+      fetchedUrls.push(url);
+      return { ok: true, json: async () => ({ summary, record }) };
+    },
+    setInterval: () => 0,
+    URLSearchParams,
+  }));
+  await waitForCondition(() => replacedUrls.length > 0);
+  return { doc, recent: elements.get("recent")!, pager: elements.get("recent-pager")!, fetchedUrls };
+}
+
+await runAsync("record page paginates recent requests and jumps to the page of a requestId from the URL", async () => {
+  const recentKeys = makeRecentKeys(37);
+  const target = recentKeys[30];
+  const prefix = target.requestId.slice(0, 6);
+  const { doc, recent, pager, fetchedUrls } = await runRecordPageScript(recentKeys, "?requestId=" + prefix, makeRecordFor(target));
+
+  assert.deepEqual(fetchedUrls, ["/record/" + prefix]);
+  assert.deepEqual(recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId), recentKeys.slice(24, 36).map((item) => item.requestId));
+  const active = recent.querySelector(".recent-key.active");
+  assert.equal(active?.dataset.requestId, target.requestId);
+  assert.equal(doc.activeElement, active);
+  assert.equal(active?.scrolledIntoView, true);
+  assert.equal(pager.querySelector(".current")?.textContent, "3");
+  assert.match(pager.textContent, /25–36 \/ 37/);
+
+  pager.children.find((child) => child.textContent === "›")!.click();
+  assert.deepEqual(recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId), recentKeys.slice(36).map((item) => item.requestId));
+  assert.equal(pager.querySelector(".current")?.textContent, "4");
+  assert.match(pager.textContent, /37–37 \/ 37/);
+  assert.equal(pager.children.find((child) => child.textContent === "›")?.disabled, true);
+
+  pager.children.find((child) => child.textContent === "1")!.click();
+  assert.deepEqual(recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId), recentKeys.slice(0, 12).map((item) => item.requestId));
+  assert.equal(pager.children.find((child) => child.textContent === "‹")?.disabled, true);
+});
+
+await runAsync("record page hides the pager when all recent requests fit on one page", async () => {
+  const recentKeys = makeRecentKeys(12);
+  const { recent, pager } = await runRecordPageScript(recentKeys, "?requestId=" + recentKeys[11].requestId, makeRecordFor(recentKeys[11]));
+  assert.equal(recent.querySelectorAll(".recent-key").length, 12);
+  assert.equal(recent.querySelector(".recent-key.active")?.dataset.requestId, recentKeys[11].requestId);
+  assert.equal(pager.children.length, 0);
 });
 
 run("record page stream parser keeps data-like text inside JSON payloads", () => {

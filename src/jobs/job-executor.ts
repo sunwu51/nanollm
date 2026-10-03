@@ -1,7 +1,6 @@
 import type { ModelConfig } from "../core/config.js";
 import { buildModelTestRequest } from "../proxy/model-test.js";
 import { createUsageCollector, SSEParser } from "../converters/streams.js";
-import { passthroughStreamRequest } from "../proxy/proxy.js";
 import { type Job, type JobOutput, type JobResult } from "./jobs.js";
 
 export interface ExecutionOutput { output: JobOutput; metrics: JobResult["metrics"] }
@@ -10,8 +9,11 @@ export class JobExecutionError extends Error {
 }
 export interface JobExecutor {
   type: string;
-  execute(job: Job, model: ModelConfig, signal: AbortSignal): Promise<ExecutionOutput>;
+  /** `requestId` is stored on the attempt before the call so even timed-out attempts link to their request record. */
+  execute(job: Job, model: ModelConfig, signal: AbortSignal, context?: { requestId: string }): Promise<ExecutionOutput>;
 }
+/** Sends a client-format request for `model` and returns the client-format response (the gateway's own /v1 routes in production). */
+export type JobRequestSender = (model: ModelConfig, request: { path: string; body: Record<string, unknown> }) => Promise<Response>;
 export function outputMediaType(text: string): string {
   let content = text.trim().replace(/^\x60{3}(?:html|svg|xml|json)?[^\n]*\n([\s\S]*?)\x60{3}\s*$/i, "$1").trim();
   content = content.replace(/^<\?xml[\s\S]*?\?>\s*/i, "");
@@ -20,16 +22,26 @@ export function outputMediaType(text: string): string {
   try { JSON.parse(content); return "application/json"; } catch { return "text/plain"; }
 }
 
-export const modelRequestExecutor: JobExecutor = {
+async function errorMessage(response: Response): Promise<string> {
+  const raw = await response.text().catch(() => "");
+  let message: unknown;
+  try { const body = JSON.parse(raw); message = body?.error?.message ?? body?.error; } catch { message = raw.slice(0, 500); }
+  return `HTTP ${response.status}` + (typeof message === "string" && message ? ": " + message : "");
+}
+
+export const createModelRequestExecutor = (send: JobRequestSender): JobExecutor => ({
   type: "model_request",
   async execute(job, model, signal) {
-    const { body } = buildModelTestRequest(model.provider, model.model, job.request.message);
-    const options = { signal, modelName: model.name,
-      ...(!model.subscription_provider && !model.claude_subscription_provider ? { userAgent: "nanollm-scheduled-job" } : {}) };
-    const result = await passthroughStreamRequest(model, body, options);
+    const started = Date.now();
+    const response = await send(model, buildModelTestRequest(model.provider, model.name, job.request.message));
+    if (signal.aborted) { await response.body?.cancel(signal.reason).catch(() => {}); signal.throwIfAborted(); }
+    if (!response.ok || !response.body) throw new Error(await errorMessage(response));
     const parser = new SSEParser(true), collector = createUsageCollector(model.provider), decoder = new TextDecoder();
-    const reader = result.body.getReader();
-    let text = "", textBytes = 0, wireBytes = 0, completed = false, truncated = false;
+    const reader = response.body.getReader();
+    // Cancelling the client stream is what stops the gateway's upstream call.
+    const onAbort = () => { void reader.cancel(signal.reason).catch(() => {}); };
+    signal.addEventListener("abort", onAbort, { once: true });
+    let text = "", textBytes = 0, wireBytes = 0, completed = false, truncated = false, ttfbMs: number | undefined;
     let streamError: string | undefined;
     const append = (part: string) => {
       const bytes = Buffer.from(part);
@@ -61,12 +73,12 @@ export const modelRequestExecutor: JobExecutor = {
         if (reason || value.type === "response.completed" || value.type === "message_stop") completed = true;
       }
     };
-    const partial = (): ExecutionOutput => ({ output: { text, media_type: outputMediaType(text), truncated }, metrics: { ttfb_ms: result.timing.ttfbMs, usage: collector.getLatestUsage() } });
+    const partial = (): ExecutionOutput => ({ output: { text, media_type: outputMediaType(text), truncated }, metrics: { ttfb_ms: ttfbMs, usage: collector.getLatestUsage() } });
     try {
       while (true) {
         signal.throwIfAborted();
-        const chunk = await reader.read(); if (chunk.done) break;
-        wireBytes += chunk.value.byteLength;
+        const chunk = await reader.read(); signal.throwIfAborted(); if (chunk.done) break;
+        ttfbMs ??= Date.now() - started; wireBytes += chunk.value.byteLength;
         if (wireBytes > Math.max(1024 * 1024, job.execution.max_output_bytes * 16)) { truncated = true; throw new Error("上游响应流超过大小限制"); }
         const decoded = decoder.decode(chunk.value, { stream: true }); collector.push(decoded); consume(parser.push(decoded));
       }
@@ -79,7 +91,8 @@ export const modelRequestExecutor: JobExecutor = {
     } catch (error) {
       throw new JobExecutionError(error instanceof Error ? error.message : String(error), partial(), { cause: error });
     } finally {
+      signal.removeEventListener("abort", onAbort);
       await reader.cancel().catch(() => {}); reader.releaseLock();
     }
   },
-};
+});

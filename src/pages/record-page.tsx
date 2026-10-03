@@ -1,4 +1,5 @@
 import { renderToString } from "hono/jsx/dom/server";
+import { LOGO_DATA_URI } from "./logo.js";
 
 function serializeForScript(value: unknown): string {
   return JSON.stringify(value)
@@ -10,7 +11,7 @@ function serializeForScript(value: unknown): string {
 const REQUEST_ID_DATALIST_ID = "request-id-options";
 const STRING_PREVIEW_LENGTH = 100;
 const SUMMARY_POLL_INTERVAL_MS = 3000;
-const RECENT_REQUEST_LIMIT = 10;
+const RECENT_PAGE_SIZE = 12;
 
 export interface RecordSummary {
   enabled: boolean;
@@ -208,8 +209,7 @@ const STYLE = /* css */ String.raw`
         flex-wrap: wrap;
         gap: 8px;
       }
-      .recent-key,
-      .recent-toggle {
+      .recent-key {
         appearance: none;
         border: 1px solid rgba(140, 90, 47, 0.18);
         background: #fffaf2;
@@ -219,8 +219,6 @@ const STYLE = /* css */ String.raw`
         font: inherit;
         cursor: pointer;
         text-align: left;
-      }
-      .recent-key {
         width: 260px;
       }
       .recent-key.active {
@@ -311,13 +309,46 @@ const STYLE = /* css */ String.raw`
       .status-badge.status-code {
         min-width: 32px;
       }
-      .recent-toggle {
-        min-width: 44px;
-        text-align: center;
-        border-style: dashed;
-        color: var(--muted);
-        background: rgba(255, 250, 242, 0.7);
+      .recent-pager {
+        margin-top: 10px;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+      }
+      .recent-pager:empty {
+        display: none;
+      }
+      .recent-pager button {
+        appearance: none;
+        min-width: 34px;
+        border: 1px solid rgba(140, 90, 47, 0.18);
+        background: #fffaf2;
+        color: var(--accent);
+        padding: 5px 9px;
+        border-radius: 8px;
+        font: inherit;
+        font-size: 12px;
         font-weight: 700;
+        cursor: pointer;
+      }
+      .recent-pager button.current {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fffaf2;
+        cursor: default;
+      }
+      .recent-pager button:disabled:not(.current) {
+        opacity: 0.4;
+        cursor: default;
+      }
+      .recent-pager .pager-gap,
+      .recent-pager .pager-range {
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .recent-pager .pager-range {
+        margin-left: 6px;
       }
       .section {
         border: 1px solid rgba(216, 207, 193, 0.82);
@@ -557,6 +588,7 @@ const SCRIPT = String.raw`
       const INITIAL_SUMMARY = __INITIAL_SUMMARY__;
       const summaryEl = document.getElementById("summary");
       const recentEl = document.getElementById("recent");
+      const recentPagerEl = document.getElementById("recent-pager");
       const contentEl = document.getElementById("content");
       const recordPanelEl = document.getElementById("record-panel");
       const requestIdInput = document.getElementById("request-id");
@@ -588,7 +620,8 @@ const SCRIPT = String.raw`
         });
       }
 
-      let recentExpanded = false;
+      let recentPage = 0;
+      let latestSummary = INITIAL_SUMMARY;
       let selectedRequestId = null;
 
       function markActiveRecent() {
@@ -670,38 +703,79 @@ const SCRIPT = String.raw`
       function renderRecentList(summary) {
         recentEl.textContent = "";
         const items = summary.recentKeys || [];
-        if (items.length === 0) {
-          return;
-        }
-
-        const visibleItems = recentExpanded ? items : items.slice(0, ${RECENT_REQUEST_LIMIT});
-        visibleItems.forEach((item) => {
+        const pageCount = Math.max(1, Math.ceil(items.length / ${RECENT_PAGE_SIZE}));
+        recentPage = Math.min(Math.max(recentPage, 0), pageCount - 1);
+        const start = recentPage * ${RECENT_PAGE_SIZE};
+        items.slice(start, start + ${RECENT_PAGE_SIZE}).forEach((item) => {
           recentEl.appendChild(renderRecentButton(item));
         });
+        renderRecentPager(items.length, pageCount, start);
+      }
 
-        if (!recentExpanded && items.length > ${RECENT_REQUEST_LIMIT}) {
-          const more = document.createElement("button");
-          more.type = "button";
-          more.className = "recent-toggle";
-          more.textContent = "...";
-          more.addEventListener("click", () => {
-            recentExpanded = true;
-            renderRecentList(summary);
-          });
-          recentEl.appendChild(more);
+      // Page numbers to show: first, last, and a window around the current page; null marks a gap.
+      function getPagerSlots(pageCount) {
+        const slots = [];
+        for (let page = 0; page < pageCount; page += 1) {
+          if (page === 0 || page === pageCount - 1 || Math.abs(page - recentPage) <= 2) {
+            slots.push(page);
+          } else if (slots[slots.length - 1] !== null) {
+            slots.push(null);
+          }
         }
+        return slots;
+      }
 
-        if (recentExpanded && items.length > ${RECENT_REQUEST_LIMIT}) {
-          const collapse = document.createElement("button");
-          collapse.type = "button";
-          collapse.className = "recent-toggle";
-          collapse.textContent = "<";
-          collapse.addEventListener("click", () => {
-            recentExpanded = false;
-            renderRecentList(summary);
-          });
-          recentEl.appendChild(collapse);
-        }
+      function createPagerButton(label, page, title) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = label;
+        if (title) button.title = title;
+        button.disabled = page === recentPage || page < 0;
+        button.addEventListener("click", () => goToRecentPage(page));
+        return button;
+      }
+
+      function renderRecentPager(total, pageCount, start) {
+        recentPagerEl.textContent = "";
+        if (pageCount <= 1) return;
+        recentPagerEl.appendChild(createPagerButton("‹", recentPage > 0 ? recentPage - 1 : -1, "上一页"));
+        getPagerSlots(pageCount).forEach((page) => {
+          if (page === null) {
+            const gap = document.createElement("span");
+            gap.className = "pager-gap";
+            gap.textContent = "…";
+            recentPagerEl.appendChild(gap);
+            return;
+          }
+          const button = createPagerButton(String(page + 1), page);
+          if (page === recentPage) button.className = "current";
+          recentPagerEl.appendChild(button);
+        });
+        recentPagerEl.appendChild(createPagerButton("›", recentPage < pageCount - 1 ? recentPage + 1 : -1, "下一页"));
+        const range = document.createElement("span");
+        range.className = "pager-range";
+        range.textContent = (start + 1) + "–" + Math.min(start + ${RECENT_PAGE_SIZE}, total) + " / " + total;
+        recentPagerEl.appendChild(range);
+      }
+
+      function goToRecentPage(page) {
+        recentPage = page;
+        renderRecentList(latestSummary);
+      }
+
+      // Switch to the page holding the given request so its button is rendered; returns false if it is not in the list.
+      function showRecentPageFor(summary, requestId) {
+        const index = (summary.recentKeys || []).findIndex((item) => item.requestId === requestId);
+        if (index < 0) return false;
+        recentPage = Math.floor(index / ${RECENT_PAGE_SIZE});
+        return true;
+      }
+
+      function focusActiveRecent() {
+        const active = recentEl.querySelector(".recent-key.active");
+        if (!active) return;
+        active.focus({ preventScroll: true });
+        active.scrollIntoView({ block: "nearest" });
       }
 
       function setSummary(summary) {
@@ -720,9 +794,7 @@ const SCRIPT = String.raw`
           summaryEl.appendChild(pill);
         }
 
-        if (!summary.recentKeys || summary.recentKeys.length <= ${RECENT_REQUEST_LIMIT}) {
-          recentExpanded = false;
-        }
+        latestSummary = summary;
         renderRecentList(summary);
       }
 
@@ -1730,12 +1802,12 @@ const SCRIPT = String.raw`
           renderError(payload.error || "查询失败");
           return;
         }
-        selectedRequestId = requestId;
-        markActiveRecent();
-        if (payload.summary) {
-          setSummary(payload.summary);
-        }
+        selectedRequestId = payload.record.requestId;
+        const summary = payload.summary || latestSummary;
+        const listed = showRecentPageFor(summary, selectedRequestId);
+        setSummary(summary);
         renderRecord(payload.record);
+        if (listed) focusActiveRecent();
         history.replaceState(null, "", "/record?requestId=" + encodeURIComponent(requestId));
       }
 
@@ -1764,6 +1836,7 @@ function RecordPage({ summary }: { summary: RecordSummary }) {
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>nanollm record</title>
+        <link rel="icon" type="image/svg+xml" href={LOGO_DATA_URI} />
         <style dangerouslySetInnerHTML={{ __html: STYLE }} />
       </head>
       <body>
@@ -1784,6 +1857,7 @@ function RecordPage({ summary }: { summary: RecordSummary }) {
         </div>
         <div class="summary" id="summary"></div>
         <div class="recent" id="recent"></div>
+        <div class="recent-pager" id="recent-pager"></div>
         <div class="content" id="content">
           <section class="section empty">还没有加载记录。</section>
         </div>

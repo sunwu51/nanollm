@@ -8,6 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
 import http from "node:http";
+import { spawn } from "node:child_process";
+import vm from "node:vm";
 import { createClient } from "@libsql/client";
 import { Hono } from "hono";
 import { stringify } from "yaml";
@@ -15,9 +17,10 @@ import type { ModelConfig } from "../src/core/config.js";
 import { JobConfigStore, nextJobDates, validateJob, type JobRun, type Job } from "../src/jobs/jobs.js";
 import { MemoryJobRunStore, SqliteJobRunStore, type JobRunStore } from "../src/jobs/job-run-store.js";
 import { JobScheduler } from "../src/jobs/job-scheduler.js";
-import { JobExecutionError, modelRequestExecutor, type JobExecutor } from "../src/jobs/job-executor.js";
+import { createModelRequestExecutor, JobExecutionError, type JobExecutor } from "../src/jobs/job-executor.js";
 import { createJobRoutes } from "../src/jobs/job-routes.js";
 import { renderJobsPage } from "../src/jobs/jobs-page.js";
+import { LOGO_DATA_URI, LOGO_SVG } from "../src/pages/logo.js";
 import { SSEParser } from "../src/converters/streams.js";
 
 const model: ModelConfig = { name: "chosen", provider: "openai-chat", base_url: "https://example.test/v1", api_key: "test-secret", model: "real-model" };
@@ -193,11 +196,13 @@ test("API validates models and versions, launches asynchronously, reviews and de
   assert.equal((await request("jobs", "POST", null)).status, 400);
 });
 
-test("real upstream streaming preserves chosen connection, uses native protocols, bounds output and aborts", { timeout: 15000 }, async t => {
-  let mode = "chat"; const calls: any[] = [];
+test("executor sends client-format requests, parses the stream, bounds output and cancels on abort", { timeout: 15000 }, async t => {
+  let mode = "chat", closed = 0; const calls: any[] = [];
   const upstream = http.createServer(async (req, res) => {
     let raw = ""; for await (const chunk of req) raw += chunk;
-    calls.push({ path: req.url, body: JSON.parse(raw) }); res.writeHead(200, { "content-type": "text/event-stream" });
+    calls.push({ path: req.url, body: JSON.parse(raw) }); res.on("close", () => { closed++; });
+    if (mode === "error") { res.writeHead(502, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message: "upstream exploded" } })); return; }
+    res.writeHead(200, { "content-type": "text/event-stream" });
     if (mode === "anthropic") {
       res.end('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"<svg/>"}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n'); return;
     }
@@ -205,21 +210,118 @@ test("real upstream streaming preserves chosen connection, uses native protocols
     res.write("data: " + JSON.stringify({ choices: [{ delta: { content: text } }] }) + "\n\n");
     if (mode === "hang") return;
     if (mode === "length") res.write('data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n');
+    if (mode === "chat") res.write('data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n');
     if (mode !== "incomplete") res.write("data: [DONE]\n\n"); res.end();
   });
   upstream.listen(0, "127.0.0.1"); await once(upstream, "listening"); t.after(() => { upstream.closeAllConnections(); upstream.close(); });
   const port = (upstream.address() as import("node:net").AddressInfo).port;
-  const config = { ...model, base_url: `http://127.0.0.1:${port}/v1`, ttfb_timeout: 2000 };
-  const execute = () => modelRequestExecutor.execute(job(), config, new AbortController().signal);
-  assert.equal((await execute()).output.text, "<svg>pelican</svg>"); assert.equal(calls[0].body.model, "real-model");
+  const sent: ModelConfig[] = [];
+  const executor = createModelRequestExecutor(async (target, request) => {
+    sent.push(target);
+    return fetch(`http://127.0.0.1:${port}${request.path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request.body) });
+  });
+  const execute = (j = job(), target: ModelConfig = model, signal = new AbortController().signal) => executor.execute(j, target, signal);
+  const first = await execute();
+  assert.equal(first.output.text, "<svg>pelican</svg>"); assert.equal(first.output.media_type, "image/svg+xml");
+  assert.equal(first.metrics?.usage?.outputTokens, 7); assert.equal(typeof first.metrics?.ttfb_ms, "number");
+  // The gateway resolves the model, so the request carries the configured name, not the upstream id.
+  assert.equal(calls[0].path, "/v1/chat/completions"); assert.equal(calls[0].body.model, "chosen");
+  assert.deepEqual(calls[0].body.stream_options, { include_usage: true }); assert.equal(sent[0], model);
   mode = "incomplete"; await assert.rejects(execute(), /未正常结束/);
   mode = "length"; await assert.rejects(execute(), (e: JobExecutionError) => !!e.partial.output.truncated);
   mode = "large"; const limited = job(); limited.execution.max_output_bytes = 1024;
-  await assert.rejects(modelRequestExecutor.execute(limited, config, new AbortController().signal), (e: JobExecutionError) => e.partial.output.text.length <= 1024 && e.partial.output.truncated);
-  mode = "anthropic"; const converted = await modelRequestExecutor.execute(job(), { ...config, provider: "anthropic" }, new AbortController().signal);
-  assert.equal(converted.output.text, "<svg/>"); assert.equal(calls.at(-1).path, "/v1/messages"); assert.equal(calls.at(-1).body.model, "real-model");
-  mode = "hang"; const controller = new AbortController(), task = modelRequestExecutor.execute(job(), config, controller.signal);
-  const timer = setTimeout(() => controller.abort(new Error("cancelled")), 100); try { await assert.rejects(task); } finally { clearTimeout(timer); }
+  await assert.rejects(execute(limited), (e: JobExecutionError) => e.partial.output.text.length <= 1024 && e.partial.output.truncated);
+  mode = "error"; await assert.rejects(execute(), (e: Error) => !(e instanceof JobExecutionError) && e.message === "HTTP 502: upstream exploded");
+  mode = "anthropic"; const converted = await execute(job(), { ...model, provider: "anthropic" });
+  assert.equal(converted.output.text, "<svg/>"); assert.equal(calls.at(-1).path, "/v1/messages"); assert.equal(calls.at(-1).body.model, "chosen");
+  mode = "hang"; const controller = new AbortController(), closedBefore = closed, task = execute(job(), model, controller.signal);
+  const timer = setTimeout(() => controller.abort(new Error("cancelled")), 100);
+  try { await assert.rejects(task, (e: JobExecutionError) => e.message === "cancelled" && e.partial.output.text === "<svg>pelican</svg>"); } finally { clearTimeout(timer); }
+  // Aborting cancels the response stream, which is what stops the gateway's upstream call.
+  const deadline = Date.now() + 3000; while (closed === closedBefore && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.ok(closed > closedBefore, "hanging stream was closed");
+});
+
+test("scheduler gives every attempt a request id and passes it to the executor", async t => {
+  const store = fixture(t), runs = new MemoryJobRunStore(), seen: Array<string | undefined> = [];
+  let calls = 0;
+  const scheduler = new JobScheduler(store, runs, () => [model], [{ type: "model_request", execute: async (_job, _model, _signal, context) => {
+    seen.push(context?.requestId); if (++calls === 1) throw new Error("first attempt fails"); return structuredClone(output);
+  } }]);
+  const value = job(); value.execution.max_attempts = 2; store.save(value, store.snapshot().version, true); await scheduler.initialize();
+  const started = await scheduler.runNow(value.id); await finished(scheduler);
+  const run = (await runs.get(started.id))!;
+  const ids = run.results[0].attempts.map(a => a.request_id);
+  assert.equal(ids.length, 2); assert.deepEqual(seen, ids); assert.ok(ids.every(id => typeof id === "string" && id.length > 0)); assert.notEqual(ids[0], ids[1]);
+});
+
+test("scheduled jobs go through the gateway's /v1 routes: recorded, counted once, with usage and speed", { timeout: 60000 }, async t => {
+  const upstreamCalls: any[] = [];
+  const upstream = http.createServer(async (req, res) => {
+    let raw = ""; for await (const chunk of req) raw += chunk;
+    upstreamCalls.push({ path: req.url, body: JSON.parse(raw), auth: req.headers.authorization });
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"<svg>"}}]}\n\n');
+    await new Promise(resolve => setTimeout(resolve, 80));
+    res.write('data: {"choices":[{"delta":{"content":"pelican</svg>"},"finish_reason":"stop"}]}\n\n');
+    // Like OpenAI, only report usage when the request asks for it.
+    if (upstreamCalls.at(-1).body.stream_options?.include_usage) res.write('data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n');
+    res.write("data: [DONE]\n\n"); res.end();
+  });
+  upstream.listen(0, "127.0.0.1"); await once(upstream, "listening"); t.after(() => { upstream.closeAllConnections(); upstream.close(); });
+  const upstreamPort = (upstream.address() as import("node:net").AddressInfo).port;
+  const probe = http.createServer(); probe.listen(0, "127.0.0.1"); await once(probe, "listening");
+  const port = (probe.address() as import("node:net").AddressInfo).port; await new Promise(resolve => probe.close(resolve));
+  const dir = mkdtempSync(join(tmpdir(), "nanollm-job-e2e-"));
+  writeFileSync(join(dir, "config.yaml"), stringify({ server: { auth: { token: "job-token" } },
+    models: [{ name: "chosen", provider: "openai-chat", base_url: `http://127.0.0.1:${upstreamPort}/v1`, api_key: "upstream-key", model: "real-model" }] }));
+  const child = spawn(process.execPath, ["--import", "tsx", "server.ts", "--config", join(dir, "config.yaml"), "--storage", "memory"],
+    { cwd: process.cwd(), env: { ...process.env, PORT: String(port) }, stdio: ["ignore", "pipe", "pipe"] });
+  let log = ""; child.stdout.on("data", d => { log += d; }); child.stderr.on("data", d => { log += d; });
+  t.after(() => { child.kill(); rmSync(dir, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${port}`, headers = { authorization: "Bearer job-token", "content-type": "application/json" };
+  const call = async (path: string, init?: RequestInit) => { const response = await fetch(base + path, { headers, ...init }); return { status: response.status, body: await response.json() as any }; };
+  for (const deadline = Date.now() + 30000; ;) {
+    if (child.exitCode !== null) assert.fail("server exited:\n" + log);
+    if (await fetch(base + "/health").then(r => r.ok, () => false)) break;
+    if (Date.now() > deadline) assert.fail("server did not start:\n" + log);
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  const { body: data } = await call("/jobs/api/data");
+  assert.equal((await call("/jobs/api/jobs", { method: "POST", body: JSON.stringify({ job: job(), baseVersion: data.version }) })).status, 201);
+  const started = await call("/jobs/api/jobs/hourly/run", { method: "POST", body: "{}" });
+  assert.equal(started.status, 202);
+  let run: JobRun;
+  for (const deadline = Date.now() + 15000; ;) {
+    run = (await call("/jobs/api/runs/" + started.body.id)).body;
+    if (!["pending", "running"].includes(run.status)) break;
+    if (Date.now() > deadline) assert.fail("job did not finish: " + JSON.stringify(run));
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  const result = run.results[0];
+  assert.equal(run.status, "succeeded", JSON.stringify(run));
+  assert.equal(result.output?.text, "<svg>pelican</svg>");
+  assert.equal(result.metrics?.usage?.outputTokens, 7);
+  assert.equal(upstreamCalls.length, 1);
+  assert.equal(upstreamCalls[0].body.model, "real-model"); assert.equal(upstreamCalls[0].auth, "Bearer upstream-key");
+
+  const requestId = result.attempts[0].request_id!;
+  const record = await call("/record/" + encodeURIComponent(requestId));
+  assert.equal(record.status, 200);
+  assert.equal(record.body.record.requestId, requestId);
+  assert.equal(record.body.record.clientRequest.path, "/v1/chat/completions");
+  assert.equal(record.body.record.clientRequest.status, "success");
+  assert.equal(record.body.record.clientRequest.headers["user-agent"], "nanollm-scheduled-job");
+  assert.equal(record.body.record.attempts[0].modelName, "chosen");
+
+  const status = await call("/status/data");
+  const cells = status.body.models.find((m: any) => m.name === "chosen").series as Array<Record<string, number | null>>;
+  const sum = (key: string) => cells.reduce((total, cell) => total + Number(cell[key] ?? 0), 0);
+  assert.equal(sum("totalRequests"), 1, "the job request is counted once");
+  assert.equal(sum("successRequests"), 1);
+  assert.equal(sum("nonCacheInputTokens"), 11);
+  assert.equal(sum("outputTokens"), 7);
+  assert.ok(cells.some(cell => Number(cell.avgTokenSpeed) > 0), "average speed is recorded");
 });
 
 test("page script parses, renders four views and previews without same-origin access", () => {
@@ -265,9 +367,97 @@ test("jobs page uses aligned URL and only user message editor", () => {
   assert.doesNotMatch(html,/请求协议|请求体 JSON|request-format|JSON.parse\(body.value\)/);
 });
 
+test("logo is served as the page icon and matches assets/logo.svg", () => {
+  assert.equal(LOGO_SVG, readFileSync(join(process.cwd(), "assets", "logo.svg"), "utf8").trim());
+  assert.ok(renderJobsPage().includes(`href="${LOGO_DATA_URI}"`));
+});
+
 test("run detail page only polls while its run is active and keeps scroll position", () => {
   const html=renderJobsPage();
   for (const part of ["runActive=['pending','running'].includes(run.status)", "route[0]==='runs'?(runActive?2000:0)", 'window.scrollTo(0,keepScroll)']) assert.ok(html.includes(part), part);
+});
+
+class FakeJobsElement {
+  children: FakeJobsElement[] = []; parent?: FakeJobsElement; className = ""; hidden = false; text = ""; attributes: Record<string, string> = {};
+  [key: string]: unknown;
+  constructor(readonly tagName: string) {}
+  get textContent(): string { return this.text + this.children.map(c => c.textContent).join(""); }
+  set textContent(value: string) { this.children = []; this.text = value; }
+  get childNodes() { return this.children; }
+  get isConnected() { return true; }
+  get classList() { return { add: (name: string) => { this.className = (this.className + " " + name).trim(); } }; }
+  append(...nodes: Array<FakeJobsElement | string>) { for (const n of nodes) { if (typeof n === "string") this.text += n; else { n.parent = this; this.children.push(n); } } }
+  replaceChildren(...nodes: FakeJobsElement[]) { this.children = []; this.text = ""; this.append(...nodes); }
+  setAttribute(name: string, value: string) { this.attributes[name] = value; }
+  all(): FakeJobsElement[] { return this.children.flatMap(c => [c, ...c.all()]); }
+  /** Visible means neither this element nor an ancestor is hidden. */
+  get visible(): boolean { return !this.hidden && (!this.parent || this.parent.visible); }
+}
+
+test("history rows expand to show each model result and expand-all pauses auto refresh", async () => {
+  const script = renderJobsPage().match(/<script>([\s\S]*)<\/script>/)![1];
+  const summary = (id: string, started: number) => ({ id, job_id: "hourly", job_name: "绘图巡检", trigger: "manual", status: "succeeded", started_at: started, finished_at: started + 1000,
+    results: [{ model_name: "alpha", status: "succeeded" }, { model_name: "beta", status: "failed" }] });
+  const detail = (id: string) => ({ ...summary(id, 0), job_snapshot: job(), results: [
+    { model_name: "alpha", status: "succeeded", upstream_model: "real-alpha", output: { text: "<svg>" + id + "</svg>", media_type: "image/svg+xml", truncated: false } },
+    { model_name: "beta", status: "failed", error: { message: "beta broke" }, output: { text: "plain " + id, media_type: "text/plain", truncated: false } }] });
+  const data = { jobs: [], runs: [summary("r1", 2000), summary("r2", 1000)], activeJobIds: [], nextRuns: {}, version: 1, storageMode: "memory" };
+  const calls: string[] = [], timers: Array<() => void> = [], elements = new Map<string, FakeJobsElement>();
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  vm.runInContext(script, vm.createContext({
+    document: { getElementById: (id: string) => { if (!elements.has(id)) elements.set(id, new FakeJobsElement("div")); return elements.get(id); }, createElement: (tag: string) => new FakeJobsElement(tag) },
+    location: { hash: "#/history", pathname: "/jobs" }, history: { replaceState() {} },
+    window: { scrollY: 0, scrollTo() {}, addEventListener() {}, confirm: () => true },
+    fetch: async (url: string) => { const path = url.replace("/jobs/api/", ""); calls.push(path);
+      const body = path === "data" ? data : path.startsWith("model-options") ? { modelOptions: [], modelErrors: [] } : detail(decodeURIComponent(path.slice("runs/".length)));
+      return { ok: true, json: async () => structuredClone(body) }; },
+    setTimeout: (fn: () => void) => { timers.push(fn); return timers.length; }, clearTimeout() {},
+    Intl, crypto, console,
+  }));
+  await settle();
+  const app = elements.get("app")!;
+  const buttons = (label: string) => app.all().filter(n => n.tagName === "button" && n.textContent === label);
+  const detailRows = () => app.all().filter(n => n.className === "run-detail");
+  assert.equal(buttons("展开").length, 2);
+  assert.equal(buttons("展开全部").length, 1);
+  // 查看 is a link but must look like the 展开 button next to it.
+  assert.deepEqual(app.all().filter(n => n.textContent === "查看").map(n => [n.tagName, n.className]), [["a", "button"], ["a", "button"]]);
+  assert.ok(detailRows().every(row => !row.visible));
+  const paused = app.all().find(n => n.textContent === "展开期间暂停自动刷新")!;
+  assert.equal(paused.visible, false);
+
+  (buttons("展开")[0].onclick as () => void)(); await settle();
+  assert.deepEqual(calls.filter(c => c.startsWith("runs/")), ["runs/r1"]);
+  const [first, second] = detailRows();
+  assert.ok(first.visible); assert.ok(!second.visible); assert.ok(paused.visible);
+  const frame = first.all().find(n => n.tagName === "iframe")!;
+  assert.match(String(frame.srcdoc), /<svg>r1<\/svg>/);
+  assert.match(first.textContent, /alpha[\s\S]*real-alpha[\s\S]*beta[\s\S]*beta broke[\s\S]*plain r1/);
+  assert.equal(buttons("收起").length, 1);
+  assert.equal(buttons("展开全部").length, 1);
+
+  // A pending refresh only reschedules itself while rows are expanded.
+  const dataCalls = calls.filter(c => c === "data").length, pending = timers.length;
+  timers.at(-1)!(); await settle();
+  assert.equal(calls.filter(c => c === "data").length, dataCalls);
+  assert.equal(timers.length, pending + 1);
+
+  (buttons("展开全部")[0].onclick as () => void)(); await settle();
+  assert.deepEqual(calls.filter(c => c.startsWith("runs/")), ["runs/r1", "runs/r2"]);
+  assert.ok(detailRows().every(row => row.visible));
+  assert.match(second.textContent, /plain r2/);
+  assert.equal(buttons("收起全部").length, 1);
+
+  (buttons("收起全部")[0].onclick as () => void)(); await settle();
+  assert.ok(detailRows().every(row => !row.visible)); assert.equal(paused.visible, false);
+  assert.equal(buttons("展开").length, 2);
+  // Finished runs are cached, so expanding again does not refetch.
+  (buttons("展开")[0].onclick as () => void)(); await settle();
+  assert.equal(calls.filter(c => c.startsWith("runs/")).length, 2);
+
+  (buttons("收起")[0].onclick as () => void)();
+  timers.at(-1)!(); await settle();
+  assert.equal(calls.filter(c => c === "data").length, dataCalls + 1);
 });
 
 test("subscription targets save and execute with native credentials tags", async t => {
