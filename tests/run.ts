@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import vm from "node:vm";
 import os from "node:os";
@@ -5964,6 +5964,11 @@ run("record page stream parser keeps data-like text inside JSON payloads", () =>
   assert.match(html, /if \(line === ""\) \{\n            flushEvent\(\);/);
   assert.match(html, /currentDataLines\.push\(line\.slice\(5\)\.trimStart\(\)\)/);
   assert.match(html, /currentDataLines\[currentDataLines\.length - 1\] \+= "\\n" \+ line/);
+});
+
+run("server.ts keeps @ts-nocheck as its first line so the build stays type-check free", () => {
+  // The directive is ignored unless it precedes every statement; an import above it broke the Railway build.
+  assert.equal(readFileSync(join(process.cwd(), "server.ts"), "utf8").split(/\r?\n/, 1)[0], "// @ts-nocheck");
 });
 
 run("http log level only keeps /v1 lifecycle logs at info", () => {

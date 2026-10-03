@@ -1,6 +1,6 @@
-import { JobModelCatalog } from "./src/jobs/job-model-catalog.js";
 // @ts-nocheck
 import "dotenv/config";
+import { JobModelCatalog } from "./src/jobs/job-model-catalog.js";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
