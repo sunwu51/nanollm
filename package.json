@@ -20,7 +20,7 @@
     "prepack": "npm run build",
     "prepublishOnly": "node scripts/verify-native-package.mjs",
     "start": "tsx server.ts",
-    "start:railway": "bash scripts/start-railway.sh",
+    "start:railway": "exec bash scripts/start-railway.sh",
     "dev": "tsx --watch server.ts",
     "migrate:turso": "tsx scripts/migrate-sqlite-to-turso.ts",
     "migrate:storage": "npm run build && node dist/scripts/storage-migration-cli.js",
