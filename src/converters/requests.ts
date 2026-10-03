@@ -30,7 +30,7 @@ import {
   unwrapResponsesCustomToolInput,
   wrapResponsesCustomToolInput,
 } from "./shared.js";
-import { isResponsesCustomToolName, markResponsesCustomToolName } from "../request-context.js";
+import { isResponsesCustomToolName, markResponsesCustomToolName } from "../core/request-context.js";
 
 export interface AnthropicRequestConversionOptions {
   defaultMaxOutputTokens?: number;

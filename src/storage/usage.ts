@@ -1,6 +1,6 @@
 import type { SqliteClient } from "./sqlite.js";
 import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
-import type { NormalizedUsage } from "./converters/shared.js";
+import type { NormalizedUsage } from "../converters/shared.js";
 
 export interface UsageDayMetrics {
   totalRequests: number;
@@ -29,6 +29,7 @@ export interface UsageStoreLike {
   recordAttempt(modelName: string, timestamp?: number): void;
   recordSuccess(modelName: string, durationMs: number, usage?: NormalizedUsage, timestamp?: number): void;
   recordFailure(modelName: string, durationMs?: number, timestamp?: number): void;
+  listModelNames(query: UsageQuery): Promise<string[]>;
   listDays(query: UsageQuery): Promise<UsageDayCell[]>;
 }
 
@@ -187,6 +188,13 @@ export class UsageStore implements UsageStoreLike {
     }
 
     return buildDenseDays(query, sparse);
+  }
+
+  async listModelNames(query: UsageQuery): Promise<string[]> {
+    return [...this.modelDays.entries()]
+      .filter(([, days]) => [...days.keys()].some((day) => day >= query.start && day <= query.end))
+      .map(([modelName]) => modelName)
+      .sort();
   }
 }
 
@@ -358,6 +366,15 @@ export class SqliteUsageStore implements UsageStoreLike {
     }
 
     return buildDenseDays(query, sparse);
+  }
+
+  async listModelNames(query: UsageQuery): Promise<string[]> {
+    await this.waitForWrites();
+    const rows = allRows<Record<string, unknown>>(await this.db.execute({
+      sql: `SELECT DISTINCT model_name FROM usage_days WHERE day >= ? AND day <= ? ORDER BY model_name`,
+      args: [query.start, query.end],
+    }));
+    return rows.map((row) => String(row.model_name ?? "")).filter(Boolean);
   }
 
   async getModelDay(modelName: string, day: string): Promise<UsageDayCell | undefined> {

@@ -26,4 +26,5 @@ EOF
   echo "Initialized nanollm config at $CONFIG_PATH"
 fi
 
-HOME="$CONFIG_DIR" node --max-old-space-size="$MAX_OLD_SPACE_SIZE" dist/server.js --config "$CONFIG_PATH" --storage "$STORAGE_MODE"
+export HOME="$CONFIG_DIR"
+exec node --max-old-space-size="$MAX_OLD_SPACE_SIZE" dist/server.js --config "$CONFIG_PATH" --storage "$STORAGE_MODE"

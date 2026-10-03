@@ -1,4 +1,5 @@
 import { renderToString } from "hono/jsx/dom/server";
+import { LOGO_DATA_URI } from "./logo.js";
 function serializeForScript(value: unknown): string {
   return JSON.stringify(value)
     .replaceAll("<", "\\u003c")
@@ -633,6 +634,7 @@ const SCRIPT = /* js */ String.raw`
             proxy: provider.proxy || "",
             _id: nextId("provider"),
             _expanded: false,
+            _groupName: provider.name || "",
           })),
           models: (form.models || []).map((model) => ({
             ...model,
@@ -762,7 +764,7 @@ const SCRIPT = /* js */ String.raw`
           recordExtras: formState.recordExtras || {},
           server: { ...formState.server },
           record: { ...formState.record },
-          providers: formState.providers.map(({ _id, _expanded, ...provider }) => provider),
+          providers: formState.providers.map(({ _id, _expanded, _groupName, ...provider }) => provider),
           models: formState.models.map(({ _id, _expanded, _advancedExpanded, _advancedJsonText, _extrasError, ...model }) => ({
             ...model,
             custom_provider: model.connection_mode === "custom" ? model.custom_provider : "",
@@ -1236,17 +1238,25 @@ const SCRIPT = /* js */ String.raw`
           const grid = document.createElement("div");
           grid.className = "field-grid two";
           bindField(grid, "name", { value: provider.name, attributes: { "data-focus-id": "provider-name-" + provider._id }, onInput(value) {
-            const previousName = provider.name;
             provider.name = value;
-            if (previousName) {
-              formState.models.forEach((model) => {
-                if (model.connection_mode === "custom" && model.custom_provider === previousName) {
-                  const wasSuffixed = isSuffixedName(model, previousName);
-                  model.custom_provider = value;
-                  if (wasSuffixed && value) renameModelRef(model, getSuffixedName(model, value));
-                }
-              });
-              if (expandedModelGroups.delete(previousName) && value) expandedModelGroups.add(value);
+            // Models follow the group this provider owns (_groupName), not the transient input text, so intermediate
+            // keystrokes that are empty or collide with another provider's name (e.g. "oa" while typing "oa2") never
+            // move or unbind models.
+            const nextName = value;
+            const takenByOther = formState.providers.some((item) => item !== provider && (item.name === nextName || item._groupName === nextName));
+            if (nextName.trim() && !takenByOther && nextName !== provider._groupName) {
+              const previousName = provider._groupName;
+              if (previousName) {
+                formState.models.forEach((model) => {
+                  if (model.connection_mode === "custom" && model.custom_provider === previousName) {
+                    const wasSuffixed = isSuffixedName(model, previousName);
+                    model.custom_provider = nextName;
+                    if (wasSuffixed) renameModelRef(model, getSuffixedName(model, nextName));
+                  }
+                });
+                if (expandedModelGroups.delete(previousName)) expandedModelGroups.add(nextName);
+              }
+              provider._groupName = nextName;
             }
             markDirty(true);
           } });
@@ -2558,6 +2568,7 @@ const SCRIPT = /* js */ String.raw`
         formState.providers.push({
           _id: id,
           _expanded: true,
+          _groupName: "",
           name: "",
           provider: "openai-chat",
           base_url: "",
@@ -2616,6 +2627,7 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>nanollm config admin</title>
+        <link rel="icon" type="image/svg+xml" href={LOGO_DATA_URI} />
         <style dangerouslySetInnerHTML={{ __html: STYLE }} />
       </head>
       <body>
@@ -2649,6 +2661,10 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
                   <a class="quick-link" href="/record">
                     <div class="quick-link-title">/record</div>
                     <div class="quick-link-desc">查看采样记录。</div>
+                  </a>
+                  <a class="quick-link" href="/jobs">
+                    <div class="quick-link-title">/jobs</div>
+                    <div class="quick-link-desc">设置 cron、定时测试模型并对比历史作品。</div>
                   </a>
                 </div>
               </div>

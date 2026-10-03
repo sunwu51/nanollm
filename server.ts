@@ -1,5 +1,6 @@
 // @ts-nocheck
 import "dotenv/config";
+import { JobModelCatalog } from "./src/jobs/job-model-catalog.js";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -8,22 +9,22 @@ import type { Context } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { randomUUID } from "node:crypto";
-import type { ModelConfig, ServerConfig } from "./src/config.js";
-import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "./src/auth.js";
-import { getPublicModelNames, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/config.js";
-import { ConfigManager } from "./src/config-manager.js";
-import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy.js";
-import { forwardRequest, forwardStreamRequest, passthroughAlphaSearchRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, type OpenAIImageOperation } from "./src/proxy.js";
-import { FallbackFailureTracker, sortFallbackGroupMembers } from "./src/fallback.js";
-import { SqliteStatusStore, StatusStore, type StatusStoreLike } from "./src/status.js";
-import { renderStatusPage } from "./src/status-page.js";
-import { SqliteUsageStore, UsageStore, addLocalDays, formatLocalDay, getUsageYears, parseLocalDay, type UsageStoreLike } from "./src/usage.js";
-import { renderRecordPage } from "./src/record-page.js";
-import { renderAdminConfigPage } from "./src/admin-config-page.js";
-import { buildModelTestRequest, DEFAULT_MODEL_TEST_MESSAGE, extractModelTestReply } from "./src/model-test.js";
-import { fetchUpstreamModels } from "./src/upstream-models.js";
-import { getHTTPLogLevel, shouldEmitLog } from "./src/http-log.js";
-import { buildJsonResponse, buildNonStreamResponse } from "./src/response-compression.js";
+import type { ModelConfig, ServerConfig } from "./src/core/config.js";
+import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "./src/core/auth.js";
+import { getPublicModelNames, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
+import { ConfigManager } from "./src/core/config-manager.js";
+import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy/proxy.js";
+import { forwardRequest, forwardStreamRequest, passthroughAlphaSearchRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, type OpenAIImageOperation } from "./src/proxy/proxy.js";
+import { FallbackFailureTracker, sortFallbackGroupMembers } from "./src/proxy/fallback.js";
+import { SqliteStatusStore, StatusStore, type StatusStoreLike } from "./src/storage/status.js";
+import { renderStatusPage } from "./src/pages/status-page.js";
+import { SqliteUsageStore, UsageStore, addLocalDays, formatLocalDay, getUsageYears, parseLocalDay, type UsageStoreLike } from "./src/storage/usage.js";
+import { renderRecordPage } from "./src/pages/record-page.js";
+import { renderAdminConfigPage } from "./src/pages/admin-config-page.js";
+import { buildModelTestRequest, DEFAULT_MODEL_TEST_MESSAGE, extractModelTestReply } from "./src/proxy/model-test.js";
+import { fetchUpstreamModels } from "./src/proxy/upstream-models.js";
+import { getHTTPLogLevel, shouldEmitLog } from "./src/core/http-log.js";
+import { buildJsonResponse, buildNonStreamResponse } from "./src/core/response-compression.js";
 import {
   normalizeOpenAIChatRequest,
   normalizeOpenAIResponsesRequest,
@@ -35,8 +36,8 @@ import {
   denormalizeToAnthropicResponse,
 } from "./src/converters/responses.js";
 import { createSSEConverter, createUsageCollector, formatDone, SSEParser } from "./src/converters/streams.js";
-import { createRequestId, getRequestId, runWithRequestId, setClientIp, setClientRequestHeaders, withRequestId } from "./src/request-context.js";
-import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "./src/response-cache.js";
+import { createRequestId, getRequestId, runWithRequestId, setClientIp, setClientRequestHeaders, withRequestId } from "./src/core/request-context.js";
+import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "./src/proxy/response-cache.js";
 import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
@@ -53,16 +54,23 @@ import {
   setRecordedClientResponseMeta,
   setRecordedRequestError,
   useSqliteRecordStore,
-} from "./src/record.js";
+} from "./src/storage/record.js";
 import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
-import { shouldIgnoreStreamReadError } from "./src/stream-errors.js";
-import { handleServerStartupError } from "./src/startup-error.js";
-import { openSqliteStorage } from "./src/sqlite.js";
-import { buildAdminConfigForm, buildAdminConfigFormFromEffectiveConfig, buildYamlTextFromAdminForm, type AdminConfigForm } from "./src/admin-config-form.js";
-import { extractErrorCauses, formatErrorWithCauses } from "./src/error-details.js";
-import { bootstrapSubscriptionProviders, configureSubscriptionStorage, fetchSubscriptionModels, fetchSubscriptionUsage, getCachedSubscriptionCredential, pollDeviceLogin, resetSubscriptionUsage, startDeviceLogin } from "./src/openai-subscription.js";
-import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, fetchClaudeSubscriptionModels, fetchClaudeSubscriptionUsage, getCachedClaudeSubscriptionCredential, startClaudeLogin } from "./src/claude-subscription.js";
+import { shouldIgnoreStreamReadError } from "./src/core/stream-errors.js";
+import { handleServerStartupError } from "./src/core/startup-error.js";
+import { installGracefulShutdown } from "./src/core/shutdown.js";
+import { JobConfigStore } from "./src/jobs/jobs.js";
+import { MemoryJobRunStore, SqliteJobRunStore } from "./src/jobs/job-run-store.js";
+import { JobScheduler } from "./src/jobs/job-scheduler.js";
+import { createModelRequestExecutor } from "./src/jobs/job-executor.js";
+import { createJobRoutes } from "./src/jobs/job-routes.js";
+import { renderJobsPage } from "./src/jobs/jobs-page.js";
+import { openSqliteStorage, waitForClientWrites } from "./src/storage/sqlite.js";
+import { buildAdminConfigForm, buildAdminConfigFormFromEffectiveConfig, buildYamlTextFromAdminForm, type AdminConfigForm } from "./src/pages/admin-config-form.js";
+import { extractErrorCauses, formatErrorWithCauses } from "./src/core/error-details.js";
+import { bootstrapSubscriptionProviders, configureSubscriptionStorage, fetchSubscriptionModels, fetchSubscriptionUsage, getCachedSubscriptionCredential, pollDeviceLogin, resetSubscriptionUsage, startDeviceLogin } from "./src/subscriptions/openai-subscription.js";
+import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, fetchClaudeSubscriptionModels, fetchClaudeSubscriptionUsage, getCachedClaudeSubscriptionCredential, startClaudeLogin } from "./src/subscriptions/claude-subscription.js";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -150,6 +158,14 @@ const apiCors = cors({
 });
 
 app.use("*", async (c, next) => {
+  if (shutdown.isShuttingDown()) {
+    c.header("Connection", "close");
+    return c.json({ error: "Server is shutting down" }, 503);
+  }
+  return next();
+});
+
+app.use("*", async (c, next) => {
   const requestId = getRequestId() ?? createRequestId();
   const started = Date.now();
   const logLevel = getHTTPLogLevel(c.req.path);
@@ -179,7 +195,7 @@ app.use("*", async (c, next) => {
 });
 
 app.use("*", async (c, next) => {
-  if (c.req.path.startsWith("/admin/")) {
+  if (c.req.path.startsWith("/admin/") || c.req.path === "/jobs" || c.req.path.startsWith("/jobs/")) {
     return next();
   }
   return apiCors(c, next);
@@ -221,6 +237,33 @@ type UpstreamOptions = { userAgent?: string; attemptIndex?: number; modelName?: 
 const fallbackFailureTracker = new FallbackFailureTracker();
 const statusStore: StatusStoreLike = sqliteStorage ? new SqliteStatusStore(sqliteStorage.client) : new StatusStore();
 const usageStore: UsageStoreLike = sqliteStorage ? new SqliteUsageStore(sqliteStorage.client) : new UsageStore();
+const jobsPath = join(dirname(configPath), "jobs.yaml");
+const jobConfigStore = new JobConfigStore(jobsPath);
+const jobRunStore = sqliteStorage ? new SqliteJobRunStore(sqliteStorage.client, jobsPath) : new MemoryJobRunStore();
+const jobModelCatalog = new JobModelCatalog(() => configManager.getActiveSnapshot().effectiveConfig);
+// Scheduled jobs call the gateway's own /v1 routes in-process, so they are recorded and counted in
+// status/usage exactly like client requests. The job's catalog-resolved model is pinned to the
+// request id for getCandidateModels, so the call uses the connection snapshotted when the run started.
+const jobRequestModels = new Map<string, ModelConfig>();
+const jobRequestExecutor = createModelRequestExecutor(async (model, request) => {
+  const config = configManager.getActiveSnapshot().effectiveConfig;
+  const requestId = getRequestId() ?? createRequestId();
+  const headers = new Headers({ "content-type": "application/json" });
+  if (!model.subscription_provider && !model.claude_subscription_provider) headers.set("user-agent", "nanollm-scheduled-job");
+  if (config.auth?.token) headers.set("authorization", `Bearer ${config.auth.token}`);
+  jobRequestModels.set(requestId, model);
+  try {
+    return await app.fetch(new Request(`http://127.0.0.1:${config.port}${request.path}`, { method: "POST", headers, body: JSON.stringify(request.body) }));
+  } finally {
+    jobRequestModels.delete(requestId);
+  }
+});
+const jobScheduler = new JobScheduler(jobConfigStore, jobRunStore,
+  () => configManager.getActiveSnapshot().effectiveConfig.models,
+  // The whole execution, including reading the stream, stays in the request context so the record is finalized under this id.
+  [{ ...jobRequestExecutor, execute: (job, model, signal, context) => runWithRequestId(context?.requestId ?? createRequestId(), () => jobRequestExecutor.execute(job, model, signal)) }],
+  Date.now, 2, name => jobModelCatalog.resolve(name));
+await jobScheduler.initialize();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
 
@@ -315,6 +358,8 @@ function orange(message: string): string {
 }
 
 function getCandidateModels(config: ServerConfig, primaryModel: string): ModelConfig[] {
+  const pinned = jobRequestModels.get(getRequestId() ?? "");
+  if (pinned?.name === primaryModel) return [pinned];
   const now = Date.now();
   const isFallbackGroup = primaryModel in config.fallback;
   if (isFallbackGroup) {
@@ -573,13 +618,13 @@ async function buildUsagePayload(c: Context | undefined, config: ServerConfig, o
   const queryYear = selectedYear ?? new Date(now).getFullYear();
   const range = normalizeUsageDayRange(c?.req.query("start"), c?.req.query("end"), queryYear, selectedRange, now);
   const modelQuery = c?.req.query("model") || undefined;
-  const modelNames = config.models.map((model) => model.name);
+  const configuredModels = new Map(config.models.map((model) => [model.name, model]));
+  const historicalModelNames = await usageStore.listModelNames(range);
+  const modelNames = [...new Set([...config.models.map((model) => model.name), ...historicalModelNames])].sort();
   const selectedModel = modelQuery && modelNames.includes(modelQuery) ? modelQuery : undefined;
-  const pricedModels = selectedModel
-    ? config.models.filter((model) => model.name === selectedModel)
-    : config.models;
-  const modelUsage = await Promise.all(pricedModels.map(async (model) => {
-    const days = await usageStore.listDays({ ...range, modelName: model.name });
+  const usageModelNames = selectedModel ? [selectedModel] : modelNames;
+  const modelUsage = await Promise.all(usageModelNames.map(async (modelName) => {
+    const days = await usageStore.listDays({ ...range, modelName });
     const metrics = days.reduce((total, day) => ({
       day: range.end,
       totalRequests: total.totalRequests + day.totalRequests,
@@ -593,7 +638,7 @@ async function buildUsagePayload(c: Context | undefined, config: ServerConfig, o
       outputTokens: total.outputTokens + day.outputTokens,
       totalTokens: total.totalTokens + day.totalTokens,
     }));
-    return { name: model.name, upstreamModel: model.model, metrics };
+    return { name: modelName, upstreamModel: configuredModels.get(modelName)?.model ?? modelName, metrics };
   }));
 
   return {
@@ -1232,6 +1277,9 @@ app.post("/record/:requestId/replay", async (c) => {
 });
 
 app.get("/admin", (c) => c.html(renderAdminConfigPage(buildConfigAdminPayload())));
+app.get("/jobs", (c) => c.html(renderJobsPage()));
+app.route("/jobs/api", createJobRoutes(jobScheduler,
+  () => configManager.getActiveSnapshot().effectiveConfig.models, storageMode, jobModelCatalog));
 app.post("/admin/providers/:name/device-login", async (c) => {
   try {
     const provider = configManager.getActiveSnapshot().effectiveConfig.providers.find((item) => item.name === c.req.param("name"));
@@ -1436,14 +1484,24 @@ const server = serve({ fetch: app.fetch, port: startupConfig.port }, (info) => {
 server.once("error", (error: Error & { code?: string }) => {
   handleServerStartupError(error, {
     port: startupConfig.port,
-    dispose: () => configManager.dispose(),
+    dispose: () => { configManager.dispose(); jobScheduler.stop(); },
   });
 });
 
-server.once("close", () => {
-  configManager.dispose();
-  void flushRecording();
-  sqliteStorage?.client.close();
+const shutdown = installGracefulShutdown({
+  server,
+  stopBackgroundWork: () => { configManager.dispose(); jobScheduler.stop(); },
+  cleanup: async () => {
+    await jobScheduler.flush();
+    if (sqliteStorage) await waitForClientWrites(sqliteStorage.client);
+    await flushRecording();
+    if (sqliteStorage) {
+      await waitForClientWrites(sqliteStorage.client);
+      sqliteStorage.client.close();
+    }
+  },
 });
+
+jobScheduler.start();
 
 export { server };

@@ -1,5 +1,5 @@
 import { stringify as stringifyYAML } from "yaml";
-import { parseSourceConfigDocument, type ServerConfig } from "./config.js";
+import { parseSourceConfigDocument, type ServerConfig } from "../core/config.js";
 
 type AdminModelDraft = {
   name: string;

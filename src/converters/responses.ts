@@ -21,7 +21,7 @@ import {
   unwrapResponsesCustomToolInput,
   wrapResponsesCustomToolInput,
 } from "./shared.js";
-import { isResponsesCustomToolName } from "../request-context.js";
+import { isResponsesCustomToolName } from "../core/request-context.js";
 
 export function normalizeOpenAIChatResponse(response: OpenAIChatResponse): NormalizedResponse {
   const choice = response.choices[0];

@@ -1,33 +1,33 @@
 // @ts-nocheck
-import type { ModelConfig } from "./config.js";
-import { SSEParser, type StreamFormat } from "./converters/streams.js";
-import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "./converters/shared.js";
+import type { ModelConfig } from "../core/config.js";
+import { SSEParser, type StreamFormat } from "../converters/streams.js";
+import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "../converters/shared.js";
 import {
   denormalizeToOpenAIChatRequest,
   denormalizeToOpenAIResponsesRequest,
   denormalizeToAnthropicRequest,
-} from "./converters/requests.js";
+} from "../converters/requests.js";
 import {
   normalizeOpenAIChatResponse,
   normalizeOpenAIResponsesResponse,
   normalizeAnthropicResponse,
-} from "./converters/responses.js";
-import { normalizeUsage } from "./converters/shared.js";
+} from "../converters/responses.js";
+import { normalizeUsage } from "../converters/shared.js";
 import {
   ensureRecordedAttempt,
   setRecordedAttemptError,
   setRecordedAttemptResponseBody,
   setRecordedAttemptResponseMeta,
-} from "./record.js";
+} from "../storage/record.js";
 import { runInNewContext } from "node:vm";
 import { randomUUID } from "node:crypto";
 import { Agent, ProxyAgent, fetch as undiciFetch } from "undici";
-import { extractErrorCauses } from "./error-details.js";
-import { getClientIp, getClientRequestHeaders } from "./request-context.js";
-import { getCachedSubscriptionCredential, ensureSubscriptionCredential, SUBSCRIPTION_URL } from "./openai-subscription.js";
-import { CLAUDE_CODE_DEFAULT_HEADERS, CODEX_CLI_ORIGINATOR, CODEX_CLI_USER_AGENT } from "./subscription-client-compat.js";
-import { addClaudeBillingBlock } from "./claude-billing.js";
-import { applyClaudeSubscriptionSessionIdentity, hasClaudeMetadataUserId, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "./claude-subscription-body.js";
+import { extractErrorCauses } from "../core/error-details.js";
+import { getClientIp, getClientRequestHeaders } from "../core/request-context.js";
+import { getCachedSubscriptionCredential, ensureSubscriptionCredential, SUBSCRIPTION_URL } from "../subscriptions/openai-subscription.js";
+import { CLAUDE_CODE_DEFAULT_HEADERS, CODEX_CLI_ORIGINATOR, CODEX_CLI_USER_AGENT } from "../subscriptions/subscription-client-compat.js";
+import { addClaudeBillingBlock } from "../subscriptions/claude-billing.js";
+import { applyClaudeSubscriptionSessionIdentity, hasClaudeMetadataUserId, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../subscriptions/claude-subscription-body.js";
 import {
   CLAUDE_CODE_BETA,
   CLAUDE_MESSAGES_URL,
@@ -35,9 +35,10 @@ import {
   ensureClaudeSubscriptionCredential,
   getCachedClaudeSubscriptionCredential,
   getOrCreateClaudeSubscriptionDeviceId,
-} from "./claude-subscription.js";
+} from "../subscriptions/claude-subscription.js";
 
 export interface UpstreamRequestOptions {
+  signal?: AbortSignal;
   userAgent?: string;
   attemptIndex?: number;
   modelName?: string;
@@ -653,7 +654,9 @@ async function upstreamFetchToUrl(
     method: "POST",
     headers,
     body,
-    ...(abortController ? { signal: abortController.signal } : {}),
+    ...((abortController || options?.signal) ? { signal: abortController && options?.signal
+      ? AbortSignal.any([abortController.signal, options.signal])
+      : abortController?.signal ?? options?.signal } : {}),
   };
   ensureRecordedAttempt({
     index: options?.attemptIndex ?? 0,

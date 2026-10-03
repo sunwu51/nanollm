@@ -2,11 +2,11 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync } from 
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
-import type { CustomProviderConfig } from "./config.js";
+import type { CustomProviderConfig } from "../core/config.js";
 import { oauthPost } from "./oauth-transport.js";
 import { CODEX_CLI_ORIGINATOR, CODEX_CLI_VERSION, buildCodexCliUserAgent } from "./subscription-client-compat.js";
 import { getLatestCodexVersion } from "./codex-version.js";
-import { extractUpstreamModelIds } from "./upstream-models.js";
+import { extractUpstreamModelIds } from "../proxy/upstream-models.js";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEVICE_USER_CODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode";

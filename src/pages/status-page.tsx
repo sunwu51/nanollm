@@ -1,5 +1,6 @@
 import { renderToString } from "hono/jsx/dom/server";
-import type { StatusCell } from "./status.js";
+import { LOGO_DATA_URI } from "./logo.js";
+import type { StatusCell } from "../storage/status.js";
 import { USAGE_SCRIPT, USAGE_STYLE, UsageSection, type UsagePagePayload } from "./usage-page.js";
 
 function serializeForScript(value: unknown): string {
@@ -742,6 +743,7 @@ function StatusPage({ payload }: { payload: StatusPagePayload }) {
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>nanollm status</title>
+        <link rel="icon" type="image/svg+xml" href={LOGO_DATA_URI} />
         <style dangerouslySetInnerHTML={{ __html: STYLE }} />
       </head>
       <body>

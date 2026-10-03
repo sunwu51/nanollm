@@ -20,12 +20,12 @@ export function resolveOAuthTransportPath() {
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const candidates = [
     // npm packages keep all supported helpers in platform-specific directories.
+    join(moduleDir, "..", "..", "..", "native-bin", platformDirectory(), helperName()),
     join(moduleDir, "..", "..", "native-bin", platformDirectory(), helperName()),
-    join(moduleDir, "..", "native-bin", platformDirectory(), helperName()),
     // GitHub release bundles keep both executables beside each other.
     join(dirname(process.execPath), helperName()),
-    join(moduleDir, "..", "native", "oauth-transport", "target", "release", helperName()),
-    join(moduleDir, "native", "oauth-transport", helperName()),
+    join(moduleDir, "..", "..", "native", "oauth-transport", "target", "release", helperName()),
+    join(moduleDir, "..", "native", "oauth-transport", helperName()),
     resolve(process.cwd(), "native", "oauth-transport", "target", "release", helperName()),
   ];
   return candidates.find(existsSync);

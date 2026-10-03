@@ -155,7 +155,7 @@ jobs:
           cd npm-smoke
           npm init -y >/dev/null
           npm install "$tarball" >/dev/null
-          node --input-type=module -e "import('./node_modules/nanollm/dist/src/oauth-transport.js').then(m => { const p=m.resolveOAuthTransportPath(); if (!p || !p.replaceAll('\\\\','/').endsWith('native-bin/linux-x64/nanollm-oauth-transport')) throw new Error('npm helper was not resolved: '+p); console.log(p) })"
+          node --input-type=module -e "import('./node_modules/nanollm/dist/src/subscriptions/oauth-transport.js').then(m => { const p=m.resolveOAuthTransportPath(); if (!p || !p.replaceAll('\\\\','/').endsWith('native-bin/linux-x64/nanollm-oauth-transport')) throw new Error('npm helper was not resolved: '+p); console.log(p) })"
           cat > config.yaml <<'EOF'
           server:
             port: 31992

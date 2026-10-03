@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import vm from "node:vm";
 import os from "node:os";
 import { dirname, join } from "node:path";
 import { createClient, type Client } from "@libsql/client";
@@ -23,26 +24,26 @@ import {
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { denormalizeToAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
-import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/claude-subscription-body.js";
-import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/auth.js";
-import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/config.js";
-import { renderAdminConfigPage } from "../src/admin-config-page.js";
-import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/admin-config-form.js";
-import { buildModelTestRequest, extractModelTestReply } from "../src/model-test.js";
-import { buildSubscriptionModelsRequest } from "../src/openai-subscription.js";
-import { fetchLatestCodexVersion, parseCodexReleaseVersion } from "../src/codex-version.js";
-import { buildClaudeModelsHeaders } from "../src/claude-subscription.js";
-import { CODEX_CLI_ORIGINATOR, CODEX_CLI_USER_AGENT, CODEX_CLI_VERSION } from "../src/subscription-client-compat.js";
-import { extractUpstreamModelIds, fetchUpstreamModels } from "../src/upstream-models.js";
-import { ConfigManager } from "../src/config-manager.js";
-import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
-import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
-import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, forwardRequest, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
-import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "../src/response-cache.js";
-import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/response-compression.js";
-import { renderRecordPage } from "../src/record-page.js";
-import { renderStatusPage } from "../src/status-page.js";
-import { handleServerStartupError } from "../src/startup-error.js";
+import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
+import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
+import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
+import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
+import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/pages/admin-config-form.js";
+import { buildModelTestRequest, extractModelTestReply } from "../src/proxy/model-test.js";
+import { buildSubscriptionModelsRequest } from "../src/subscriptions/openai-subscription.js";
+import { fetchLatestCodexVersion, parseCodexReleaseVersion } from "../src/subscriptions/codex-version.js";
+import { buildClaudeModelsHeaders } from "../src/subscriptions/claude-subscription.js";
+import { CODEX_CLI_ORIGINATOR, CODEX_CLI_USER_AGENT, CODEX_CLI_VERSION } from "../src/subscriptions/subscription-client-compat.js";
+import { extractUpstreamModelIds, fetchUpstreamModels } from "../src/proxy/upstream-models.js";
+import { ConfigManager } from "../src/core/config-manager.js";
+import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/proxy/fallback.js";
+import { getHTTPLogLevel, shouldEmitLog } from "../src/core/http-log.js";
+import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, forwardRequest, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy/proxy.js";
+import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "../src/proxy/response-cache.js";
+import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/core/response-compression.js";
+import { renderRecordPage } from "../src/pages/record-page.js";
+import { renderStatusPage } from "../src/pages/status-page.js";
+import { handleServerStartupError } from "../src/core/startup-error.js";
 import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
@@ -62,14 +63,14 @@ import {
   stopRecording,
   useMemoryRecordStore,
   useSqliteRecordStore,
-} from "../src/record.js";
-import { runWithRequestId, setClientRequestHeaders } from "../src/request-context.js";
-import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/status.js";
-import { shouldIgnoreStreamReadError } from "../src/stream-errors.js";
-import { extractErrorCauses, formatErrorWithCauses } from "../src/error-details.js";
-import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/usage.js";
+} from "../src/storage/record.js";
+import { runWithRequestId, setClientRequestHeaders } from "../src/core/request-context.js";
+import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/storage/status.js";
+import { shouldIgnoreStreamReadError } from "../src/core/stream-errors.js";
+import { extractErrorCauses, formatErrorWithCauses } from "../src/core/error-details.js";
+import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/storage/usage.js";
 import { normalizeUsage } from "../src/converters/shared.js";
-import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch } from "../src/sqlite.js";
+import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
 
 function createTestSqliteClient(path: string): Client {
@@ -4829,6 +4830,7 @@ await runAsync("usage store aggregates daily attempts, success usage, and failur
   assert.equal(alpha.successRequests, 1);
   assert.equal(alpha.failureRequests, 1);
   assert.equal(alpha.totalTokens, 175);
+  assert.deepEqual(await store.listModelNames({ start: day, end: day }), ["alpha", "beta"]);
 });
 
 await runAsync("sqlite usage store persists daily aggregates and supports dense range queries", async () => {
@@ -4864,6 +4866,7 @@ await runAsync("sqlite usage store persists daily aggregates and supports dense 
     assert.equal(range[0].totalRequests, 0);
     assert.equal(range[1].day, "2026-01-02");
     assert.equal(range[1].totalRequests, 2);
+    assert.deepEqual(await restarted.listModelNames({ start: "2026-01-01", end: "2026-01-03" }), ["alpha"]);
   } finally {
     db.close();
     removeTestDir(dir);
@@ -5296,6 +5299,68 @@ await runAsync("record store deduplicates image data URLs and restores them for 
   await stopRecording();
 });
 
+await runAsync("record store compacts generated images in responses and image_generation_call inputs", async () => {
+  await startRecording({ maxSize: 3 });
+  const base64 = "c".repeat(1024 * 256);
+  const dataUrl = `data:image/webp;base64,${base64}`;
+  const generated = { id: "ig_1", type: "image_generation_call", status: "completed", output_format: "webp", result: base64 };
+
+  const jsonRequestId = "image004-1234-5678-9abc-def012345678";
+  beginRecordedRequest({
+    requestId: jsonRequestId,
+    path: "/v1/responses",
+    headers: {},
+    body: { model: "alpha", input: [{ role: "user", content: "draw" }, generated] },
+    stream: false,
+  });
+  ensureRecordedAttempt({
+    requestId: jsonRequestId,
+    index: 1,
+    provider: "openai-responses",
+    modelName: "alpha",
+    url: "https://example.com/v1/responses",
+    requestHeaders: {},
+    requestBody: JSON.stringify({ model: "upstream-alpha", input: [generated] }),
+  });
+  setRecordedAttemptResponseBody({ requestId: jsonRequestId, index: 1, body: JSON.stringify({ output: [generated] }) });
+  setRecordedClientResponseBody({ requestId: jsonRequestId, body: { output: [generated] } });
+  finalizeRecordedRequest({ requestId: jsonRequestId });
+
+  const compactJson = await getRecordedRequest(jsonRequestId);
+  const requestRef = (compactJson?.clientRequest.body as any).input[1].result;
+  assert.equal(requestRef.mediaType, "image/webp");
+  assert.equal(requestRef.base64Only, true);
+  assert.equal(await getRecordedImage(requestRef.__nanollm_record_image_ref), dataUrl);
+  assert.equal((compactJson?.attempts[0].request.body as any).input[0].result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  assert.equal((compactJson?.attempts[0].response.body as any).output[0].result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  assert.equal((compactJson?.clientResponse.body as any).output[0].result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  const replayable = await getRecordedRequest(jsonRequestId, { hydrateImages: true });
+  assert.equal((replayable?.clientRequest.body as any).input[1].result, base64);
+
+  const streamRequestId = "image005-1234-5678-9abc-def012345678";
+  beginRecordedRequest({ requestId: streamRequestId, path: "/v1/responses", headers: {}, body: { model: "alpha", stream: true }, stream: true });
+  const partial = { type: "response.image_generation_call.partial_image", output_format: "webp", partial_image_b64: "d".repeat(4096) };
+  const sse = [
+    `event: response.image_generation_call.partial_image\r\ndata: ${JSON.stringify(partial)}\r\n\r\n`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", item: generated })}\n\n`,
+    `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { output: [generated] } })}\n\n`,
+  ].join("");
+  for (let offset = 0; offset < sse.length; offset += 7000) {
+    appendRecordedClientResponseBody({ requestId: streamRequestId, chunk: sse.slice(offset, offset + 7000) });
+  }
+  finalizeRecordedRequest({ requestId: streamRequestId });
+
+  const streamed = String((await getRecordedRequest(streamRequestId))?.clientResponse.body);
+  assert.doesNotMatch(streamed, /cccccccc|dddddddd/);
+  assert.match(streamed, /event: response\.image_generation_call\.partial_image\r\ndata: \{.*\}\r\n\r\n/);
+  const events = streamed.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => JSON.parse(line.slice(5)));
+  assert.equal(events.length, 3);
+  assert.equal(await getRecordedImage(events[0].partial_image_b64.__nanollm_record_image_ref), `data:image/webp;base64,${partial.partial_image_b64}`);
+  assert.equal(events[1].item.result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  assert.equal(events[2].response.output[0].result.__nanollm_record_image_ref, requestRef.__nanollm_record_image_ref);
+  await stopRecording();
+});
+
 await runAsync("record summary keeps fallback actual model and failure status", async () => {
   await startRecording();
   const requestId = "fedcba98-7654-3210-abcd-ef1234567890";
@@ -5460,6 +5525,21 @@ await runAsync("sqlite record store restores compacted images after restart", as
     assert.equal(await getRecordedImage(compactImage.__nanollm_record_image_ref), image);
     const replayable = await getRecordedRequest(requestId, { hydrateImages: true });
     assert.equal((replayable?.clientRequest.body as any).input[0].content[0].image_url, image);
+
+    const streamRequestId = "image006-1234-5678-9abc-def012345678";
+    const generated = { type: "image_generation_call", output_format: "png", result: "e".repeat(1024 * 64) };
+    beginRecordedRequest({ requestId: streamRequestId, path: "/v1/responses", headers: {}, body: { model: "alpha", stream: true }, stream: true });
+    appendRecordedClientResponseBody({ requestId: streamRequestId, chunk: `data: ${JSON.stringify({ type: "response.output_item.done", item: generated })}\n\n` });
+    finalizeRecordedRequest({ requestId: streamRequestId });
+    await stopRecording();
+    db.close();
+
+    db = createTestSqliteClient(dbPath);
+    useSqliteRecordStore(db);
+    await startRecording({ maxSize: 2 });
+    const streamed = String((await getRecordedRequest(streamRequestId))?.clientResponse.body);
+    const ref = JSON.parse(streamed.trim().slice(5)).item.result.__nanollm_record_image_ref;
+    assert.equal(await getRecordedImage(ref), `data:image/png;base64,${generated.result}`);
   } finally {
     useMemoryRecordStore();
     db.close();
@@ -5600,7 +5680,8 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /\/record\/" \+ encodeURIComponent\(record\.requestId\) \+ "\/replay"/);
   assert.match(html, /\.recent-key\.active \{/);
   assert.match(html, /<a class="back-admin" href="\/admin">/);
-  assert.match(html, /selectedRequestId = requestId;\s*markActiveRecent\(\);/);
+  assert.match(html, /selectedRequestId = payload\.record\.requestId;/);
+  assert.match(html, /id="recent-pager"/);
   assert.match(html, /Sensitive client headers are not replayed; provider auth uses current config\./);
   assert.match(html, /Replay disabled while in progress/);
   assert.match(html, /Replay created new record/);
@@ -5620,7 +5701,8 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /placeholder="例如 6dfae2ab-1234-5678-9abc-def012345678"/);
   assert.match(html, /grid-template-columns: 1fr/);
   assert.match(html, /recent-key/);
-  assert.match(html, /recent-toggle/);
+  assert.doesNotMatch(html, /recent-toggle/);
+  assert.match(html, /\.recent-pager button\.current \{/);
   assert.match(html, /recent-title-row/);
   assert.match(html, /recent-title/);
   assert.match(html, /recent-model-row/);
@@ -5650,10 +5732,10 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /actualModel\.textContent = "-> " \+ \(item\.actualModel \|\| "-"\)/);
   assert.match(html, /meta\.textContent = item\.path \+ " · " \+ new Date\(item\.createdAt\)\.toLocaleTimeString\("zh-CN"\)/);
   assert.match(html, /renderRecentList/);
-  assert.match(html, /items\.slice\(0, 10\)/);
+  assert.match(html, /items\.slice\(start, start \+ 12\)/);
   assert.match(html, /model\.textContent = item\.model \|\| "-"/);
-  assert.match(html, /more\.textContent = "\.\.\."/);
-  assert.match(html, /collapse\.textContent = "<"/);
+  assert.doesNotMatch(html, /more\.textContent = "\.\.\."/);
+  assert.doesNotMatch(html, /collapse\.textContent = "<"/);
   assert.match(html, /function flushEvent\(/);
   assert.match(html, /const lines = normalized\.split\("\\n"\)/);
   assert.match(html, /currentDataLines\[currentDataLines\.length - 1\] \+= "\\n" \+ line/);
@@ -5666,7 +5748,7 @@ run("record page renders query UI and JSON tree viewer", () => {
 run("model test builds provider-native streaming requests", () => {
   const chat = buildModelTestRequest("openai-chat", "alpha", "hi");
   assert.equal(chat.path, "/v1/chat/completions");
-  assert.deepEqual(chat.body, { model: "alpha", messages: [{ role: "user", content: "hi" }], stream: true });
+  assert.deepEqual(chat.body, { model: "alpha", messages: [{ role: "user", content: "hi" }], stream: true, stream_options: { include_usage: true } });
   const responses = buildModelTestRequest("openai-responses", "beta", "hi");
   assert.equal(responses.path, "/v1/responses");
   assert.equal(responses.body.stream, true);
@@ -5765,6 +5847,187 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.match(html, /"X-Test":"ok"/);
 });
 
+class FakeRecordPageElement {
+  children: FakeRecordPageElement[] = [];
+  parent?: FakeRecordPageElement;
+  className = "";
+  dataset: Record<string, string> = {};
+  style: Record<string, string> = {};
+  disabled = false;
+  scrolledIntoView = false;
+  private text = "";
+  private listeners = new Map<string, Array<() => void>>();
+
+  constructor(readonly tagName: string, private readonly doc: { activeElement?: FakeRecordPageElement }) {}
+
+  get textContent(): string {
+    return this.text + this.children.map((child) => child.textContent).join("");
+  }
+
+  set textContent(value: string) {
+    this.children = [];
+    this.text = value;
+  }
+
+  get classList() {
+    const names = () => new Set(this.className.split(/\s+/).filter(Boolean));
+    return {
+      contains: (name: string) => names().has(name),
+      add: (name: string) => { this.className = [...names(), name].join(" "); },
+      remove: (name: string) => { this.className = [...names()].filter((item) => item !== name).join(" "); },
+      toggle: (name: string, force?: boolean) => {
+        const set = names();
+        if (force ?? !set.has(name)) set.add(name); else set.delete(name);
+        this.className = [...set].join(" ");
+      },
+    };
+  }
+
+  appendChild(child: FakeRecordPageElement) {
+    child.parent = this;
+    this.children.push(child);
+    return child;
+  }
+
+  append(...children: Array<FakeRecordPageElement | string>) {
+    for (const child of children) {
+      if (typeof child === "string") this.text += child; else this.appendChild(child);
+    }
+  }
+
+  remove() {
+    if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this);
+  }
+
+  setAttribute(name: string, value: string) {
+    (this as unknown as Record<string, unknown>)[name] = value;
+  }
+
+  addEventListener(type: string, listener: () => void) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  click() {
+    if (!this.disabled) this.listeners.get("click")?.forEach((listener) => listener());
+  }
+
+  focus() {
+    this.doc.activeElement = this;
+  }
+
+  scrollIntoView() {
+    this.scrolledIntoView = true;
+  }
+
+  // Only class selectors (".a.b") are needed by the record page script.
+  querySelectorAll(selector: string): FakeRecordPageElement[] {
+    const classes = selector.split(".").filter(Boolean);
+    const found: FakeRecordPageElement[] = [];
+    const visit = (node: FakeRecordPageElement) => {
+      for (const child of node.children) {
+        if (classes.every((name) => child.classList.contains(name))) found.push(child);
+        visit(child);
+      }
+    };
+    visit(this);
+    return found;
+  }
+
+  querySelector(selector: string) {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+}
+
+type RecentKey = NonNullable<Parameters<typeof renderRecordPage>[0]["recentKeys"]>[number];
+
+function makeRecentKeys(count: number): RecentKey[] {
+  return Array.from({ length: count }, (_, index) => ({
+    key: `key-${index}`,
+    requestId: `req${String(index).padStart(3, "0")}-0000-0000`,
+    path: "/v1/messages",
+    model: "claude-sonnet-4-6",
+    source: "claudecode" as const,
+    status: "success" as const,
+    createdAt: Date.UTC(2026, 3, 20) - index * 1000,
+  }));
+}
+
+function makeRecordFor(item: RecentKey) {
+  return {
+    requestId: item.requestId,
+    key: item.key,
+    createdAt: item.createdAt,
+    stream: false,
+    clientRequest: { path: item.path, headers: {}, body: {}, source: item.source, status: item.status },
+    attempts: [],
+    clientResponse: { status: 200, headers: {}, body: {} },
+  };
+}
+
+/** Run the record page's inline script against a fake DOM, opening it with the given `?requestId=` search. */
+async function runRecordPageScript(recentKeys: RecentKey[], search: string, record: unknown) {
+  const summary = { enabled: true, capturedCount: recentKeys.length, limit: 100, sessionStartedAt: Date.UTC(2026, 3, 20), recentKeys };
+  const script = /<script>([\s\S]*)<\/script>/.exec(renderRecordPage(summary))?.[1];
+  assert.ok(script, "record page script");
+  const doc: { activeElement?: FakeRecordPageElement } = {};
+  const elements = new Map<string, FakeRecordPageElement>();
+  const fetchedUrls: string[] = [];
+  const replacedUrls: string[] = [];
+  vm.runInContext(script, vm.createContext({
+    document: {
+      getElementById(id: string) {
+        if (!elements.has(id)) elements.set(id, new FakeRecordPageElement("div", doc));
+        return elements.get(id);
+      },
+      createElement: (tagName: string) => new FakeRecordPageElement(tagName, doc),
+    },
+    window: { location: { search } },
+    history: { replaceState: (_state: unknown, _title: string, url: string) => replacedUrls.push(url) },
+    fetch: async (url: string) => {
+      fetchedUrls.push(url);
+      return { ok: true, json: async () => ({ summary, record }) };
+    },
+    setInterval: () => 0,
+    URLSearchParams,
+  }));
+  await waitForCondition(() => replacedUrls.length > 0);
+  return { doc, recent: elements.get("recent")!, pager: elements.get("recent-pager")!, fetchedUrls };
+}
+
+await runAsync("record page paginates recent requests and jumps to the page of a requestId from the URL", async () => {
+  const recentKeys = makeRecentKeys(37);
+  const target = recentKeys[30];
+  const prefix = target.requestId.slice(0, 6);
+  const { doc, recent, pager, fetchedUrls } = await runRecordPageScript(recentKeys, "?requestId=" + prefix, makeRecordFor(target));
+
+  assert.deepEqual(fetchedUrls, ["/record/" + prefix]);
+  assert.deepEqual(recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId), recentKeys.slice(24, 36).map((item) => item.requestId));
+  const active = recent.querySelector(".recent-key.active");
+  assert.equal(active?.dataset.requestId, target.requestId);
+  assert.equal(doc.activeElement, active);
+  assert.equal(active?.scrolledIntoView, true);
+  assert.equal(pager.querySelector(".current")?.textContent, "3");
+  assert.match(pager.textContent, /25–36 \/ 37/);
+
+  pager.children.find((child) => child.textContent === "›")!.click();
+  assert.deepEqual(recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId), recentKeys.slice(36).map((item) => item.requestId));
+  assert.equal(pager.querySelector(".current")?.textContent, "4");
+  assert.match(pager.textContent, /37–37 \/ 37/);
+  assert.equal(pager.children.find((child) => child.textContent === "›")?.disabled, true);
+
+  pager.children.find((child) => child.textContent === "1")!.click();
+  assert.deepEqual(recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId), recentKeys.slice(0, 12).map((item) => item.requestId));
+  assert.equal(pager.children.find((child) => child.textContent === "‹")?.disabled, true);
+});
+
+await runAsync("record page hides the pager when all recent requests fit on one page", async () => {
+  const recentKeys = makeRecentKeys(12);
+  const { recent, pager } = await runRecordPageScript(recentKeys, "?requestId=" + recentKeys[11].requestId, makeRecordFor(recentKeys[11]));
+  assert.equal(recent.querySelectorAll(".recent-key").length, 12);
+  assert.equal(recent.querySelector(".recent-key.active")?.dataset.requestId, recentKeys[11].requestId);
+  assert.equal(pager.children.length, 0);
+});
+
 run("record page stream parser keeps data-like text inside JSON payloads", () => {
   const html = renderRecordPage({
     enabled: true,
@@ -5778,6 +6041,11 @@ run("record page stream parser keeps data-like text inside JSON payloads", () =>
   assert.match(html, /if \(line === ""\) \{\n            flushEvent\(\);/);
   assert.match(html, /currentDataLines\.push\(line\.slice\(5\)\.trimStart\(\)\)/);
   assert.match(html, /currentDataLines\[currentDataLines\.length - 1\] \+= "\\n" \+ line/);
+});
+
+run("server.ts keeps @ts-nocheck as its first line so the build stays type-check free", () => {
+  // The directive is ignored unless it precedes every statement; an import above it broke the Railway build.
+  assert.equal(readFileSync(join(process.cwd(), "server.ts"), "utf8").split(/\r?\n/, 1)[0], "// @ts-nocheck");
 });
 
 run("http log level only keeps /v1 lifecycle logs at info", () => {

@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { getRequestId } from "./request-context.js";
-import { DEFAULT_RECORD_MAX_SIZE } from "./config.js";
+import { getRequestId } from "../core/request-context.js";
+import { DEFAULT_RECORD_MAX_SIZE } from "../core/config.js";
 import type { SqliteClient } from "./sqlite.js";
 import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
-import type { ErrorCauseDetail } from "./error-details.js";
+import type { ErrorCauseDetail } from "../core/error-details.js";
 
 const REDACTED = "[REDACTED]";
 const SENSITIVE_HEADERS = new Set(["authorization", "x-api-key", "cookie", "set-cookie"]);
@@ -188,6 +188,13 @@ function isImageReference(value: unknown): value is ImageReference {
   return !!value && typeof value === "object" && !Array.isArray(value) && typeof (value as Record<string, unknown>)[IMAGE_REFERENCE_KEY] === "string";
 }
 
+// Responses image_generation_call items and partial_image stream events carry raw base64 without a data URL prefix.
+function isGeneratedImageField(source: Record<string, unknown>, key: string, item: unknown): item is string {
+  if (typeof item !== "string" || !item || isImageDataUrl(item)) return false;
+  return (key === "result" && source.type === "image_generation_call") ||
+    (key === "partial_image_b64" && source.type === "response.image_generation_call.partial_image");
+}
+
 // Keep request records compact while retaining enough information to reconstruct them for replay.
 function compactImages(value: unknown, images: Map<string, string>): unknown {
   if (typeof value === "string") return isImageDataUrl(value) ? imageReference(value, images) : value;
@@ -199,6 +206,9 @@ function compactImages(value: unknown, images: Map<string, string>): unknown {
   for (const [key, item] of Object.entries(source)) {
     if (key === "data" && source.type === "base64" && typeof item === "string" && typeof source.media_type === "string") {
       result[key] = imageReference(`data:${source.media_type};base64,${item}`, images, true);
+    } else if (isGeneratedImageField(source, key, item)) {
+      const format = typeof source.output_format === "string" && source.output_format ? source.output_format : "png";
+      result[key] = imageReference(`data:image/${format};base64,${item}`, images, true);
     } else {
       result[key] = compactImages(item, images);
     }
@@ -216,16 +226,46 @@ function restoreImages(value: unknown, images: Map<string, string>): unknown {
   return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, restoreImages(item, images)]));
 }
 
+const TEXT_IMAGE_REFERENCE = new RegExp(`"${IMAGE_REFERENCE_KEY}":"([a-f0-9]{64})"`, "g");
+
 function collectImageReferences(value: unknown, hashes = new Set<string>()): Set<string> {
   if (isImageReference(value)) hashes.add(value[IMAGE_REFERENCE_KEY]);
+  // Streamed bodies keep references inside raw SSE text.
+  else if (typeof value === "string" && value.includes(IMAGE_REFERENCE_KEY)) {
+    for (const match of value.matchAll(TEXT_IMAGE_REFERENCE)) hashes.add(match[1]);
+  }
   else if (Array.isArray(value)) value.forEach((item) => collectImageReferences(item, hashes));
   else if (value && typeof value === "object") Object.values(value).forEach((item) => collectImageReferences(item, hashes));
   return hashes;
 }
 
+const SSE_IMAGE_HINT = /data:image\/|"base64"|image_generation_call/;
+
+// Streamed bodies are stored as raw SSE text; compact image payloads inside each JSON data line.
+function compactSseText(text: string, images: Map<string, string>): string {
+  if (!SSE_IMAGE_HINT.test(text)) return text;
+  return text.split("\n").map((line) => {
+    if (!line.startsWith("data:") || !SSE_IMAGE_HINT.test(line)) return line;
+    try {
+      const compacted = compactImages(JSON.parse(line.slice(5)), images);
+      if (collectImageReferences(compacted).size === 0) return line;
+      return `data: ${JSON.stringify(compacted)}${line.endsWith("\r") ? "\r" : ""}`;
+    } catch {
+      return line;
+    }
+  }).join("\n");
+}
+
 function compactRecordBody(body: unknown, images: Map<string, string>): { value: unknown; truncated: boolean } {
   const parsed = typeof body === "string" ? (() => { try { return JSON.parse(body); } catch { return body; } })() : body;
-  return { value: compactImages(parsed, images), truncated: false };
+  return { value: typeof parsed === "string" ? compactSseText(parsed, images) : compactImages(parsed, images), truncated: false };
+}
+
+function compactStreamedBodies(record: RecordEntry, images: Map<string, string>) {
+  for (const attempt of record.attempts) {
+    if (typeof attempt.response.body === "string") attempt.response.body = compactSseText(attempt.response.body, images);
+  }
+  if (typeof record.clientResponse.body === "string") record.clientResponse.body = compactSseText(record.clientResponse.body, images);
 }
 
 function maskHeaderValue(name: string, value: string): string {
@@ -448,7 +488,7 @@ class RecordStore implements RecordStoreLike {
   setAttemptResponseBody(input: { requestId?: string; index: number; body: unknown }) {
     const attempt = this.getMutable(input.requestId)?.attempts.find((item) => item.index === input.index);
     if (!attempt) return;
-    const body = normalizeBody(input.body);
+    const body = compactRecordBody(input.body, this.images);
     attempt.response.body = body.value;
     attempt.response.truncated = body.truncated;
   }
@@ -488,7 +528,7 @@ class RecordStore implements RecordStoreLike {
   setClientResponseBody(input: { requestId?: string; body: unknown }) {
     const record = this.getMutable(input.requestId);
     if (!record) return;
-    const body = normalizeBody(input.body);
+    const body = compactRecordBody(input.body, this.images);
     record.clientResponse.body = body.value;
     record.clientResponse.truncated = body.truncated;
     record.firstByteAt ??= Date.now();
@@ -514,7 +554,9 @@ class RecordStore implements RecordStoreLike {
 
   finalizeRequest(input: { requestId?: string }) {
     const record = this.getMutable(input.requestId);
-    if (record) record.completedAt ??= Date.now();
+    if (!record || record.completedAt) return;
+    compactStreamedBodies(record, this.images);
+    record.completedAt = Date.now();
   }
 }
 
@@ -992,7 +1034,7 @@ class SqliteRecordStore implements RecordStoreLike {
     this.mutate(input.requestId, (record) => {
       const attempt = record.attempts.find((item) => item.index === input.index);
       if (!attempt) return;
-      const body = normalizeBody(input.body);
+      const body = compactRecordBody(input.body, this.images);
       attempt.response.body = body.value;
       attempt.response.truncated = body.truncated;
     });
@@ -1036,7 +1078,7 @@ class SqliteRecordStore implements RecordStoreLike {
 
   setClientResponseBody(input: { requestId?: string; body: unknown }) {
     this.mutate(input.requestId, (record) => {
-      const body = normalizeBody(input.body);
+      const body = compactRecordBody(input.body, this.images);
       record.clientResponse.body = body.value;
       record.clientResponse.truncated = body.truncated;
       record.firstByteAt ??= Date.now();
@@ -1067,6 +1109,7 @@ class SqliteRecordStore implements RecordStoreLike {
     const key = getRecordKey(id);
     const record = this.activeRecords.get(key);
     if (!record) return;
+    if (!record.completedAt) compactStreamedBodies(record, this.images);
     record.completedAt ??= Date.now();
     this.activeRecords.delete(key);
     this.persistQueue.set(key, record);

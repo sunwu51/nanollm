@@ -1,4 +1,4 @@
-import type { UsageDayCell } from "./usage.js";
+import type { UsageDayCell } from "../storage/usage.js";
 
 export type UsageRangeMode = "7d" | "30d" | "year";
 
@@ -345,6 +345,14 @@ export const USAGE_SCRIPT = String.raw`
         ) / 1000000;
       }
 
+      function findModelPrice(modelId) {
+        const exactPrice = modelPrices[modelId];
+        if (exactPrice) return exactPrice;
+        const separator = modelId.lastIndexOf("-");
+        if (separator <= 0) return null;
+        return modelPrices[modelId.slice(0, separator)] || null;
+      }
+
       function renderUsageCosts() {
         if (!modelPrices) {
           USAGE_EQUIVALENT_COST_EL.textContent = "正在加载模型价格…";
@@ -357,7 +365,7 @@ export const USAGE_SCRIPT = String.raw`
         const unmatchedModels = [];
         for (const item of USAGE_DATA.modelUsage || []) {
           const modelId = String(item.upstreamModel || "").toLowerCase();
-          const price = modelPrices[modelId];
+          const price = findModelPrice(modelId);
           if (price) matchedCost += calculateModelCost(item.metrics, price);
           else {
             unmatchedCost += calculateModelCost(item.metrics, fallbackPrice);

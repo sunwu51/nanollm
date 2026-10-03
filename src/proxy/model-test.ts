@@ -1,4 +1,4 @@
-import { SSEParser, type StreamFormat } from "./converters/streams.js";
+import { SSEParser, type StreamFormat } from "../converters/streams.js";
 
 export const DEFAULT_MODEL_TEST_MESSAGE = "Reply with only ok.";
 export const PELICAN_MODEL_TEST_MESSAGE = "Generate an SVG animation embedded in HTML of a pelican riding a bicycle. Return only the code, with no explanation.";
@@ -8,7 +8,8 @@ export function buildModelTestRequest(provider: StreamFormat, modelName: string,
     case "openai-chat":
       return {
         path: "/v1/chat/completions",
-        body: { model: modelName, messages: [{ role: "user", content: message }], stream: true },
+        // Without include_usage a same-format passthrough never sees token usage.
+        body: { model: modelName, messages: [{ role: "user", content: message }], stream: true, stream_options: { include_usage: true } },
       };
     case "openai-responses":
       return {

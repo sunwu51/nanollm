@@ -2,10 +2,10 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 
 import { dirname, join, resolve } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
-import type { CustomProviderConfig } from "./config.js";
+import type { CustomProviderConfig } from "../core/config.js";
 import { oauthPost } from "./oauth-transport.js";
 import { CLAUDE_CODE_USER_AGENT, CLAUDE_OAUTH_BETA } from "./subscription-client-compat.js";
-import { extractUpstreamModelIds } from "./upstream-models.js";
+import { extractUpstreamModelIds } from "../proxy/upstream-models.js";
 
 export { CLAUDE_CLI_USER_AGENT, CLAUDE_CODE_BETA, CLAUDE_OAUTH_BETA } from "./subscription-client-compat.js";
 
