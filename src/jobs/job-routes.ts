@@ -3,7 +3,7 @@ import type { ModelConfig } from "../core/config.js";
 import { JobConflictError, JobValidationError, jobError, nextJobDates, validateJob, validateJobModels } from "./jobs.js";
 import type { JobScheduler } from "./job-scheduler.js";
 
-export function createJobRoutes(scheduler: JobScheduler, getModels: () => ModelConfig[], storageMode: string, catalog?: { list(refresh?: boolean): Promise<unknown>; resolve(name: string): ModelConfig | undefined }) {
+export function createJobRoutes(scheduler: JobScheduler, getModels: () => ModelConfig[], storageMode: string, catalog?: { list(): unknown; resolve(name: string): ModelConfig | undefined }) {
   const routes = new Hono();
   routes.use("*", async (c, next) => {
     c.header("Cache-Control", "no-store");
@@ -21,7 +21,7 @@ export function createJobRoutes(scheduler: JobScheduler, getModels: () => ModelC
   });
   routes.onError((error, c) => c.json({ error: jobError(error).message }, error instanceof JobConflictError ? 409 : error instanceof JobValidationError || error instanceof SyntaxError ? 400 : 500));
   const validateModels = (job: Parameters<typeof validateJobModels>[0]) => { if (!catalog) return validateJobModels(job, getModels()); for (const name of job.models) if (!catalog.resolve(name)) throw new JobValidationError("models: 目标模型不存在"); };
-  routes.get("/model-options", async c => c.json(catalog ? await catalog.list(c.req.query("refresh") === "1") : { modelOptions: getModels().filter(m => m.provider !== "openai-image" && !m.name.includes("*")).map(m => ({ name: m.name, label: m.name, group: m.provider })), modelErrors: [] }));
+  routes.get("/model-options", c => c.json(catalog ? catalog.list() : { modelOptions: getModels().filter(m => m.provider !== "openai-image" && !m.name.includes("*")).map(m => ({ name: m.name, label: m.name, group: m.provider })) }));
   routes.get("/data", async c => c.json({ ...await scheduler.data(), storageMode }));
   routes.post("/schedule-preview", async c => {
     const body = await c.req.json(); return c.json({ dates: nextJobDates({ cron: body.cron, timezone: body.timezone }) });

@@ -240,14 +240,10 @@ const usageStore: UsageStoreLike = sqliteStorage ? new SqliteUsageStore(sqliteSt
 const jobsPath = join(dirname(configPath), "jobs.yaml");
 const jobConfigStore = new JobConfigStore(jobsPath);
 const jobRunStore = sqliteStorage ? new SqliteJobRunStore(sqliteStorage.client, jobsPath) : new MemoryJobRunStore();
-const jobModelCatalog = new JobModelCatalog(() => configManager.getActiveSnapshot().effectiveConfig, async provider => {
-  if (provider.provider === "openai-subscription") return fetchSubscriptionModels(provider.name, provider.proxy);
-  const headers: Record<string, string> = {}; applyClaudeSubscriptionHeaders(headers);
-  return fetchClaudeSubscriptionModels(provider.name, provider.proxy, headers);
-});
+const jobModelCatalog = new JobModelCatalog(() => configManager.getActiveSnapshot().effectiveConfig);
 // Scheduled jobs call the gateway's own /v1 routes in-process, so they are recorded and counted in
-// status/usage exactly like client requests. The job's catalog-resolved model (possibly a
-// `subscription:` name that /v1 cannot look up) is pinned to the request id for getCandidateModels.
+// status/usage exactly like client requests. The job's catalog-resolved model is pinned to the
+// request id for getCandidateModels, so the call uses the connection snapshotted when the run started.
 const jobRequestModels = new Map<string, ModelConfig>();
 const jobRequestExecutor = createModelRequestExecutor(async (model, request) => {
   const config = configManager.getActiveSnapshot().effectiveConfig;

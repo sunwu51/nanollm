@@ -28,7 +28,7 @@ docs/                Reference docs
 3. `proxy/proxy` calls the upstream. Subscription providers obtain tokens and headers through `subscriptions/*`.
 4. The response (or SSE stream) is converted back (`converters/responses`, `converters/streams`) and returned, with errors shaped by `core/error-details` and `core/stream-errors`.
 5. `storage/record`, `storage/status` and `storage/usage` persist what happened. `pages/*` render it.
-6. `jobs/*` runs model requests on a cron schedule. `server.ts` gives the job executor a sender that calls the app's own `/v1` routes in-process, so job calls go through steps 1-5 (recording, status, usage) like client requests. The job's resolved model is pinned to the request id, so `subscription:` targets work without being exposed to `/v1` clients. Results are stored through `jobs/job-run-store`, and each attempt keeps its `request_id` for linking to the record.
+6. `jobs/*` runs model requests on a cron schedule. `server.ts` gives the job executor a sender that calls the app's own `/v1` routes in-process, so job calls go through steps 1-5 (recording, status, usage) like client requests. Job targets are the text models in config.yaml (`jobs/job-model-catalog`); the resolved model is pinned to the request id so the call uses the connection snapshotted when the run started. Results are stored through `jobs/job-run-store`, and each attempt keeps its `request_id` for linking to the record.
 
 ## Modules
 

@@ -517,7 +517,7 @@ jobs:
       max_runs: 24
 ```
 
-The executor builds one user message in each model's own protocol and manages the streaming request. Calls use the selected connection directly and do not go through fallback. Configured text models and models from the OpenAI and Claude subscription catalogs are supported; subscription models do not need to be added to config.yaml, and catalog loading errors are shown in the form. Existing per-model overrides (body, headers, expressions) still apply. Job requests consume provider quota and count towards model call status and usage statistics.
+The executor builds one user message in each model's own protocol and manages the streaming request. Calls use the selected connection directly and do not go through fallback. Targets are the text models configured in config.yaml (including subscription-backed models defined there). Existing per-model overrides (body, headers, expressions) still apply. Job requests go through the gateway's own /v1 routes, so they consume provider quota, appear in /record and count towards model call status and usage statistics.
 
 - **memory (default)**: runs, raw text outputs, review marks and notes are kept in memory and cleared on restart (job config is kept). By default the latest 24 finished runs per job are kept; all job history also shares a 64 MiB memory cap, and when it is reached the oldest finished runs are dropped. Running runs are never evicted.
 - **SQLite**: adds a `job_runs` table. Retention follows each job's `max_runs`, and outputs are stored and evicted together with their runs. History survives restarts, and unfinished runs are marked `interrupted`. Records are isolated by the absolute path of `jobs.yaml`, so history is only restored when the same path is used.

@@ -340,27 +340,40 @@ test("message-only request rejects empty messages and generation parameters", ()
     else assert.deepEqual(body.messages,[{role:"user",content:"hello"}]);
   }
 });
-test("subscription catalog covers both providers, caches discovery and resolves without discovery", async () => {
-  const config = {models:[model,{...model,name:"wild-*",model:"*",custom_provider:"oa",subscription_provider:"oa",provider:"openai-responses"}],
-    providers:[{name:"oa",provider:"openai-subscription",base_url:"",api_key:"",proxy:"http://localhost:1234"},{name:"cl",provider:"claude-subscription",base_url:"",api_key:""}],
-    ttfb_timeout:12345} as ServerConfig;
-  let calls=0;
-  const catalog = new JobModelCatalog(()=>config,async p=>{calls++;return p.name==="oa"?["gpt-test"]:["claude-test"];});
-  const name="subscription:oa:gpt-test";
-  assert.equal(catalog.resolve(name)?.subscription_provider,"oa");
-  assert.equal(catalog.resolve(name)?.provider_proxy,"http://localhost:1234");
-  assert.equal(catalog.resolve("wild-gpt-test")?.model,"gpt-test");
-  const [a,b] = await Promise.all([catalog.list(),catalog.list()]);
-  assert.equal(calls,2);assert.deepEqual(a,b);
-  assert.ok(a.modelOptions.some(m=>m.name===name));
-  assert.equal(catalog.resolve("subscription:cl:claude-test")?.provider,"anthropic");
-  assert.equal(catalog.resolve("subscription:cl:claude-test")?.claude_subscription_provider,"cl");
-  config.providers=[];assert.equal(catalog.resolve(name),undefined);
+test("job catalog lists only config text models and does not discover subscription models", () => {
+  const config = { models: [model,
+    { name: "oa-gpt", provider: "openai-responses", base_url: "https://chatgpt.com/backend-api/codex", api_key: "", model: "gpt-test", custom_provider: "oa", subscription_provider: "oa" },
+    { ...model, name: "wild-*", model: "*" }, { ...model, name: "img", provider: "openai-image" }],
+    providers: [{ name: "oa", provider: "openai-subscription", base_url: "", api_key: "" }, { name: "cl", provider: "claude-subscription", base_url: "", api_key: "" }] } as unknown as ServerConfig;
+  const catalog = new JobModelCatalog(() => config);
+  assert.deepEqual(catalog.list().modelOptions, [{ name: "chosen", label: "chosen", group: "openai-chat" }, { name: "oa-gpt", label: "oa-gpt", group: "oa" }]);
+  assert.equal(catalog.resolve("oa-gpt")?.subscription_provider, "oa");
+  assert.deepEqual([catalog.resolve("wild-gpt-test")?.name, catalog.resolve("wild-gpt-test")?.model], ["wild-gpt-test", "gpt-test"]);
+  assert.equal(catalog.resolve("img"), undefined);
+  assert.equal(catalog.resolve("subscription:oa:gpt-test"), undefined);
 });
-test("subscription discovery errors remain visible", async () => {
-  const config={models:[],providers:[{name:"broken",provider:"openai-subscription",base_url:"",api_key:""}]} as unknown as ServerConfig;
-  const catalog=new JobModelCatalog(()=>config,async()=>{throw new Error("login required");});
-  assert.match((await catalog.list()).modelErrors[0],/broken: login required/);
+
+test("job API offers config models only and rejects subscription: targets", async t => {
+  const config = { models: [model], providers: [{ name: "oa", provider: "openai-subscription", base_url: "", api_key: "" }] } as unknown as ServerConfig;
+  const catalog = new JobModelCatalog(() => config), store = fixture(t);
+  const scheduler = new JobScheduler(store, new MemoryJobRunStore(), () => config.models, [success], Date.now, 2, n => catalog.resolve(n));
+  await scheduler.initialize(); const app = new Hono(); app.route("/jobs/api", createJobRoutes(scheduler, () => config.models, "memory", catalog));
+  assert.deepEqual(await (await app.request("/jobs/api/model-options")).json(), { modelOptions: [{ name: "chosen", label: "chosen", group: "openai-chat" }] });
+  const save = (models: string[]) => app.request("/jobs/api/jobs", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ job: { ...job(), models }, baseVersion: store.snapshot().version }) });
+  const rejected = await save(["subscription:oa:gpt-test"]);
+  assert.equal(rejected.status, 400); assert.match((await rejected.json()).error, /目标模型不存在/);
+  assert.equal((await save(["chosen"])).status, 201);
+});
+
+test("job form hides filtered models and aligns the schedule checkbox with the other inputs", () => {
+  const html = renderJobsPage();
+  // `.model-picker label{display:flex}` would otherwise override the hidden attribute and break search.
+  assert.ok(html.includes("[hidden]{display:none!important}"));
+  assert.ok(html.includes("label.hidden=!label.textContent.toLowerCase().includes(search.value.toLowerCase())"));
+  assert.ok(html.includes("enabledField.append(node('label','定时调度'),enabledLabel)"));
+  assert.ok(html.includes(".check-row{display:flex;align-items:center;gap:8px;min-height:44px}"));
+  assert.doesNotMatch(html, /刷新模型目录|订阅模型目录|model-options\?refresh/);
 });
 test("jobs page uses aligned URL and only user message editor", () => {
   const html=renderJobsPage();assert.match(html,/\/jobs\/api\//);
@@ -460,20 +473,6 @@ test("history rows expand to show each model result and expand-all pauses auto r
   assert.equal(calls.filter(c => c === "data").length, dataCalls + 1);
 });
 
-test("subscription targets save and execute with native credentials tags", async t => {
-  const config={models:[],providers:[{name:"oa",provider:"openai-subscription",base_url:"",api_key:""},{name:"cl",provider:"claude-subscription",base_url:"",api_key:""}]} as unknown as ServerConfig;
-  const catalog=new JobModelCatalog(()=>config,async()=>[]);
-  const store=fixture(t),runs=new MemoryJobRunStore(),seen:ModelConfig[]=[];
-  const scheduler=new JobScheduler(store,runs,()=>[],[{type:"model_request",execute:async(j,m)=>{seen.push(m);assert.equal(j.request.message,"Draw a pelican");return output;}}],Date.now,2,n=>catalog.resolve(n));
-  await scheduler.initialize();const app=new Hono();app.route("/jobs/api",createJobRoutes(scheduler,()=>[],"memory",catalog));
-  const value={...job(),models:["subscription:oa:gpt-test","subscription:cl:claude-test"]};
-  const response=await app.request("/jobs/api/jobs",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({job:value,baseVersion:store.snapshot().version})});
-  assert.equal(response.status,201);
-  await scheduler.runNow(value.id);await finished(scheduler);
-  assert.equal(seen[0].subscription_provider,"oa");assert.equal(seen[0].provider,"openai-responses");
-  assert.equal(seen[1].claude_subscription_provider,"cl");assert.equal(seen[1].provider,"anthropic");
-  assert.equal((await runs.list())[0].status,"succeeded");
-});
 test("legacy single-user templates migrate to message-only configuration", t => {
   const store=fixture(t);const value={...job(),request:{format:"openai-chat",body:{messages:[{role:"user",content:"legacy prompt"}],max_tokens:8192}}};
   writeFileSync(store.path,stringify({version:1,jobs:[value]}));
