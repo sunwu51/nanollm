@@ -1,4 +1,4 @@
-import { SSEParser, type StreamFormat } from "./converters/streams.js";
+import { SSEParser, type StreamFormat } from "../converters/streams.js";
 
 export const DEFAULT_MODEL_TEST_MESSAGE = "Reply with only ok.";
 export const PELICAN_MODEL_TEST_MESSAGE = "Generate an SVG animation embedded in HTML of a pelican riding a bicycle. Return only the code, with no explanation.";

@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import http from "node:http";
 import { execFileSync } from "node:child_process";
 import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
-import { oauthPost, resolveOAuthTransportPath } from "../src/oauth-transport.js";
-import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, ensureClaudeSubscriptionCredential, getCachedClaudeSubscriptionCredential, getOrCreateClaudeSubscriptionDeviceId, parseClaudeCallback, startClaudeLogin } from "../src/claude-subscription.js";
-import { parseConfigText } from "../src/config.js";
-import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "../src/proxy.js";
-import { applyClaudeSubscriptionSessionIdentity } from "../src/claude-subscription-body.js";
-import { runWithRequestId, setClientIp, setClientRequestHeaders } from "../src/request-context.js";
-import { bootstrapSubscriptionProviders, configureSubscriptionStorage, startDeviceLogin, pollDeviceLogin, ensureSubscriptionCredential, getCachedSubscriptionCredential } from "../src/openai-subscription.js";
+import { oauthPost, resolveOAuthTransportPath } from "../src/subscriptions/oauth-transport.js";
+import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, ensureClaudeSubscriptionCredential, getCachedClaudeSubscriptionCredential, getOrCreateClaudeSubscriptionDeviceId, parseClaudeCallback, startClaudeLogin } from "../src/subscriptions/claude-subscription.js";
+import { parseConfigText } from "../src/core/config.js";
+import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "../src/proxy/proxy.js";
+import { applyClaudeSubscriptionSessionIdentity } from "../src/subscriptions/claude-subscription-body.js";
+import { runWithRequestId, setClientIp, setClientRequestHeaders } from "../src/core/request-context.js";
+import { bootstrapSubscriptionProviders, configureSubscriptionStorage, startDeviceLogin, pollDeviceLogin, ensureSubscriptionCredential, getCachedSubscriptionCredential } from "../src/subscriptions/openai-subscription.js";
 
 test("Claude device ID migrates legacy credentials and survives a fresh process", () => {
   const dir = mkdtempSync(join(tmpdir(), "nanollm-claude-device-"));
@@ -29,7 +29,7 @@ test("Claude device ID migrates legacy credentials and survives a fresh process"
     assert.match(deviceId, /^[a-f0-9]{64}$/);
     assert.equal(getOrCreateClaudeSubscriptionDeviceId(provider), deviceId);
     assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { ...credential, deviceId });
-    const moduleUrl = new URL("../src/claude-subscription.js", import.meta.url).href;
+    const moduleUrl = new URL("../src/subscriptions/claude-subscription.js", import.meta.url).href;
     const script = `import { configureClaudeSubscriptionStorage, getOrCreateClaudeSubscriptionDeviceId } from ${JSON.stringify(moduleUrl)};
       configureClaudeSubscriptionStorage(${JSON.stringify(configPath)});
       process.stdout.write(getOrCreateClaudeSubscriptionDeviceId(${JSON.stringify(provider)}));`;
@@ -300,4 +300,10 @@ console.log(JSON.stringify({status:200,body:JSON.stringify(payload)}));
     process.chdir(previousCwd);
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("OAuth helper lookup still resolves the package-root native-bin from the subscriptions module", () => {
+  const helper = join(process.cwd(), "native-bin", `${process.platform}-${process.arch}`, process.platform === "win32" ? "nanollm-oauth-transport.exe" : "nanollm-oauth-transport");
+  if (!existsSync(helper)) return;
+  assert.equal(resolveOAuthTransportPath(), helper);
 });

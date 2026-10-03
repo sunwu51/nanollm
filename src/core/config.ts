@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { parse as parseYAML } from "yaml";
-import type { StreamFormat } from "./converters/streams.js";
+import type { StreamFormat } from "../converters/streams.js";
 
 export const DEFAULT_RECORD_MAX_SIZE = 10;
 export const DEFAULT_TTFB_TIMEOUT = 5000;

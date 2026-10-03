@@ -23,26 +23,26 @@ import {
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { denormalizeToAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
-import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/claude-subscription-body.js";
-import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/auth.js";
-import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/config.js";
-import { renderAdminConfigPage } from "../src/admin-config-page.js";
-import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/admin-config-form.js";
-import { buildModelTestRequest, extractModelTestReply } from "../src/model-test.js";
-import { buildSubscriptionModelsRequest } from "../src/openai-subscription.js";
-import { fetchLatestCodexVersion, parseCodexReleaseVersion } from "../src/codex-version.js";
-import { buildClaudeModelsHeaders } from "../src/claude-subscription.js";
-import { CODEX_CLI_ORIGINATOR, CODEX_CLI_USER_AGENT, CODEX_CLI_VERSION } from "../src/subscription-client-compat.js";
-import { extractUpstreamModelIds, fetchUpstreamModels } from "../src/upstream-models.js";
-import { ConfigManager } from "../src/config-manager.js";
-import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
-import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
-import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, forwardRequest, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
-import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "../src/response-cache.js";
-import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/response-compression.js";
-import { renderRecordPage } from "../src/record-page.js";
-import { renderStatusPage } from "../src/status-page.js";
-import { handleServerStartupError } from "../src/startup-error.js";
+import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
+import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
+import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
+import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
+import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/pages/admin-config-form.js";
+import { buildModelTestRequest, extractModelTestReply } from "../src/proxy/model-test.js";
+import { buildSubscriptionModelsRequest } from "../src/subscriptions/openai-subscription.js";
+import { fetchLatestCodexVersion, parseCodexReleaseVersion } from "../src/subscriptions/codex-version.js";
+import { buildClaudeModelsHeaders } from "../src/subscriptions/claude-subscription.js";
+import { CODEX_CLI_ORIGINATOR, CODEX_CLI_USER_AGENT, CODEX_CLI_VERSION } from "../src/subscriptions/subscription-client-compat.js";
+import { extractUpstreamModelIds, fetchUpstreamModels } from "../src/proxy/upstream-models.js";
+import { ConfigManager } from "../src/core/config-manager.js";
+import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/proxy/fallback.js";
+import { getHTTPLogLevel, shouldEmitLog } from "../src/core/http-log.js";
+import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, forwardRequest, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy/proxy.js";
+import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "../src/proxy/response-cache.js";
+import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/core/response-compression.js";
+import { renderRecordPage } from "../src/pages/record-page.js";
+import { renderStatusPage } from "../src/pages/status-page.js";
+import { handleServerStartupError } from "../src/core/startup-error.js";
 import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
@@ -62,14 +62,14 @@ import {
   stopRecording,
   useMemoryRecordStore,
   useSqliteRecordStore,
-} from "../src/record.js";
-import { runWithRequestId, setClientRequestHeaders } from "../src/request-context.js";
-import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/status.js";
-import { shouldIgnoreStreamReadError } from "../src/stream-errors.js";
-import { extractErrorCauses, formatErrorWithCauses } from "../src/error-details.js";
-import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/usage.js";
+} from "../src/storage/record.js";
+import { runWithRequestId, setClientRequestHeaders } from "../src/core/request-context.js";
+import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/storage/status.js";
+import { shouldIgnoreStreamReadError } from "../src/core/stream-errors.js";
+import { extractErrorCauses, formatErrorWithCauses } from "../src/core/error-details.js";
+import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/storage/usage.js";
 import { normalizeUsage } from "../src/converters/shared.js";
-import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch } from "../src/sqlite.js";
+import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
 
 function createTestSqliteClient(path: string): Client {

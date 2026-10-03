@@ -3,7 +3,7 @@ import type { ChatCompletionChunk } from "openai/resources/chat/completions/comp
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
 import type { RawMessageStreamEvent } from "@anthropic-ai/sdk/resources/messages/messages";
 import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, qualifyOpenAIResponsesToolName, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput } from "./shared.js";
-import { isResponsesCustomToolName, } from "../request-context.js";
+import { isResponsesCustomToolName, } from "../core/request-context.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -26,6 +26,7 @@ type ParsedSSE = { event?: string; data: string };
 
 export class SSEParser {
   private buffer = "";
+  constructor(private includeDone = false) {}
 
   hasBufferedRealData(): boolean {
     if (!this.buffer.trim()) return false;
@@ -73,7 +74,7 @@ export class SSEParser {
       }
 
       const data = dataLines.join("\n");
-      if (!data || data === "[DONE]") continue;
+      if (!data || (!this.includeDone && data === "[DONE]")) continue;
       if (event === "ping") continue;
 
       results.push({ event, data });
@@ -83,9 +84,9 @@ export class SSEParser {
 
   flush(): ParsedSSE[] {
     if (!this.buffer.trim()) return [];
-    const result = this.push(this.buffer + "\n\n");
+    const pending = this.buffer;
     this.buffer = "";
-    return result;
+    return this.push(pending + "\n\n");
   }
 }
 

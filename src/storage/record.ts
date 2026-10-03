@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { getRequestId } from "./request-context.js";
-import { DEFAULT_RECORD_MAX_SIZE } from "./config.js";
+import { getRequestId } from "../core/request-context.js";
+import { DEFAULT_RECORD_MAX_SIZE } from "../core/config.js";
 import type { SqliteClient } from "./sqlite.js";
 import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
-import type { ErrorCauseDetail } from "./error-details.js";
+import type { ErrorCauseDetail } from "../core/error-details.js";
 
 const REDACTED = "[REDACTED]";
 const SENSITIVE_HEADERS = new Set(["authorization", "x-api-key", "cookie", "set-cookie"]);

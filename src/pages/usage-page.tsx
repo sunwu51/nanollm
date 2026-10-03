@@ -1,4 +1,4 @@
-import type { UsageDayCell } from "./usage.js";
+import type { UsageDayCell } from "../storage/usage.js";
 
 export type UsageRangeMode = "7d" | "30d" | "year";
 

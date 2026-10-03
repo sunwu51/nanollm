@@ -2660,6 +2660,10 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
                     <div class="quick-link-title">/record</div>
                     <div class="quick-link-desc">查看采样记录。</div>
                   </a>
+                  <a class="quick-link" href="/jobs">
+                    <div class="quick-link-title">/jobs</div>
+                    <div class="quick-link-desc">设置 cron、定时测试模型并对比历史作品。</div>
+                  </a>
                 </div>
               </div>
             </section>

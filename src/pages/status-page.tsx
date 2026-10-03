@@ -1,5 +1,5 @@
 import { renderToString } from "hono/jsx/dom/server";
-import type { StatusCell } from "./status.js";
+import type { StatusCell } from "../storage/status.js";
 import { USAGE_SCRIPT, USAGE_STYLE, UsageSection, type UsagePagePayload } from "./usage-page.js";
 
 function serializeForScript(value: unknown): string {

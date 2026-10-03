@@ -1,5 +1,5 @@
 import { ProxyAgent, fetch as undiciFetch } from "undici";
-import { resolveEnvVars } from "./config.js";
+import { resolveEnvVars } from "../core/config.js";
 
 export interface UpstreamModelsRequest {
   provider: string;

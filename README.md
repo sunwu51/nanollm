@@ -12,6 +12,47 @@
 
 ## Configure
 
+### 定时模型任务
+
+在 `/admin` 点击 **/jobs**，或打开 `/jobs`，新建任务、选择具体模型、填写一条用户消息及五段 cron。调度时区需要明确指定；页面可预览未来 5 次运行时间。Pelican 和简单回复是可编辑的快捷模板，不是固定的任务类型。
+
+任务配置保存在主配置旁的 `jobs.yaml`，两种存储模式都使用这个文件。文件不存在时没有任务，首次保存时创建；手动修改会自动加载。文件格式错误时暂停后续调度并在页面提示，修复后恢复，正在运行的任务继续使用自己的配置快照。保存、启用任务不会立即调用模型；首次执行按照下一次 cron 时间，也可点击 **立即运行**。
+
+```yaml
+version: 1
+jobs:
+  - id: hourly-pelican
+    name: 每小时 Pelican 绘图
+    enabled: true
+    type: model_request
+    schedule:
+      cron: "0 * * * *"
+      timezone: Asia/Singapore
+    models: [my-text-model] # config.yaml 中已保存的具体文本模型名称
+    request:
+      message: >
+        Generate an SVG animation embedded in HTML of a pelican riding a bicycle.
+        Return only the code, with no explanation.
+    execution:
+      timeout_ms: 300000
+      overlap_policy: skip
+      max_attempts: 1
+      max_output_bytes: 262144
+    retention:
+      max_runs: 24
+```
+
+执行器按模型自身协议构造一条 user 消息并管理流式请求。模型调用直接使用所选连接，不走 fallback；支持已配置的文本模型及 OpenAI、Claude 订阅供应商目录中的模型。订阅模型无需额外写入 config.yaml，目录加载错误会在表单提示。模型上的 body、headers、表达式等现有覆盖配置继续生效。任务请求消耗供应商额度，计入模型调用状态与用量统计。
+
+- **memory（默认）**：执行记录、原始文本作品、审核标记及备注保存在内存。重启后清空，Job 配置保留。每任务默认保留最近 24 条已结束记录；全部任务历史另有 64 MiB 内存上限，达到上限时清理最旧的已结束记录。正在执行的记录不参与清理。
+- **SQLite**：新增 `job_runs` 表，保留规则同样按每任务的 `max_runs` 执行，作品随记录一起保存和淘汰。重启保留历史，将未结束记录标记为 interrupted。记录按 jobs.yaml 的绝对路径隔离，使用相同路径才能恢复对应历史。
+
+每个任务包含 1–20 个具体模型，单模型输出默认最多 256 KiB，可设置 1–1024 KiB。保留次数可设置 1–168；最多尝试 1–5 次，超时可设置 1 秒至 1 小时。输出截断或超过大小限制不自动重试，其他调用失败按照配置重试，可能产生额外费用。
+
+第一版用于单实例部署，最多同时运行 2 个任务，同一模型连接串行调用。上次任务未结束时跳过新的定时触发；资源繁忙时，其他到期任务等待可用位置。停用只停止后续调度，取消当前运行是单独操作；重启不补停机期间的任务。
+
+页面支持任务列表、编辑、执行历史、多模型结果、HTML/SVG 隔离预览、原始代码及历史并排对比。人工审核支持“待审核 / 正常 / 疑似异常”和备注，仅供展示，不改变路由、fallback 或调度。Pelican 作品不自动评分，调用失败单独显示。删除任务默认保留历史，也可选择同时删除记录、作品与审核信息。
+
 Example:
 
 ```yaml
@@ -219,7 +260,7 @@ models:
 
 Railway 使用 `/data/config.yaml` 时，凭据位于 `/data/openai-subscription/<uuid>.json`。将 volume 挂载到 `/data` 即可同时保存配置和登录状态，服务端可以直接通过管理页完成 Device Code 登录。
 
-Codex 订阅请求会透传客户端同时提供的 `originator` 与 `User-Agent`；缺少其中任一项时使用一组配对的 Codex CLI 默认值。默认版本、`originator` 和 UA 在 `src/subscription-client-compat.ts` 中维护，升级兼容版本时修改该文件。
+Codex 订阅请求会透传客户端同时提供的 `originator` 与 `User-Agent`；缺少其中任一项时使用一组配对的 Codex CLI 默认值。默认版本、`originator` 和 UA 在 `src/subscriptions/subscription-client-compat.ts` 中维护，升级兼容版本时修改该文件。
 
 #### Claude subscription
 
@@ -238,7 +279,7 @@ models:
 
 `claude-subscription` 不接受 `base_url` 或 `api_key`。Claude 没有 Device Code 登录，流程是：保存配置后在 `/admin` 展开该供应商并点击“登录”，在新打开的 Claude 授权页完成授权；浏览器随后跳转到 `https://platform.claude.com/oauth/code/callback?code=...&state=...`，把地址栏中的完整 URL（或该页面显示的 `code#state`）粘贴回管理页弹窗并点击“完成登录”。登录会话 10 分钟内有效。登录成功后同样显示“已登录”、“重新登录”和“查询用量”（5 小时 / 7 天窗口利用率）。
 
-Claude Code 的兼容版本与默认 User-Agent，以及 Codex CLI 的默认身份常量，集中保存在 `src/subscription-client-compat.ts`；升级对应 CLI 兼容版本时请同步更新这里的版本及 Claude beta 标识。Claude 请求若客户端未传 `x-claude-code-session-id`，网关会按 UTC 日期与请求中的 `x-forwarded-for` 首个地址（或 `x-real-ip`、`cf-connecting-ip`）生成当日稳定值，IP 部分以 SHA-256 摘要形式写入。
+Claude Code 的兼容版本与默认 User-Agent，以及 Codex CLI 的默认身份常量，集中保存在 `src/subscriptions/subscription-client-compat.ts`；升级对应 CLI 兼容版本时请同步更新这里的版本及 Claude beta 标识。Claude 请求若客户端未传 `x-claude-code-session-id`，网关会按 UTC 日期与请求中的 `x-forwarded-for` 首个地址（或 `x-real-ip`、`cf-connecting-ip`）生成当日稳定值，IP 部分以 SHA-256 摘要形式写入。
 
 凭据以明文 JSON 保存到 `<config.yaml 所在目录>/claude-subscription/<uuid>.json`（access token、refresh token、过期时间、scopes、订阅类型、账户邮箱等），在到期前 5 分钟自动刷新。请求上游时使用 `Authorization: Bearer`，并参考 Claude Code 的请求头：`anthropic-beta` 总是包含 `oauth-2025-04-20` 与 `claude-code-20250219`（与客户端传入的 beta 合并）；缺失时补 `Accept`、`User-Agent`、`x-app`、`x-stainless-*` 和 `anthropic-dangerous-direct-browser-access` 默认值，流式请求补 `x-stainless-helper-method: stream`，每个缺少 `x-client-request-id` 的请求生成新 UUID。客户端传入的这些头以及模型配置中的 `headers` 可覆盖默认值。
 
@@ -480,6 +521,10 @@ npx nanollm
 ```
 
 注意：npm 发布包不会包含作者本地的 `config.yaml`，需要你自己准备配置文件。
+
+## Project Structure
+
+代码按功能分为 `src/core`、`converters`、`proxy`、`subscriptions`、`storage`、`jobs`、`pages` 七个模块，入口为 `server.ts`。模块职责、依赖规则与请求流程见 [docs/architecture.md](docs/architecture.md)。
 
 ## Config Admin
 

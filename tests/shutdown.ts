@@ -3,10 +3,10 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import http from "node:http";
 import { test } from "node:test";
-import { resolveShutdownTimeoutMs } from "../src/shutdown.js";
+import { resolveShutdownTimeoutMs } from "../src/core/shutdown.js";
 
 async function startFixture(t: { after: (fn: () => void) => void }, mode = "normal", timeoutMs = 1_000) {
-  const moduleUrl = new URL("../src/shutdown.js", import.meta.url).href;
+  const moduleUrl = new URL("../src/core/shutdown.js", import.meta.url).href;
   const child = spawn(process.execPath, ["--input-type=module", "--eval", `
     import http from 'node:http';
     import { installGracefulShutdown } from ${JSON.stringify(moduleUrl)};

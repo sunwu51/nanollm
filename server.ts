@@ -1,3 +1,4 @@
+import { JobModelCatalog } from "./src/jobs/job-model-catalog.js";
 // @ts-nocheck
 import "dotenv/config";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
@@ -8,22 +9,22 @@ import type { Context } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { randomUUID } from "node:crypto";
-import type { ModelConfig, ServerConfig } from "./src/config.js";
-import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "./src/auth.js";
-import { getPublicModelNames, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/config.js";
-import { ConfigManager } from "./src/config-manager.js";
-import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy.js";
-import { forwardRequest, forwardStreamRequest, passthroughAlphaSearchRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, type OpenAIImageOperation } from "./src/proxy.js";
-import { FallbackFailureTracker, sortFallbackGroupMembers } from "./src/fallback.js";
-import { SqliteStatusStore, StatusStore, type StatusStoreLike } from "./src/status.js";
-import { renderStatusPage } from "./src/status-page.js";
-import { SqliteUsageStore, UsageStore, addLocalDays, formatLocalDay, getUsageYears, parseLocalDay, type UsageStoreLike } from "./src/usage.js";
-import { renderRecordPage } from "./src/record-page.js";
-import { renderAdminConfigPage } from "./src/admin-config-page.js";
-import { buildModelTestRequest, DEFAULT_MODEL_TEST_MESSAGE, extractModelTestReply } from "./src/model-test.js";
-import { fetchUpstreamModels } from "./src/upstream-models.js";
-import { getHTTPLogLevel, shouldEmitLog } from "./src/http-log.js";
-import { buildJsonResponse, buildNonStreamResponse } from "./src/response-compression.js";
+import type { ModelConfig, ServerConfig } from "./src/core/config.js";
+import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "./src/core/auth.js";
+import { getPublicModelNames, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
+import { ConfigManager } from "./src/core/config-manager.js";
+import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy/proxy.js";
+import { forwardRequest, forwardStreamRequest, passthroughAlphaSearchRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, type OpenAIImageOperation } from "./src/proxy/proxy.js";
+import { FallbackFailureTracker, sortFallbackGroupMembers } from "./src/proxy/fallback.js";
+import { SqliteStatusStore, StatusStore, type StatusStoreLike } from "./src/storage/status.js";
+import { renderStatusPage } from "./src/pages/status-page.js";
+import { SqliteUsageStore, UsageStore, addLocalDays, formatLocalDay, getUsageYears, parseLocalDay, type UsageStoreLike } from "./src/storage/usage.js";
+import { renderRecordPage } from "./src/pages/record-page.js";
+import { renderAdminConfigPage } from "./src/pages/admin-config-page.js";
+import { buildModelTestRequest, DEFAULT_MODEL_TEST_MESSAGE, extractModelTestReply } from "./src/proxy/model-test.js";
+import { fetchUpstreamModels } from "./src/proxy/upstream-models.js";
+import { getHTTPLogLevel, shouldEmitLog } from "./src/core/http-log.js";
+import { buildJsonResponse, buildNonStreamResponse } from "./src/core/response-compression.js";
 import {
   normalizeOpenAIChatRequest,
   normalizeOpenAIResponsesRequest,
@@ -35,8 +36,8 @@ import {
   denormalizeToAnthropicResponse,
 } from "./src/converters/responses.js";
 import { createSSEConverter, createUsageCollector, formatDone, SSEParser } from "./src/converters/streams.js";
-import { createRequestId, getRequestId, runWithRequestId, setClientIp, setClientRequestHeaders, withRequestId } from "./src/request-context.js";
-import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "./src/response-cache.js";
+import { createRequestId, getRequestId, runWithRequestId, setClientIp, setClientRequestHeaders, withRequestId } from "./src/core/request-context.js";
+import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "./src/proxy/response-cache.js";
 import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
@@ -53,17 +54,23 @@ import {
   setRecordedClientResponseMeta,
   setRecordedRequestError,
   useSqliteRecordStore,
-} from "./src/record.js";
+} from "./src/storage/record.js";
 import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
-import { shouldIgnoreStreamReadError } from "./src/stream-errors.js";
-import { handleServerStartupError } from "./src/startup-error.js";
-import { installGracefulShutdown } from "./src/shutdown.js";
-import { openSqliteStorage, waitForClientWrites } from "./src/sqlite.js";
-import { buildAdminConfigForm, buildAdminConfigFormFromEffectiveConfig, buildYamlTextFromAdminForm, type AdminConfigForm } from "./src/admin-config-form.js";
-import { extractErrorCauses, formatErrorWithCauses } from "./src/error-details.js";
-import { bootstrapSubscriptionProviders, configureSubscriptionStorage, fetchSubscriptionModels, fetchSubscriptionUsage, getCachedSubscriptionCredential, pollDeviceLogin, resetSubscriptionUsage, startDeviceLogin } from "./src/openai-subscription.js";
-import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, fetchClaudeSubscriptionModels, fetchClaudeSubscriptionUsage, getCachedClaudeSubscriptionCredential, startClaudeLogin } from "./src/claude-subscription.js";
+import { shouldIgnoreStreamReadError } from "./src/core/stream-errors.js";
+import { handleServerStartupError } from "./src/core/startup-error.js";
+import { installGracefulShutdown } from "./src/core/shutdown.js";
+import { JobConfigStore } from "./src/jobs/jobs.js";
+import { MemoryJobRunStore, SqliteJobRunStore } from "./src/jobs/job-run-store.js";
+import { JobScheduler } from "./src/jobs/job-scheduler.js";
+import { modelRequestExecutor } from "./src/jobs/job-executor.js";
+import { createJobRoutes } from "./src/jobs/job-routes.js";
+import { renderJobsPage } from "./src/jobs/jobs-page.js";
+import { openSqliteStorage, waitForClientWrites } from "./src/storage/sqlite.js";
+import { buildAdminConfigForm, buildAdminConfigFormFromEffectiveConfig, buildYamlTextFromAdminForm, type AdminConfigForm } from "./src/pages/admin-config-form.js";
+import { extractErrorCauses, formatErrorWithCauses } from "./src/core/error-details.js";
+import { bootstrapSubscriptionProviders, configureSubscriptionStorage, fetchSubscriptionModels, fetchSubscriptionUsage, getCachedSubscriptionCredential, pollDeviceLogin, resetSubscriptionUsage, startDeviceLogin } from "./src/subscriptions/openai-subscription.js";
+import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, fetchClaudeSubscriptionModels, fetchClaudeSubscriptionUsage, getCachedClaudeSubscriptionCredential, startClaudeLogin } from "./src/subscriptions/claude-subscription.js";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -188,7 +195,7 @@ app.use("*", async (c, next) => {
 });
 
 app.use("*", async (c, next) => {
-  if (c.req.path.startsWith("/admin/")) {
+  if (c.req.path.startsWith("/admin/") || c.req.path === "/jobs" || c.req.path.startsWith("/jobs/")) {
     return next();
   }
   return apiCors(c, next);
@@ -230,6 +237,31 @@ type UpstreamOptions = { userAgent?: string; attemptIndex?: number; modelName?: 
 const fallbackFailureTracker = new FallbackFailureTracker();
 const statusStore: StatusStoreLike = sqliteStorage ? new SqliteStatusStore(sqliteStorage.client) : new StatusStore();
 const usageStore: UsageStoreLike = sqliteStorage ? new SqliteUsageStore(sqliteStorage.client) : new UsageStore();
+const jobsPath = join(dirname(configPath), "jobs.yaml");
+const jobConfigStore = new JobConfigStore(jobsPath);
+const jobRunStore = sqliteStorage ? new SqliteJobRunStore(sqliteStorage.client, jobsPath) : new MemoryJobRunStore();
+const jobModelCatalog = new JobModelCatalog(() => configManager.getActiveSnapshot().effectiveConfig, async provider => {
+  if (provider.provider === "openai-subscription") return fetchSubscriptionModels(provider.name, provider.proxy);
+  const headers: Record<string, string> = {}; applyClaudeSubscriptionHeaders(headers);
+  return fetchClaudeSubscriptionModels(provider.name, provider.proxy, headers);
+});
+const jobScheduler = new JobScheduler(jobConfigStore, jobRunStore,
+  () => configManager.getActiveSnapshot().effectiveConfig.models,
+  [{ ...modelRequestExecutor, execute: async (job, model, signal) => {
+    const started = Date.now();
+    return runWithRequestId(createRequestId(), async () => {
+      recordModelAttempt(model.name, started);
+      try {
+        const result = await modelRequestExecutor.execute(job, model, signal);
+        recordModelSuccess(model.name, Date.now() - started, result.metrics?.ttfb_ms, result.metrics?.usage, started);
+        return result;
+      } catch (error) {
+        recordModelFailure(model.name, Date.now() - started, started);
+        throw error;
+      }
+    });
+  } }], Date.now, 2, name => jobModelCatalog.resolve(name));
+await jobScheduler.initialize();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
 
@@ -1241,6 +1273,9 @@ app.post("/record/:requestId/replay", async (c) => {
 });
 
 app.get("/admin", (c) => c.html(renderAdminConfigPage(buildConfigAdminPayload())));
+app.get("/jobs", (c) => c.html(renderJobsPage()));
+app.route("/jobs/api", createJobRoutes(jobScheduler,
+  () => configManager.getActiveSnapshot().effectiveConfig.models, storageMode, jobModelCatalog));
 app.post("/admin/providers/:name/device-login", async (c) => {
   try {
     const provider = configManager.getActiveSnapshot().effectiveConfig.providers.find((item) => item.name === c.req.param("name"));
@@ -1445,14 +1480,15 @@ const server = serve({ fetch: app.fetch, port: startupConfig.port }, (info) => {
 server.once("error", (error: Error & { code?: string }) => {
   handleServerStartupError(error, {
     port: startupConfig.port,
-    dispose: () => configManager.dispose(),
+    dispose: () => { configManager.dispose(); jobScheduler.stop(); },
   });
 });
 
 const shutdown = installGracefulShutdown({
   server,
-  stopBackgroundWork: () => configManager.dispose(),
+  stopBackgroundWork: () => { configManager.dispose(); jobScheduler.stop(); },
   cleanup: async () => {
+    await jobScheduler.flush();
     if (sqliteStorage) await waitForClientWrites(sqliteStorage.client);
     await flushRecording();
     if (sqliteStorage) {
@@ -1461,5 +1497,7 @@ const shutdown = installGracefulShutdown({
     }
   },
 });
+
+jobScheduler.start();
 
 export { server };

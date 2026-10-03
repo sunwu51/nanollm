@@ -1,4 +1,4 @@
-import type { NormalizedUsage } from "./converters/shared.js";
+import type { NormalizedUsage } from "../converters/shared.js";
 import type { SqliteClient } from "./sqlite.js";
 import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
 
