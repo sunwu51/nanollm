@@ -13,7 +13,7 @@ import {
   denormalizeUsageToOpenAIResponses,
   fail,
   normalizeUsage,
-  parseJson,
+  parseToolArguments,
   qualifyOpenAIResponsesToolName,
   refusal,
   sanitizeAnthropicToolId,
@@ -287,7 +287,7 @@ export function denormalizeToAnthropicResponse(response: NormalizedResponse): An
           id: sanitizeAnthropicToolId(toolCall.id),
           caller: { type: "direct" as const },
           name: toolCall.name,
-          input: parseJson(toolCall.payload, `Anthropic tool call "${toolCall.name}"`),
+          input: parseToolArguments(toolCall.payload, `Anthropic tool call "${toolCall.name}"`),
         };
       }) ?? []),
     ],

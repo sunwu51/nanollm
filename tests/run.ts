@@ -2650,6 +2650,81 @@ run("anthropic five common effort levels are preserved in both OpenAI protocols"
   }
 });
 
+run("chat none effort disables anthropic thinking and minimal maps to low", () => {
+  const convert = (reasoning_effort: string) => chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini", reasoning_effort, messages: [{ role: "user", content: "hi" }],
+  } as any) as any;
+  const none = convert("none");
+  assert.deepEqual(none.thinking, { type: "disabled" });
+  assert.equal(none.output_config, undefined);
+  const minimal = convert("minimal");
+  assert.deepEqual(minimal.thinking, { type: "adaptive" });
+  assert.deepEqual(minimal.output_config, { effort: "low" });
+});
+
+run("anthropic disabled thinking maps to none effort in both OpenAI protocols", () => {
+  const request = { model: "test-model", max_tokens: 100, messages: [{ role: "user", content: "hi" }], thinking: { type: "disabled" } };
+  const chat = anthropicMessageRequestToChatParams(request as any) as any;
+  assert.equal(chat.reasoning_effort, "none");
+  assert.deepEqual(chat.reasoning, { effort: "none" });
+  assert.deepEqual(anthropicMessageRequestToResponsesRequest(request as any).reasoning, { effort: "none" });
+  const noThinking = anthropicMessageRequestToChatParams({ ...request, thinking: undefined } as any) as any;
+  assert.equal(noThinking.reasoning_effort, undefined);
+});
+
+run("service tiers map between OpenAI and Anthropic without failing", () => {
+  const toAnthropic = (service_tier: string) => (chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini", service_tier, messages: [{ role: "user", content: "hi" }],
+  } as any) as any).service_tier;
+  assert.equal(toAnthropic("auto"), "auto");
+  assert.equal(toAnthropic("default"), "standard_only");
+  assert.equal(toAnthropic("flex"), "standard_only");
+  assert.equal(toAnthropic("scale"), "auto");
+  assert.equal(toAnthropic("priority"), "auto");
+  assert.equal(toAnthropic("fast"), "auto");
+  assert.equal(toAnthropic("ultrafast"), undefined);
+  assert.equal(toAnthropic("constructor"), undefined);
+
+  const fromAnthropic = (service_tier: string) => {
+    const request = { model: "test-model", max_tokens: 100, service_tier, messages: [{ role: "user", content: "hi" }] };
+    return [(anthropicMessageRequestToChatParams(request as any) as any).service_tier, (anthropicMessageRequestToResponsesRequest(request as any) as any).service_tier];
+  };
+  assert.deepEqual(fromAnthropic("auto"), ["auto", "auto"]);
+  assert.deepEqual(fromAnthropic("standard_only"), ["default", "default"]);
+  assert.equal((chatParamsToResponsesRequest({ model: "gpt-5", service_tier: "fast", messages: [{ role: "user", content: "hi" }] } as any) as any).service_tier, "priority");
+});
+
+run("anthropic metadata keeps user_id and drops other OpenAI metadata keys", () => {
+  const convert = (metadata: Record<string, unknown>) => (chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini", metadata, messages: [{ role: "user", content: "hi" }],
+  } as any) as any).metadata;
+  assert.deepEqual(convert({ user_id: "u1", app: "demo" }), { user_id: "u1" });
+  assert.equal(convert({ app: "demo" }), undefined);
+});
+
+run("empty tool-call arguments become an empty anthropic input object", () => {
+  const request = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "user", content: "time?" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_now", type: "function", function: { name: "now", arguments: "" } }] },
+      { role: "tool", tool_call_id: "call_now", content: "12:00" },
+    ],
+  } as any) as any;
+  const toolUse = request.messages.flatMap((message: any) => Array.isArray(message.content) ? message.content : []).find((block: any) => block.type === "tool_use");
+  assert.deepEqual(toolUse.input, {});
+
+  const response = chatCompletionToAnthropicMessage({
+    id: "chatcmpl_empty", object: "chat.completion", created: 1, model: "m",
+    choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: "call_now", type: "function", function: { name: "now", arguments: "  " } }] } }],
+  } as any) as any;
+  assert.deepEqual(response.content.find((block: any) => block.type === "tool_use").input, {});
+  assert.throws(() => chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "assistant", content: null, tool_calls: [{ id: "call_bad", type: "function", function: { name: "now", arguments: "{bad" } }] }],
+  } as any), /invalid JSON/);
+});
+
 run("chat medium reasoning maps to anthropic adaptive thinking", () => {
   const anthropic = chatParamsToAnthropicMessageRequest({
     model: "gpt-4o-mini",

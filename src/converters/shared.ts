@@ -155,6 +155,12 @@ export function parseJson(textValue: string, context: string): unknown {
   }
 }
 
+/** Parse tool-call arguments; providers often send "" for tools without parameters, which means `{}`. */
+export function parseToolArguments(textValue: string | null | undefined, context: string): unknown {
+  if (textValue == null || textValue.trim() === "") return {};
+  return parseJson(textValue, context);
+}
+
 export function stringifyJson(value: unknown): string {
   return typeof value === "string" ? value : JSON.stringify(value);
 }

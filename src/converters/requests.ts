@@ -21,7 +21,7 @@ import {
   normalizeReasoningEffort,
   normalizeReasoningEffortFromBudget,
   parseDataUrl,
-  parseJson,
+  parseToolArguments,
   qualifyOpenAIResponsesToolName,
   refusal,
   requireTextOnly,
@@ -150,9 +150,11 @@ export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): No
     parallelToolCalls: normalizedToolChoice?.type === "none" ? undefined : normalizedToolChoice?.disableParallel === undefined ? undefined : !normalizedToolChoice.disableParallel,
     promptCacheKey,
     reasoningEffort:
-      request.thinking?.type === "adaptive"
-        ? request.output_config?.effort ?? null
-        : normalizeReasoningEffortFromBudget(request.thinking?.type === "enabled" ? request.thinking.budget_tokens : null),
+      request.thinking?.type === "disabled"
+        ? "none"
+        : request.thinking?.type === "adaptive"
+          ? request.output_config?.effort ?? null
+          : normalizeReasoningEffortFromBudget(request.thinking?.type === "enabled" ? request.thinking.budget_tokens : null),
     thinkingBudgetTokens: request.thinking?.type === "enabled" ? request.thinking.budget_tokens : null,
     textVerbosity: null,
     responseFormat: request.output_config?.format ? { type: "json_schema", name: "anthropic_output", schema: request.output_config.format.schema } : undefined,
@@ -970,7 +972,7 @@ function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserve
   });
   for (const toolCall of message.toolCalls ?? []) {
     if (toolCall.kind !== "function") fail("Anthropic assistant output only supports function-style tool calls");
-    blocks.push({ type: "tool_use", id: sanitizeAnthropicToolId(toolCall.id), caller: { type: "direct" }, name: toolCall.name, input: parseJson(toolCall.payload, `Anthropic tool call "${toolCall.name}"`) });
+    blocks.push({ type: "tool_use", id: sanitizeAnthropicToolId(toolCall.id), caller: { type: "direct" }, name: toolCall.name, input: parseToolArguments(toolCall.payload, `Anthropic tool call "${toolCall.name}"`) });
   }
   return blocks;
 }
@@ -1141,43 +1143,66 @@ function getAnthropicToolResultId(message: NormalizedMessage): string | undefine
   return undefined;
 }
 
+/** Anthropic metadata only accepts a string `user_id`; other OpenAI metadata tags are dropped. */
 function denormalizeAnthropicMetadata(metadata: NormalizedRequest["metadata"]) {
-  if (!metadata) return undefined;
-  const keys = Object.keys(metadata).filter((key) => metadata[key] !== undefined && metadata[key] !== null);
-  if (keys.length === 0) return undefined;
-  if (keys.length === 1 && keys[0] === "user_id" && typeof metadata.user_id === "string") return { user_id: metadata.user_id };
-  fail("Anthropic metadata only supports user_id");
+  return typeof metadata?.user_id === "string" && metadata.user_id ? { user_id: metadata.user_id } : undefined;
+}
+
+/** Map an OpenAI-style effort onto Anthropic: "none" means thinking off, "minimal" is below Anthropic's lowest level. */
+function toAnthropicEffort(reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined): string | null {
+  const effort = reasoningEffort ?? normalizeReasoningEffortFromBudget(thinkingBudgetTokens);
+  if (effort === "none") return null;
+  if (effort === "minimal") return "low";
+  return effort;
 }
 
 function denormalizeAnthropicOutputConfig(responseFormat: NormalizedRequest["responseFormat"], reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined) {
-  const effort = reasoningEffort ?? normalizeReasoningEffortFromBudget(thinkingBudgetTokens);
+  const effort = toAnthropicEffort(reasoningEffort, thinkingBudgetTokens);
   const format = responseFormat?.type === "json_schema" ? { type: "json_schema", schema: responseFormat.schema ?? {} } : undefined;
   if (!format && !effort) return undefined;
   return { ...(format ? { format } : {}), ...(effort ? { effort } : {}) };
 }
 
 function denormalizeAnthropicThinking(reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined) {
+  if (reasoningEffort === "none") return { type: "disabled" as const };
   if (!reasoningEffort && thinkingBudgetTokens == null) return undefined;
   return { type: "adaptive" as const };
 }
 
+// OpenAI Chat/Responses accept auto | default | flex | scale | priority; Anthropic accepts auto | standard_only.
+// Codex clients also send "fast" as an alias of priority. Values with no counterpart are omitted (upstream default).
+const OPENAI_SERVICE_TIERS = new Map<string, "auto" | "default" | "flex" | "scale" | "priority">([
+  ["auto", "auto"],
+  ["default", "default"],
+  ["flex", "flex"],
+  ["scale", "scale"],
+  ["priority", "priority"],
+  ["fast", "priority"],
+  ["standard_only", "default"],
+]);
+
+// Anthropic "auto" uses Priority Tier capacity when the org has it, so priority-like tiers map to auto;
+// "standard_only" never does, so default/flex map there.
+const ANTHROPIC_SERVICE_TIERS = new Map<string, "auto" | "standard_only">([
+  ["auto", "auto"],
+  ["priority", "auto"],
+  ["fast", "auto"],
+  ["scale", "auto"],
+  ["default", "standard_only"],
+  ["flex", "standard_only"],
+  ["standard_only", "standard_only"],
+]);
+
 function normalizeOpenAIServiceTier(tier: string | null | undefined): OpenAIChatRequest["service_tier"] | undefined {
-  if (!tier) return undefined;
-  if (["auto", "default", "flex", "scale", "priority"].includes(tier)) return tier as OpenAIChatRequest["service_tier"];
-  fail(`OpenAI Chat does not support service tier "${tier}"`);
+  return tier ? OPENAI_SERVICE_TIERS.get(tier.toLowerCase()) : undefined;
 }
 
 function normalizeOpenAIResponsesServiceTier(tier: string | null | undefined): OpenAIResponsesRequest["service_tier"] | undefined {
-  if (!tier) return undefined;
-  if (["auto", "default", "flex", "scale", "priority"].includes(tier)) return tier as OpenAIResponsesRequest["service_tier"];
-  fail(`OpenAI Responses does not support service tier "${tier}"`);
+  return tier ? OPENAI_SERVICE_TIERS.get(tier.toLowerCase()) : undefined;
 }
 
 function normalizeAnthropicServiceTier(tier: string | null | undefined): MessageCreateParamsBase["service_tier"] | undefined {
-  if (!tier) return undefined;
-  if (tier === "auto") return "auto";
-  if (tier === "default" || tier === "standard_only") return "standard_only";
-  fail(`Anthropic does not support service tier "${tier}"`);
+  return tier ? ANTHROPIC_SERVICE_TIERS.get(tier.toLowerCase()) : undefined;
 }
 
 function denormalizeOpenAIChatResponseFormat(format: NormalizedRequest["responseFormat"]): OpenAIChatRequest["response_format"] {
