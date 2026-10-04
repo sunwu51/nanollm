@@ -444,7 +444,7 @@ export class AnthropicStreamParser implements StreamParser {
           if (block.data) {
             out.push({ type: "content_delta", index: idx, delta: block.data });
           }
-        } else if (block.type === "tool_use") {
+        } else if (block.type === "tool_use" || block.type === "server_tool_use") {
           out.push({ type: "tool_start", index: idx, id: block.id, name: block.name, kind: "function" });
         }
         break;
@@ -469,7 +469,7 @@ export class AnthropicStreamParser implements StreamParser {
       case "content_block_stop": {
         const idx = event.index;
         const blockType = this.blockTypes.get(idx);
-        if (blockType === "tool_use") {
+        if (blockType === "tool_use" || blockType === "server_tool_use") {
           out.push({ type: "tool_done", index: idx });
         } else {
           out.push({ type: "content_done", index: idx });

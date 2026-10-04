@@ -1403,9 +1403,13 @@ const SCRIPT = String.raw`
         let sawAnthropicEvent = false;
         const toolInputBuffers = new Map();
 
+        function isToolUseBlock(block) {
+          return block && (block.type === "tool_use" || block.type === "server_tool_use");
+        }
+
         function finalizeToolUse(index) {
           const block = response?.content?.[index];
-          if (!block || block.type !== "tool_use") return;
+          if (!isToolUseBlock(block)) return;
           const partial = toolInputBuffers.get(index);
           if (!partial) {
             block.input = block.input && typeof block.input === "object" ? block.input : {};
@@ -1442,15 +1446,18 @@ const SCRIPT = String.raw`
               response.content[index] = { type: "thinking", thinking: block.thinking ?? "", signature: block.signature ?? "" };
             } else if (block.type === "redacted_thinking") {
               response.content[index] = { type: "redacted_thinking", data: block.data ?? "" };
-            } else if (block.type === "tool_use") {
+            } else if (block.type === "tool_use" || block.type === "server_tool_use") {
               response.content[index] = {
-                type: "tool_use",
+                ...block,
+                type: block.type,
                 id: block.id,
-                caller: block.caller ?? { type: "direct" },
+                ...(block.caller ? { caller: block.caller } : block.type === "tool_use" ? { caller: { type: "direct" } } : {}),
                 name: block.name,
-                input: {},
+                input: block.input && typeof block.input === "object" ? block.input : {},
               };
               toolInputBuffers.set(index, "");
+            } else {
+              response.content[index] = JSON.parse(JSON.stringify(block));
             }
             continue;
           }

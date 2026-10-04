@@ -6043,6 +6043,63 @@ run("record page stream parser keeps data-like text inside JSON payloads", () =>
   assert.match(html, /currentDataLines\[currentDataLines\.length - 1\] \+= "\\n" \+ line/);
 });
 
+run("record page stream reconstructor handles Anthropic server_tool_use events", () => {
+  const html = renderRecordPage({
+    enabled: true,
+    capturedCount: 1,
+    limit: 100,
+    sessionStartedAt: Date.UTC(2026, 3, 20, 10, 0, 0),
+    recentKeys: [],
+  });
+  const script = /<script>([\s\S]*)<\/script>/.exec(html)?.[1];
+  assert.ok(script, "record page script");
+  const sandbox: any = {
+    document: {
+      createElement: () => ({ appendChild: () => {}, addEventListener: () => {} }),
+      getElementById: () => ({ addEventListener: () => {}, appendChild: () => {}, classList: { toggle: () => {} } }),
+    },
+    window: { location: { search: "" } },
+    history: { replaceState: () => {} },
+    fetch: async () => ({ ok: true, json: async () => ({}) }),
+    setInterval: () => 0,
+    URLSearchParams,
+  };
+  vm.runInContext(script + "\n;globalThis.__reconstruct = reconstructStreamResponse;\nglobalThis.__parse = parseStreamEvents;", vm.createContext(sandbox));
+  const rawStream = [
+    'event: message_start',
+    'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-3-7-sonnet","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}',
+    '',
+    'event: content_block_start',
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_01LdVih7HhXB9cYvPoTWw7oE","name":"web_search","input":{}}}',
+    '',
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"query\\":\\"test search\\"}"}}',
+    '',
+    'event: content_block_stop',
+    'data: {"type":"content_block_stop","index":0}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":20}}',
+    '',
+    'event: message_stop',
+    'data: {"type":"message_stop"}',
+  ].join("\n");
+
+  const events = sandbox.__parse(rawStream);
+  assert.ok(events && events.length > 0);
+  const reconstructed = JSON.parse(JSON.stringify(sandbox.__reconstruct(events)));
+  assert.ok(reconstructed, "reconstructed response");
+  assert.equal(reconstructed.id, "msg_1");
+  assert.equal(reconstructed.stop_reason, "tool_use");
+  assert.equal(reconstructed.content.length, 1);
+  assert.deepEqual(reconstructed.content[0], {
+    type: "server_tool_use",
+    id: "srvtoolu_01LdVih7HhXB9cYvPoTWw7oE",
+    name: "web_search",
+    input: { query: "test search" },
+  });
+});
+
 run("server.ts keeps @ts-nocheck as its first line so the build stays type-check free", () => {
   // The directive is ignored unless it precedes every statement; an import above it broke the Railway build.
   assert.equal(readFileSync(join(process.cwd(), "server.ts"), "utf8").split(/\r?\n/, 1)[0], "// @ts-nocheck");
