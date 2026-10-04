@@ -23,6 +23,7 @@ import {
   responsesResponseToAnthropicMessage,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
+import { UnsupportedContentError } from "../src/converters/shared.js";
 import { denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
@@ -712,17 +713,48 @@ run("responses image tool output becomes anthropic image tool_result block", () 
   assert.equal(toolResult.content[0].source?.url, "https://example.com/tool.png");
 });
 
-run("responses file tool output becomes anthropic document tool_result block", () => {
-  const result = responsesRequestToAnthropicMessageRequest({
-    model: "gpt-4o-mini",
-    input: [{ type: "function_call_output", call_id: "call_file", output: [{ type: "input_file", file_url: "https://example.com/tool.pdf", filename: "tool.pdf" }] }],
-  } as any);
+run("file content is rejected with a 400 error when converting between protocols", () => {
+  const rejects = (convert: () => unknown, kind: RegExp) => assert.throws(convert, (error: any) => {
+    assert.ok(error instanceof UnsupportedContentError);
+    assert.equal(error.status, 400);
+    assert.match(error.message, kind);
+    return true;
+  });
+  const pdf = { type: "document", title: "report.pdf", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0xLjQK" } };
+  rejects(() => chatParamsToAnthropicMessageRequest({
+    model: "m", messages: [{ role: "user", content: [{ type: "file", file: { filename: "a.pdf", file_data: "data:application/pdf;base64,JVBERi0xLjQK" } }] }],
+  } as any), /Chat "file" content/);
+  rejects(() => responsesRequestToAnthropicMessageRequest({
+    model: "m", input: [{ role: "user", content: [{ type: "input_file", file_url: "https://example.com/a.pdf" }] }],
+  } as any), /Responses "input_file" content/);
+  rejects(() => responsesRequestToChatParams({
+    model: "m", input: [{ type: "function_call_output", call_id: "c1", output: [{ type: "input_file", file_id: "file-1" }] }],
+  } as any), /Responses "input_file" tool output/);
+  rejects(() => anthropicMessageRequestToChatParams({ model: "m", max_tokens: 10, messages: [{ role: "user", content: [pdf] }] } as any), /Anthropic "document" content with a "base64" source/);
+  rejects(() => anthropicMessageRequestToResponsesRequest({
+    model: "m", max_tokens: 10, messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [{ ...pdf, source: { type: "url", url: "https://example.com/a.pdf" } }] }] }],
+  } as any), /Anthropic "document" tool_result content with a "url" source/);
+  rejects(() => anthropicMessageRequestToChatParams({
+    model: "m", max_tokens: 10, messages: [{ role: "user", content: [{ type: "document", source: { type: "file", file_id: "file_1" } }] }],
+  } as any), /"file" source/);
+});
 
-  const toolResult = (result.messages[0].content as Array<{ type: string; content: Array<{ type: string; title?: string; source?: { url?: string } }> }>)[0];
-  assert.equal(toolResult.type, "tool_result");
-  assert.equal(toolResult.content[0].type, "document");
-  assert.equal(toolResult.content[0].title, "tool.pdf");
-  assert.equal(toolResult.content[0].source?.url, "https://example.com/tool.pdf");
+run("plain-text anthropic documents and fetched web pages still convert to text", () => {
+  const chat = anthropicMessageRequestToChatParams({
+    model: "m", max_tokens: 10,
+    messages: [{ role: "user", content: [{ type: "document", source: { type: "text", media_type: "text/plain", data: "notes body" } }] }],
+  } as any) as any;
+  assert.match(String(chat.messages[0].content), /notes body/);
+
+  const fetched = (document: unknown) => (anthropicMessageRequestToChatParams({
+    model: "m", max_tokens: 10,
+    messages: [
+      { role: "assistant", content: [{ type: "server_tool_use", id: "srv_1", name: "web_fetch", input: { url: "https://example.com/x" } }] },
+      { role: "user", content: [{ type: "web_fetch_tool_result", tool_use_id: "srv_1", content: { type: "web_fetch_result", url: "https://example.com/x", content: document } }] },
+    ],
+  } as any) as any).messages.find((message: any) => message.role === "tool").content;
+  assert.equal(fetched({ type: "document", source: { type: "text", media_type: "text/plain", data: "page text" } }), "page text");
+  assert.equal(fetched({ type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0xLjQK" } }), "https://example.com/x");
 });
 
 run("responses text image tool output becomes anthropic mixed tool_result block", () => {
@@ -1379,22 +1411,6 @@ run("object content survives anthropic to responses conversion for images", () =
   assert.equal(first.content[0].image_url, "https://example.com/a.png");
 });
 
-run("anthropic document user content degrades to chat text instead of failing", () => {
-  const chat = anthropicMessageRequestToChatParams({
-    model: "claude-sonnet-4-5",
-    max_tokens: 1024,
-    messages: [
-      {
-        role: "user",
-        content: [{ type: "document", title: "report.pdf", source: { type: "url", url: "https://example.com/report.pdf" } }],
-      },
-    ],
-  });
-
-  assert.equal(chat.messages[0].role, "user");
-  assert.match(String(chat.messages[0].content), /report\.pdf/);
-  assert.match(String(chat.messages[0].content), /https:\/\/example\.com\/report\.pdf/);
-});
 
 run("anthropic image user content stays chat multimodal array when image is enabled", () => {
   const chat = anthropicMessageRequestToChatParams({
@@ -2045,30 +2061,6 @@ run("anthropic image tool_result becomes responses image tool output", () => {
   assert.equal(output.output[0].image_url, "https://example.com/from-anthropic.png");
 });
 
-run("anthropic document tool_result becomes responses file tool output", () => {
-  const responses = anthropicMessageRequestToResponsesRequest({
-    model: "claude-sonnet-4-5",
-    max_tokens: 1024,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "tool_result",
-            tool_use_id: "file_resp",
-            content: [{ type: "document", title: "report.pdf", source: { type: "url", url: "https://example.com/report.pdf" } }],
-          },
-        ],
-      },
-    ],
-  });
-
-  const output = (responses.input as Array<{ type: string; output: Array<{ type: string; file_url?: string; filename?: string }> }>)[0];
-  assert.equal(output.type, "function_call_output");
-  assert.equal(output.output[0].type, "input_file");
-  assert.equal(output.output[0].file_url, "https://example.com/report.pdf");
-  assert.equal(output.output[0].filename, "report.pdf");
-});
 
 run("chat parallel_tool_calls false survives anthropic conversion without explicit tool_choice", () => {
   const anthropic = chatParamsToAnthropicMessageRequest({

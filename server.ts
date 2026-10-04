@@ -57,6 +57,7 @@ import {
 } from "./src/storage/record.js";
 import type { StreamFormat } from "./src/converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse } from "./src/converters/shared.js";
+import { UnsupportedContentError } from "./src/converters/shared.js";
 import { shouldIgnoreStreamReadError } from "./src/core/stream-errors.js";
 import { handleServerStartupError } from "./src/core/startup-error.js";
 import { installGracefulShutdown } from "./src/core/shutdown.js";
@@ -792,7 +793,9 @@ function createRoute(incomingFormat: StreamFormat) {
           return response;
         } catch (error) {
           const err = error as Error & { status?: number; upstream?: string; cause?: unknown };
-          fallbackFailureTracker.recordFailure(modelConfig.name, requestStartedAt);
+          // Content the converter refuses (e.g. files across protocols) is the request's fault, not the model's:
+          // don't demote the model in its fallback group, but still let a same-protocol candidate try.
+          if (!(error instanceof UnsupportedContentError)) fallbackFailureTracker.recordFailure(modelConfig.name, requestStartedAt);
           recordModelFailure(modelConfig.name, Date.now() - requestStartedAt, requestStartedAt);
           lastError = err;
           console.warn(

@@ -24,6 +24,7 @@ import {
   parseToolArguments,
   qualifyOpenAIResponsesToolName,
   refusal,
+  rejectFileContent,
   requireTextOnly,
   sanitizeAnthropicToolId,
   splitQualifiedOpenAIResponsesToolName,
@@ -398,9 +399,8 @@ function normalizeOpenAIChatToolResultParts(content: any): NormalizedMessage["pa
     if (part.type === "text") return text(part.text);
     if (part.type === "image_url") return { type: "image_url", url: part.image_url.url, detail: part.image_url.detail };
     if (part.type === "input_audio") return { type: "input_audio", data: part.input_audio.data, format: part.input_audio.format };
-    if (part.type === "document_url") return { type: "document_url", url: part.document_url.url, title: part.document_url.title ?? null };
-    if (part.type === "document_base64") return { type: "document_base64", data: part.document_base64.data, mediaType: part.document_base64.media_type ?? null, title: part.document_base64.title ?? null };
     if (part.type === "refusal") return refusal(part.refusal);
+    if (part.type === "file") rejectFileContent('Chat "file" content');
     fail(`Unsupported chat tool content part "${part.type}"`);
   });
 }
@@ -411,6 +411,7 @@ function normalizeOpenAIChatUserParts(content: any): NormalizedMessage["parts"] 
     if (part.type === "text") return text(part.text);
     if (part.type === "image_url") return { type: "image_url", url: part.image_url.url, detail: part.image_url.detail };
     if (part.type === "input_audio") return { type: "input_audio", data: part.input_audio.data, format: part.input_audio.format };
+    if (part.type === "file") rejectFileContent('Chat "file" content');
     fail(`Unsupported chat user content part "${part.type}"`);
   });
 }
@@ -535,11 +536,7 @@ function normalizeOpenAIResponsesMessage(item: any): NormalizedMessage {
         return { type: "image_url", url: part.image_url, detail: part.detail === "original" ? "auto" : part.detail ?? undefined };
       }
       if (part.type === "input_audio") return { type: "input_audio", data: part.input_audio.data, format: part.input_audio.format };
-      if (part.type === "input_file") {
-        if (part.file_url) return { type: "document_url", url: part.file_url, title: part.filename ?? null };
-        if (part.file_data) return { type: "document_base64", data: part.file_data, title: part.filename ?? null };
-        fail("Responses input_file without file_url or file_data is not supported");
-      }
+      if (part.type === "input_file") rejectFileContent('Responses "input_file" content');
       fail(`Unsupported Responses content part "${part.type}"`);
     }),
   };
@@ -553,11 +550,7 @@ function normalizeOpenAIResponsesToolOutput(output: any): NormalizedMessage["par
       if (!part.image_url) fail("Responses tool output input_image without image_url is not supported");
       return { type: "image_url", url: part.image_url, detail: part.detail === "original" ? "auto" : part.detail ?? undefined };
     }
-    if (part.type === "input_file") {
-      if (part.file_url) return { type: "document_url", url: part.file_url, title: part.filename ?? null };
-      if (part.file_data) return { type: "document_base64", data: part.file_data, title: part.filename ?? null };
-      fail("Responses tool output input_file without file_url or file_data is not supported");
-    }
+    if (part.type === "input_file") rejectFileContent('Responses "input_file" tool output');
     fail(`Unsupported Responses tool output part "${part.type}"`);
   });
 }
@@ -629,9 +622,8 @@ function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
       continue;
     }
     if (block.type === "document") {
-      if (block.source.type === "url") normalized.push({ role: "user", parts: [{ type: "document_url", url: block.source.url, title: block.title ?? null, cacheControl: block.cache_control }] });
-      else if (block.source.type === "base64") normalized.push({ role: "user", parts: [{ type: "document_base64", data: block.source.data, mediaType: block.source.media_type, title: block.title ?? null, cacheControl: block.cache_control }] });
-      else if (block.source.type === "text") normalized.push({ role: "user", parts: [{ type: "text", text: block.source.data, cacheControl: block.cache_control }] });
+      // Plain-text documents are just text; url/base64/file sources are files and are not converted.
+      if (block.source.type === "text") normalized.push({ role: "user", parts: [{ type: "text", text: block.source.data, cacheControl: block.cache_control }] });
       else if (block.source.type === "content") {
         const textParts: NormalizedMessage["parts"] = [];
         for (const child of block.source.content) {
@@ -640,8 +632,10 @@ function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
         }
         if (textParts.length > 0) normalized.push({ role: "user", parts: textParts });
       }
+      else rejectFileContent(`Anthropic "document" content with a "${block.source.type}" source`);
       continue;
     }
+    if (block.type === "container_upload") rejectFileContent('Anthropic "container_upload" content');
     if (block.type === "tool_result") {
       normalized.push({ role: "tool", toolCallId: block.tool_use_id, isError: block.is_error, parts: normalizeAnthropicToolResultParts(block.content) });
       continue;
@@ -675,8 +669,9 @@ function normalizeAnthropicServerToolResultParts(content: any): NormalizedMessag
   }
 
   if (content.type === "web_fetch_result") {
-    const documentParts = normalizeAnthropicToolResultParts([content.content]);
-    if (documentParts.length > 0) return documentParts;
+    // A fetched web page is a text document; a fetched PDF is a file, so only its URL is kept.
+    const source = content.content?.source;
+    if (source?.type === "text" && typeof source.data === "string") return [text(source.data)];
     return [text(content.url ?? "web_fetch_result")];
   }
 
@@ -694,9 +689,8 @@ function normalizeAnthropicToolResultParts(content: any): NormalizedMessage["par
     if (block.type === "text") return text(block.text);
     if (block.type === "image") return { type: "image_url", url: block.source.type === "url" ? block.source.url : makeDataUrl(block.source.media_type, block.source.data) };
     if (block.type === "document") {
-      if (block.source.type === "url") return { type: "document_url", url: block.source.url, title: block.title ?? null };
-      if (block.source.type === "base64") return { type: "document_base64", data: block.source.data, mediaType: block.source.media_type, title: block.title ?? null };
       if (block.source.type === "text") return text(block.source.data);
+      rejectFileContent(`Anthropic "document" tool_result content with a "${block.source.type}" source`);
     }
     fail(`Anthropic tool_result block "${block.type}" is not supported`);
   });
@@ -821,8 +815,7 @@ function denormalizeOpenAIChatToolResultMessage(message: NormalizedMessage, iden
     .join("\n");
   const tag = (ptype: string) =>
     ptype === "image_url" ? "image" :
-    ptype === "input_audio" ? "audio" :
-    ptype === "document_url" || ptype === "document_base64" ? "file" : ptype;
+    ptype === "input_audio" ? "audio" : ptype;
   const omittedTypes = [...new Set(message.parts.filter((p) => p.type !== "text" && p.type !== "refusal").map((p) => tag(p.type)))];
   const omittedNote = omittedTypes.length > 0 ? `\n[${omittedTypes.join(", ")} content omitted - not supported by current model]` : "";
   const content = (textContent + omittedNote) || `Tool result for ${identifier}: [multimedia content omitted - not supported by current model]`;
@@ -841,24 +834,14 @@ function stringifyOpenAIChatPart(part: NormalizedMessage["parts"][number], conte
   if (part.type === "text" || part.type === "refusal") return part.text;
   if (part.type === "image_url") return part.detail ? `Attached image: ${part.url} (detail: ${part.detail})` : `Attached image: ${part.url}`;
   if (part.type === "input_audio") return `Attached audio (${part.format})`;
-  if (part.type === "document_url" || part.type === "document_base64") return describeNormalizedDocumentPart(part);
   if (part.type === "thinking" || part.type === "redacted_thinking") return "";
   fail(`${context} cannot stringify part "${part.type}"`);
-}
-
-function describeNormalizedDocumentPart(part: Extract<NormalizedMessage["parts"][number], { type: "document_url" | "document_base64" }>): string {
-  if (part.type === "document_url") {
-    return part.title ? `Attached file: ${part.title} (${part.url})` : `Attached file URL: ${part.url}`;
-  }
-  return part.title ? `Attached file: ${part.title} (${part.mediaType ?? "application/octet-stream"})` : `Attached file content (${part.mediaType ?? "application/octet-stream"})`;
 }
 
 function denormalizeOpenAIResponsesToolOutput(parts: NormalizedMessage["parts"], context: string): any {
   const outputParts = parts.map((part) => {
     if (part.type === "text" || part.type === "refusal") return { type: "input_text", text: part.text };
     if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
-    if (part.type === "document_url") return { type: "input_file", file_url: part.url, filename: part.title ?? undefined };
-    if (part.type === "document_base64") return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
     fail(`${context} does not support part "${part.type}"`);
   });
 
@@ -876,9 +859,7 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
           if (part.type === "text") return { type: "input_text", text: part.text };
           if (part.type === "refusal") return { type: "refusal", refusal: part.text };
           if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
-          if (part.type === "input_audio") return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
-          if (part.type === "document_url") return { type: "input_file", file_url: part.url, filename: part.title ?? undefined };
-          return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
+          return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
         });
       
       return contentParts.length > 0 ? [{ type: "message", role: message.role, content: contentParts }] : [];
@@ -890,9 +871,7 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
           if (part.type === "text") return { type: "output_text", text: part.text, annotations: [] };
           if (part.type === "refusal") return { type: "refusal", refusal: part.text };
           if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
-          if (part.type === "input_audio") return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
-          if (part.type === "document_url") return { type: "input_file", file_url: part.url, filename: part.title ?? undefined };
-          return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
+          return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
         });
       
       const toolCallItems = message.toolCalls?.map((toolCall) => {
@@ -954,8 +933,6 @@ function denormalizeAnthropicUserParts(parts: NormalizedMessage["parts"]): any {
       const dataUrl = parseDataUrl(part.url);
       return dataUrl ? { type: "image", source: { type: "base64", media_type: dataUrl.mediaType, data: dataUrl.data }, cache_control: part.cacheControl } : { type: "image", source: { type: "url", url: part.url }, cache_control: part.cacheControl };
     }
-    if (part.type === "document_url") return { type: "document", title: part.title ?? undefined, source: { type: "url", url: part.url }, cache_control: part.cacheControl };
-    if (part.type === "document_base64") return { type: "document", title: part.title ?? undefined, source: { type: "base64", media_type: part.mediaType ?? "application/pdf", data: part.data }, cache_control: part.cacheControl };
     fail(`Anthropic does not support user part "${part.type}"`);
   });
 }
@@ -985,8 +962,6 @@ function denormalizeAnthropicToolResultParts(parts: NormalizedMessage["parts"]):
       const dataUrl = parseDataUrl(part.url);
       return dataUrl ? { type: "image", source: { type: "base64", media_type: dataUrl.mediaType, data: dataUrl.data } } : { type: "image", source: { type: "url", url: part.url } };
     }
-    if (part.type === "document_url") return { type: "document", title: part.title ?? undefined, source: { type: "url", url: part.url } };
-    if (part.type === "document_base64") return { type: "document", title: part.title ?? undefined, source: { type: "base64", media_type: part.mediaType ?? "application/pdf", data: part.data } };
     fail(`Anthropic tool_result does not support part "${part.type}"`);
   });
 }
