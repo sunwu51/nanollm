@@ -25,12 +25,14 @@ import {
   qualifyOpenAIResponsesToolName,
   refusal,
   requireTextOnly,
+  sanitizeAnthropicToolId,
   splitQualifiedOpenAIResponsesToolName,
   text,
   unwrapResponsesCustomToolInput,
   wrapResponsesCustomToolInput,
 } from "./shared.js";
-import { isResponsesCustomToolName, markResponsesCustomToolName } from "../core/request-context.js";
+import { getClientIp, getClientRequestHeaders, isResponsesCustomToolName, markResponsesCustomToolName } from "../core/request-context.js";
+import { resolveSessionId } from "../core/session-id.js";
 
 export interface AnthropicRequestConversionOptions {
   defaultMaxOutputTokens?: number;
@@ -124,18 +126,8 @@ export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): No
   if (request.system) messages.push(normalizeAnthropicSystem(request.system as any));
   for (const message of request.messages) messages.push(...normalizeAnthropicMessage(message));
 
-  let promptCacheKey: string | undefined;
-  if (request.metadata?.user_id) {
-    try {
-      const userIdData = JSON.parse(request.metadata.user_id);
-      if (userIdData.session_id) {
-        promptCacheKey = userIdData.session_id;
-      }
-    } catch {}
-  }
-  if (!promptCacheKey) {
-    promptCacheKey = makeDatePromptCacheKey();
-  }
+  // Anthropic has no prompt_cache_key; derive a per-conversation key the same way Claude subscriptions derive session ids.
+  const promptCacheKey = resolveSessionId(request, { namespace: "prompt_cache_key", clientHeaders: getClientRequestHeaders(), clientIp: getClientIp() });
   const tools = request.tools?.flatMap((tool) => {
     const normalized = normalizeAnthropicTool(tool);
     return normalized ? [normalized] : [];
@@ -378,13 +370,6 @@ export function denormalizeToAnthropicRequest(request: NormalizedRequest, option
     thinking: denormalizeAnthropicThinking(request.reasoningEffort, request.thinkingBudgetTokens),
     cache_control: request.cacheControl ?? { type: "ephemeral" },
   };
-}
-
-function makeDatePromptCacheKey(now = new Date()): string {
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  return `${year}${month}${day}`;
 }
 
 function normalizeOpenAIChatMessage(message: any): NormalizedMessage[] {
@@ -950,9 +935,10 @@ function denormalizeAnthropicMessage(message: NormalizedMessage, preserveThinkin
       return content.length > 0 ? [{ role: "assistant", content }] : [];
     }
     case "tool":
-      return [{ role: "user", content: [{ type: "tool_result", tool_use_id: message.toolCallId ?? "", is_error: message.isError ?? false, content: denormalizeAnthropicToolResultParts(message.parts) }] as any }];
+      return [{ role: "user", content: [{ type: "tool_result", tool_use_id: sanitizeAnthropicToolId(message.toolCallId ?? ""), is_error: message.isError ?? false, content: denormalizeAnthropicToolResultParts(message.parts) }] as any }];
     case "function":
-      return [{ role: "user", content: [{ type: "tool_result", tool_use_id: message.name ?? "function", is_error: message.isError ?? false, content: collapseText(requireTextOnly(message.parts, "Anthropic function result")) }] as any }];
+      // Legacy Chat function calls are normalized with id "<name>:legacy", so the result must point at the same id.
+      return [{ role: "user", content: [{ type: "tool_result", tool_use_id: sanitizeAnthropicToolId(`${message.name ?? "function"}:legacy`), is_error: message.isError ?? false, content: collapseText(requireTextOnly(message.parts, "Anthropic function result")) }] as any }];
     default:
       fail(`Anthropic Messages does not support role "${message.role}" in message array`);
   }
@@ -984,7 +970,7 @@ function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserve
   });
   for (const toolCall of message.toolCalls ?? []) {
     if (toolCall.kind !== "function") fail("Anthropic assistant output only supports function-style tool calls");
-    blocks.push({ type: "tool_use", id: toolCall.id, caller: { type: "direct" }, name: toolCall.name, input: parseJson(toolCall.payload, `Anthropic tool call "${toolCall.name}"`) });
+    blocks.push({ type: "tool_use", id: sanitizeAnthropicToolId(toolCall.id), caller: { type: "direct" }, name: toolCall.name, input: parseJson(toolCall.payload, `Anthropic tool call "${toolCall.name}"`) });
   }
   return blocks;
 }

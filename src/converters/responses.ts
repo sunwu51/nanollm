@@ -16,6 +16,7 @@ import {
   parseJson,
   qualifyOpenAIResponsesToolName,
   refusal,
+  sanitizeAnthropicToolId,
   splitQualifiedOpenAIResponsesToolName,
   text,
   unwrapResponsesCustomToolInput,
@@ -283,7 +284,7 @@ export function denormalizeToAnthropicResponse(response: NormalizedResponse): An
         if (toolCall.kind !== "function") fail("Anthropic response conversion only supports function-style tool calls");
         return {
           type: "tool_use" as const,
-          id: toolCall.id,
+          id: sanitizeAnthropicToolId(toolCall.id),
           caller: { type: "direct" as const },
           name: toolCall.name,
           input: parseJson(toolCall.payload, `Anthropic tool call "${toolCall.name}"`),

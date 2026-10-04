@@ -23,7 +23,7 @@ import {
   responsesResponseToAnthropicMessage,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
-import { denormalizeToAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
 import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
@@ -64,7 +64,7 @@ import {
   useMemoryRecordStore,
   useSqliteRecordStore,
 } from "../src/storage/record.js";
-import { runWithRequestId, setClientRequestHeaders } from "../src/core/request-context.js";
+import { runWithRequestId, setClientIp, setClientRequestHeaders } from "../src/core/request-context.js";
 import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/storage/status.js";
 import { shouldIgnoreStreamReadError } from "../src/core/stream-errors.js";
 import { extractErrorCauses, formatErrorWithCauses } from "../src/core/error-details.js";
@@ -4157,6 +4157,73 @@ run("OpenAI conversion retains explicit prompt cache keys for Claude subscriptio
   assert.equal(identities[0].session_id, identities[1].session_id);
   assert.equal(requests[0].promptCacheKey, "conversation-key");
   assert.equal(requests[1].promptCacheKey, "conversation-key");
+});
+
+run("anthropic prompt cache key uses the metadata session id when present", () => {
+  const normalized = normalizeAnthropicRequest({
+    model: "claude", max_tokens: 10,
+    metadata: { user_id: JSON.stringify({ device_id: "d", session_id: "session-123" }) },
+    messages: [{ role: "user", content: "hello" }],
+  } as any);
+  assert.equal(normalized.promptCacheKey, "session-123");
+});
+
+run("anthropic prompt cache key falls back to a per-conversation hash instead of the date", () => {
+  const key = (messages: unknown[], ip = "127.0.0.1") => runWithRequestId("req_cache_key_" + ip, () => {
+    setClientRequestHeaders(new Headers({ "user-agent": "client" }));
+    setClientIp(ip);
+    return normalizeAnthropicRequest({ model: "claude", max_tokens: 10, messages } as any).promptCacheKey;
+  });
+  const first = { role: "user", content: "hello" };
+  const grown = key([first, { role: "assistant", content: "answer" }, { role: "user", content: "next" }]);
+  assert.match(key([first]), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.equal(key([first]), grown);
+  assert.notEqual(key([first]), key([{ role: "user", content: "new chat" }]));
+  assert.notEqual(key([first]), key([first], "127.0.0.2"));
+  assert.equal(
+    runWithRequestId("req_cache_key_header", () => {
+      setClientRequestHeaders(new Headers({ "x-claude-code-session-id": "header-session" }));
+      return normalizeAnthropicRequest({ model: "claude", max_tokens: 10, messages: [first] } as any).promptCacheKey;
+    }),
+    "header-session",
+  );
+});
+
+run("tool ids with characters Anthropic rejects are sanitized in requests", () => {
+  const result = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "user", content: "read it" },
+      { role: "assistant", content: null, tool_calls: [{ id: "functions.read:0", type: "function", function: { name: "read", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "functions.read:0", content: "done" },
+      { role: "assistant", content: null, function_call: { name: "get_weather", arguments: "{}" } },
+      { role: "function", name: "get_weather", content: "Sunny" },
+    ],
+  } as any) as any;
+  const blocks = result.messages.flatMap((message: any) => Array.isArray(message.content) ? message.content : []);
+  const toolUseIds = blocks.filter((block: any) => block.type === "tool_use").map((block: any) => block.id);
+  const toolResultIds = blocks.filter((block: any) => block.type === "tool_result").map((block: any) => block.tool_use_id);
+  assert.deepEqual(toolUseIds, ["functions_read_0", "get_weather_legacy"]);
+  assert.deepEqual(toolResultIds, ["functions_read_0", "get_weather_legacy"]);
+});
+
+run("tool ids with characters Anthropic rejects are sanitized in responses and streams", () => {
+  const message = chatCompletionToAnthropicMessage({
+    id: "chatcmpl_ids", object: "chat.completion", created: 1, model: "kimi",
+    choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: "functions.read:0", type: "function", function: { name: "read", arguments: "{}" } }] } }],
+  } as any) as any;
+  assert.equal(message.content.find((block: any) => block.type === "tool_use").id, "functions_read_0");
+
+  const converter = createSSEConverter("openai-chat", "anthropic");
+  const chunks = [
+    ...converter.push([
+      { id: "chatcmpl_ids", object: "chat.completion.chunk", created: 1, model: "kimi", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "functions.read:0", type: "function", function: { name: "read", arguments: "{}" } }] }, finish_reason: null }] },
+      { id: "chatcmpl_ids", object: "chat.completion.chunk", created: 1, model: "kimi", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n"),
+    ...converter.flush(),
+  ];
+  const start = parseSSEObjects(chunks).find((event) => event.data.type === "content_block_start" && event.data.content_block?.type === "tool_use");
+  assert.equal(start?.data.content_block.id, "functions_read_0");
 });
 
 run("claude subscription fills missing defaults and removes tool_choice without tools", () => {

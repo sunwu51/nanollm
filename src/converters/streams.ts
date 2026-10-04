@@ -2,7 +2,7 @@
 import type { ChatCompletionChunk } from "openai/resources/chat/completions/completions";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
 import type { RawMessageStreamEvent } from "@anthropic-ai/sdk/resources/messages/messages";
-import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, qualifyOpenAIResponsesToolName, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput } from "./shared.js";
+import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, qualifyOpenAIResponsesToolName, sanitizeAnthropicToolId, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput } from "./shared.js";
 import { isResponsesCustomToolName, } from "../core/request-context.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -987,7 +987,7 @@ export class AnthropicStreamEmitter implements StreamEmitter {
         const idx = this.getBlockIndex(event.index);
         this.blockTypes.set(event.index, "tool_use");
         this.toolKinds.set(event.index, event.kind);
-        out.push({ type: "content_block_start", index: idx, content_block: { type: "tool_use", id: event.id, name: event.name, input: {} } });
+        out.push({ type: "content_block_start", index: idx, content_block: { type: "tool_use", id: typeof event.id === "string" ? sanitizeAnthropicToolId(event.id) : event.id, name: event.name, input: {} } });
         if (event.kind === "custom") {
           out.push({ type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: "{\"content\":\"" } });
         }

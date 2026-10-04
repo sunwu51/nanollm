@@ -113,6 +113,11 @@ export function fail(message: string): never {
   throw new Error(message);
 }
 
+/** Anthropic tool_use ids must match ^[a-zA-Z0-9_-]+$; replace anything else (e.g. ":" in "name:legacy") with "_". */
+export function sanitizeAnthropicToolId(id: string): string {
+  return id.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
 export function text(textValue: string): NormalizedPart {
   return { type: "text", text: textValue };
 }
