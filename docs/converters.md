@@ -17,17 +17,17 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | `messages` | `messages[]` | `instructions` + `input` | `system` + `messages[]` | System/developer messages become Anthropic `system`; Responses leading system/developer messages become `instructions`. |
 | `tools` | `tools[]`, legacy `functions[]` | `tools[]` | `tools[]` | Only function-style normalized tools survive all protocols. Responses MCP namespace tools are flattened to qualified function-style names like `mcp__server__tool`; unsupported hosted/server tools and non-MCP namespaces are dropped while normalizing tools. |
 | `toolChoice` | `tool_choice`, legacy `function_call` | `tool_choice` | `tool_choice` | Unsupported named choices are filtered out if the named tool was dropped. |
-| `metadata` | `metadata` | `metadata` | `metadata.user_id` only | Anthropic denormalization rejects metadata except a single string `user_id`. |
-| `serviceTier` | `service_tier` | `service_tier` | `service_tier` | Each provider validates its allowed values on denormalization. |
+| `metadata` | `metadata` | `metadata` | `metadata.user_id` only | Anthropic denormalization keeps a string `user_id` and drops every other metadata key. |
+| `serviceTier` | `service_tier` | `service_tier` | `service_tier` | Mapped per target; see Service Tier Mapping. Values with no counterpart are omitted. |
 | `stream` | `stream` | `stream` | `stream` | Chat also emits `stream_options.include_usage` when streaming. |
 | `temperature` | `temperature` | `temperature` | `temperature` | Passed through when present. |
 | `topP` | `top_p` | `top_p` | `top_p` | Passed through when present. |
 | `stopSequences` | `stop` | Not currently emitted | `stop_sequences` | Chat string `stop` normalizes to a one-item array. |
 | `parallelToolCalls` | `parallel_tool_calls` | `parallel_tool_calls` | Inverted into `tool_choice.disable_parallel_tool_use` | Anthropic expresses this on `tool_choice`, not as a top-level boolean. |
-| `promptCacheKey` | `prompt_cache_key` or `promptCacheKey` | `prompt_cache_key` or `promptCacheKey` | Derived from `metadata.user_id.session_id` JSON or date | Anthropic does not expose the same top-level prompt cache key. |
+| `promptCacheKey` | `prompt_cache_key` or `promptCacheKey` | `prompt_cache_key` or `promptCacheKey` | Derived by `core/session-id`: `x-claude-code-session-id` header, `metadata.user_id` session, session/thread/conversation headers, else a hash of client IP + user agent + first user text | Anthropic does not expose the same top-level prompt cache key. |
 | `promptCacheRetention` | `prompt_cache_retention` or `promptCacheRetention` | `prompt_cache_retention` or `promptCacheRetention` | Not emitted | OpenAI-only. |
 | `safetyIdentifier` | `safety_identifier` | `safety_identifier` | Not emitted | OpenAI-only. |
-| `reasoningEffort` | `reasoning_effort`, fallback `reasoning.effort` | `reasoning.effort` | `thinking.type=adaptive` + `output_config.effort`, fallback old `thinking.enabled.budget_tokens` | Anthropic old budgets map to `low`/`medium`/`high`; Anthropic output now uses adaptive thinking. |
+| `reasoningEffort` | `reasoning_effort`, fallback `reasoning.effort` | `reasoning.effort` | `thinking.type=disabled` → `none`; `thinking.type=adaptive` + `output_config.effort`; fallback old `thinking.enabled.budget_tokens` | Anthropic old budgets map to `low`/`medium`/`high`. Anthropic output: `none` → `thinking.type=disabled`, `minimal` → `low`, other levels use adaptive thinking. |
 | `thinkingBudgetTokens` | Not read | Not read | Old `thinking.enabled.budget_tokens` | Kept only as legacy input state; Anthropic output converts it to `output_config.effort` + adaptive thinking. |
 | `textVerbosity` | `verbosity` | `text.verbosity` | Not supported | OpenAI-only. |
 | `responseFormat` | `response_format` | `text.format` | `output_config.format` | Anthropic only emits JSON schema format. |
@@ -41,7 +41,7 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | `developer` role | `developer` input; denormalizes to Chat `system` | Leading `instructions` text | `system` text block | Anthropic has no developer role. |
 | `user` role text | string or `{ type: "text" }` | `message` with `input_text` | `user` text block/string | Multiple adjacent Anthropic same-role messages are merged. |
 | `user` image | `image_url` | `input_image` | `image` URL or base64 source | Missing Responses `image_url` errors. |
-| `user` document | Degrades to text description | `input_file` | `document` URL/base64/text source | Chat does not support documents directly. |
+| `user` file | `file` part: rejected with 400 | `input_file`: rejected with 400 | `document` with url/base64/file source: rejected with 400; `text`/`content` source becomes text | Files are only forwarded by same-protocol passthrough. See File Content. |
 | `input_audio` | Chat `input_audio` | Responses `input_audio` | Not supported | Anthropic user part errors when denormalizing audio. |
 | assistant text | `content` text | `message.content[].output_text` | assistant `text` block | Refusals are preserved as `refusal` where supported. |
 | assistant thinking | `thinking`, `reasoning`, `reasoning_content` vendor fields | Native Responses `reasoning` items are read; synthetic Chat/Anthropic thinking is not emitted in Responses create requests | Anthropic `thinking` block | Chat input/output reads and writes all three vendor thinking fields. |
@@ -49,7 +49,7 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | function tool call | `tool_calls[].function` | `function_call` | assistant `tool_use` | Anthropic `server_tool_use` also normalizes to this shape. |
 | Responses custom tool call | Wrapped into function-style schema/call | `custom_tool_call` when source was Responses custom | Anthropic `tool_use` | Custom input is wrapped/unwrapped to fit function arguments. |
 | tool result | Chat `tool` message | `function_call_output` | user `tool_result` block | Legacy Chat `function` role maps to/from tool result fallback. |
-| server tool result | Not distinct | Not distinct | `*_tool_result` blocks normalize to normal tool result | Result content is degraded to text or supported media/document parts. |
+| server tool result | Not distinct | Not distinct | `*_tool_result` blocks normalize to normal tool result | Result content is degraded to text or images. |
 
 ## Tool Mapping
 
@@ -73,22 +73,37 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | Anthropic final role | Anthropic requests converted from other formats must end with user/tool/function. | If the final normalized message is assistant, a synthetic user message `go on` is appended before denormalizing to Anthropic. Native Anthropic source skips this fix. |
 | Anthropic adjacent roles | Anthropic disallows awkward repeated role turns in many cases. | Adjacent messages with the same Anthropic role are merged by concatenating content blocks. |
 | Anthropic tool result adjacency | Anthropic expects tool results to follow the assistant tool use that requested them. | When converting non-Anthropic sources to Anthropic, pending tool results are reordered immediately after the assistant tool call when matching IDs are found later. |
-| Anthropic legacy function result | Chat legacy `function` role may use a function name instead of tool call ID. | Pending IDs include both `toolCall.id` and `toolCall.name` when the ID ends with `:legacy`. |
+| Anthropic legacy function result | Chat legacy `function` role may use a function name instead of tool call ID. | Pending IDs include both `toolCall.id` and `toolCall.name` when the ID ends with `:legacy`. The emitted `tool_result.tool_use_id` is `<name>:legacy` (sanitized) so it matches the `tool_use`. |
+| Anthropic tool ids | Anthropic requires `tool_use.id` / `tool_use_id` to match `^[a-zA-Z0-9_-]+$`. | Requests and responses converted to Anthropic replace any other character with `_` (e.g. `get_weather:legacy` becomes `get_weather_legacy`, `functions.read:0` becomes `functions_read_0`). |
 | Anthropic `server_tool_use` | It is a server-side tool call in Anthropic, but normalized as a normal function call. | It denormalizes to regular `tool_use`, not `server_tool_use`, so server-tool semantics are lost. |
-| Anthropic `*_tool_result` | Server tool results have provider-specific block types. | Any block with type ending in `_tool_result` is accepted and normalized to a normal tool result. Known web/tool-search contents are degraded to text/document parts. |
+| Anthropic `*_tool_result` | Server tool results have provider-specific block types. | Any block with type ending in `_tool_result` is accepted and normalized to a normal tool result. Known web/tool-search contents are degraded to text; a `web_fetch_result` keeps the page text for text documents and only the URL otherwise. |
 | Anthropic tool search result | `tool_search_tool_result` contains `tool_references`. | It normalizes to a normal tool result whose text is a newline-separated list of `tool_name` values. |
-| Anthropic adaptive thinking | New Anthropic thinking uses `thinking.type=adaptive` plus `output_config.effort`. | Normalization reads this first. Denormalization always uses this new form when reasoning effort exists. |
+| Anthropic adaptive thinking | New Anthropic thinking uses `thinking.type=adaptive` plus `output_config.effort`. | Normalization reads this first. Denormalization uses this form for every effort except `none`, which emits `thinking.type=disabled` with no effort; `minimal` is sent as `low` because Anthropic has no lower level. |
 | Anthropic old budget thinking | Old Anthropic thinking used `thinking.type=enabled` and `budget_tokens`. | Normalization still supports it and maps budgets `<=3000` to `low`, `<=7500` to `medium`, otherwise `high`. |
 | Chat thinking content | Providers use different non-standard fields for reasoning text. | Chat message/response conversion reads and writes `thinking`, `reasoning`, and `reasoning_content`. Streams also read/write all three delta fields. |
 | Chat reasoning effort | Providers use both top-level `reasoning_effort` and `reasoning.effort`. | Chat request normalization reads both; denormalization emits both. |
-| Reasoning effort conversion | The five common levels `low`, `medium`, `high`, `xhigh`, and `max` are preserved across Chat, Responses, and Anthropic. OpenAI Chat and Responses input `ultra` normalizes to `max`. | The `ultra` downgrade applies during protocol conversion; same-format passthrough preserves the original value. Legacy `none`/`minimal` values and budget thresholds are unchanged. Supported levels remain model-dependent. |
+| Reasoning effort conversion | The five common levels `low`, `medium`, `high`, `xhigh`, and `max` are preserved across Chat, Responses, and Anthropic. OpenAI Chat and Responses input `ultra` normalizes to `max`. | The `ultra` downgrade applies during protocol conversion; same-format passthrough preserves the original value. Between OpenAI protocols `none`/`minimal` are unchanged; toward Anthropic `none` disables thinking and `minimal` becomes `low`, and Anthropic `thinking.type=disabled` becomes `none`. Supported levels remain model-dependent. |
 | OpenAI Responses tool search history | Tool search call/output can appear in historical `input[]`. | `tool_search_call` and `tool_search_output` are logged with `console.warn` and dropped. The following `function_call` remains normal. |
 | OpenAI Responses namespace history | Historical Responses `function_call` / `custom_tool_call` items and streamed output items can carry `namespace`. | MCP namespace names are folded into qualified names like `mcp__server__tool` during normalization and are split back to `namespace` + local `name` when denormalizing back to Responses. |
 | OpenAI storage defaults | Non-passthrough OpenAI requests should not use server-side stored item references. | Proxy request forwarding sets `store=false` for OpenAI Chat and Responses. |
 | OpenAI Responses passthrough item IDs | Responses item `id` fields such as `message.id`, `reasoning.id`, and `function_call.id` point at upstream-persisted item state. | Same-format Responses passthrough removes those item `id` fields when `store=false`; `call_id` and the rest of each item are preserved. |
 | Responses custom tool input | Responses custom tools are not the same as function tools. | Custom input is wrapped into function arguments when normalizing to common function-style tools, and unwrapped when denormalizing back to Responses custom. |
 | Responses namespace tool calls | Responses `function_call`/`custom_tool_call` items can carry a separate `namespace`. | MCP namespace calls are normalized to qualified names like `mcp__server__tool` so non-namespace targets can still route the call, and are split back into `namespace` + local `name` when denormalizing back to Responses. |
-| Documents to Chat | Chat does not have the same document part model. | Documents degrade to text descriptions in Chat user/tool contexts. |
+| File content | Chat `file`, Responses `input_file` and Anthropic `document` (url/base64/file source) have different shapes and provider-specific file ids. | Not converted. The converter throws `UnsupportedContentError` (HTTP 400). In a fallback group the next candidate is still tried, so a same-protocol member can serve the request by passthrough, and the rejection does not count against the member's fallback ranking. |
+
+## Service Tier Mapping
+
+OpenAI Chat and Responses accept `auto`, `default`, `flex`, `scale`, `priority`; Anthropic accepts `auto`, `standard_only`. Codex clients also send `fast` as an alias of `priority`. Values not listed are omitted so the upstream default applies.
+
+| Source value | To OpenAI Chat / Responses | To Anthropic | Why |
+| --- | --- | --- | --- |
+| `auto` | `auto` | `auto` | Same meaning. |
+| `default` | `default` | `standard_only` | Standard capacity only. |
+| `flex` | `flex` | `standard_only` | Anthropic has no cheaper tier; never use priority capacity. |
+| `scale` | `scale` | `auto` | Reserved capacity; Anthropic `auto` uses Priority Tier when the org has it. |
+| `priority` | `priority` | `auto` | Same as above. |
+| `fast` | `priority` | `auto` | Codex alias of priority. |
+| `standard_only` | `default` | `standard_only` | Anthropic standard capacity. |
 
 ## Unsupported or Erroring Cases
 
@@ -98,6 +113,7 @@ These cases currently fail intentionally instead of silently degrading.
 
 | Location | Error condition |
 | --- | --- |
+| `content[]` `file` part | Rejected with 400 (file content). |
 | `messages[].role` | Role is not `system`, `developer`, `user`, `assistant`, `tool`, or `function`. |
 | `user.content[]` | Part is not `text`, `image_url`, or `input_audio`. |
 
@@ -105,8 +121,7 @@ These cases currently fail intentionally instead of silently degrading.
 
 | Target | Error condition |
 | --- | --- |
-| Chat user parts | Normalized user part is not text/refusal, image URL, audio, or document fallback. |
-| Chat service tier | `serviceTier` is not one of the supported OpenAI Chat values. |
+| Chat user parts | Normalized user part is not text/refusal, image URL, or audio. |
 
 ### OpenAI Responses request normalization
 
@@ -115,7 +130,7 @@ These cases currently fail intentionally instead of silently degrading.
 | `input[]` top-level item | Item type is not `message`, `reasoning`, `function_call`, `custom_tool_call`, `function_call_output`, `custom_tool_call_output`, `item_reference`, `tool_search_call`, or `tool_search_output`. `item_reference` is dropped; tool search items are warned and dropped. |
 | `message.content[]` | Content part is not `input_text`, `output_text`, `input_image`, `input_file`, `refusal`, or `input_audio`. |
 | `input_image` | Missing `image_url`. |
-| `input_file` | Missing both `file_url` and `file_data`. |
+| `input_file` | Always rejected with 400 (file content is not converted). |
 | tool output parts | Unsupported part type or missing required image/file payload. |
 
 Common Responses item types that still error if they appear in request `input[]` include:
@@ -144,15 +159,15 @@ Common Responses item types that still error if they appear in request `input[]`
 | --- | --- |
 | Responses instructions | System/developer message contains non-text parts. |
 | Responses tool/function output | Normalized tool result contains a part not representable as text/refusal, image, or file. |
-| Responses service tier | `serviceTier` is not one of the supported OpenAI Responses values. |
 
 ### Anthropic request normalization
 
 | Area | Error condition |
 | --- | --- |
 | user/assistant content block | Block is not a supported message block and does not end with `_tool_result`. |
+| `document` | Source is url, base64 or file: rejected with 400 (file content). |
 | `document.source.type=content` | Child block is not `text`. |
-| ordinary `tool_result.content[]` | Block is not `text`, `image`, or `document`. |
+| ordinary `tool_result.content[]` | Block is not `text`, `image`, or a text-source `document`. A url/base64/file `document` is rejected with 400. |
 
 Anthropic content blocks that may still error outside `_tool_result` handling include:
 
@@ -165,13 +180,11 @@ Anthropic content blocks that may still error outside `_tool_result` handling in
 | Target | Error condition |
 | --- | --- |
 | message role | Normalized role is not `system`, `developer`, `user`, `assistant`, `tool`, or `function`. |
-| user parts | Part is not text, image URL, document URL, or document base64. |
+| user parts | Part is not text or image URL. |
 | assistant tool calls | Tool call is not function-style. |
-| tool result parts | Part is not text, image URL, document URL, or document base64. |
+| tool result parts | Part is not text or image URL. |
 | tools | Normalized tool is not function-style. |
 | tool choice | Named tool choice is not function-style. |
-| metadata | Metadata contains anything other than a single string `user_id`. |
-| service tier | `serviceTier` is not one of the supported Anthropic values. |
 
 ## Response Mapping Notes
 

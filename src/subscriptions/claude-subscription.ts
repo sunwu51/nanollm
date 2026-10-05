@@ -292,7 +292,8 @@ export function getOrCreateClaudeSubscriptionDeviceId(name: string): string {
 export function buildClaudeModelsHeaders(accessToken: string, identityHeaders: Record<string, string> = {}): Record<string, string> {
   return {
     Accept: "application/json",
-    "User-Agent": CLAUDE_CODE_USER_AGENT,
+    // Lowercase like the identity headers' user-agent, so that one replaces this fallback instead of duplicating it.
+    "user-agent": CLAUDE_CODE_USER_AGENT,
     "anthropic-beta": CLAUDE_OAUTH_BETA,
     ...identityHeaders,
     Authorization: `Bearer ${accessToken}`,

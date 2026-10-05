@@ -2,7 +2,7 @@
 import type { ChatCompletionChunk } from "openai/resources/chat/completions/completions";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
 import type { RawMessageStreamEvent } from "@anthropic-ai/sdk/resources/messages/messages";
-import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, qualifyOpenAIResponsesToolName, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput } from "./shared.js";
+import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, qualifyOpenAIResponsesToolName, sanitizeAnthropicToolId, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput } from "./shared.js";
 import { isResponsesCustomToolName, } from "../core/request-context.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -444,7 +444,7 @@ export class AnthropicStreamParser implements StreamParser {
           if (block.data) {
             out.push({ type: "content_delta", index: idx, delta: block.data });
           }
-        } else if (block.type === "tool_use") {
+        } else if (block.type === "tool_use" || block.type === "server_tool_use") {
           out.push({ type: "tool_start", index: idx, id: block.id, name: block.name, kind: "function" });
         }
         break;
@@ -469,7 +469,7 @@ export class AnthropicStreamParser implements StreamParser {
       case "content_block_stop": {
         const idx = event.index;
         const blockType = this.blockTypes.get(idx);
-        if (blockType === "tool_use") {
+        if (blockType === "tool_use" || blockType === "server_tool_use") {
           out.push({ type: "tool_done", index: idx });
         } else {
           out.push({ type: "content_done", index: idx });
@@ -987,7 +987,7 @@ export class AnthropicStreamEmitter implements StreamEmitter {
         const idx = this.getBlockIndex(event.index);
         this.blockTypes.set(event.index, "tool_use");
         this.toolKinds.set(event.index, event.kind);
-        out.push({ type: "content_block_start", index: idx, content_block: { type: "tool_use", id: event.id, name: event.name, input: {} } });
+        out.push({ type: "content_block_start", index: idx, content_block: { type: "tool_use", id: typeof event.id === "string" ? sanitizeAnthropicToolId(event.id) : event.id, name: event.name, input: {} } });
         if (event.kind === "custom") {
           out.push({ type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: "{\"content\":\"" } });
         }

@@ -21,16 +21,19 @@ import {
   normalizeReasoningEffort,
   normalizeReasoningEffortFromBudget,
   parseDataUrl,
-  parseJson,
+  parseToolArguments,
   qualifyOpenAIResponsesToolName,
   refusal,
+  rejectFileContent,
   requireTextOnly,
+  sanitizeAnthropicToolId,
   splitQualifiedOpenAIResponsesToolName,
   text,
   unwrapResponsesCustomToolInput,
   wrapResponsesCustomToolInput,
 } from "./shared.js";
-import { isResponsesCustomToolName, markResponsesCustomToolName } from "../core/request-context.js";
+import { getClientIp, getClientRequestHeaders, isResponsesCustomToolName, markResponsesCustomToolName } from "../core/request-context.js";
+import { resolveSessionId } from "../core/session-id.js";
 
 export interface AnthropicRequestConversionOptions {
   defaultMaxOutputTokens?: number;
@@ -124,18 +127,8 @@ export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): No
   if (request.system) messages.push(normalizeAnthropicSystem(request.system as any));
   for (const message of request.messages) messages.push(...normalizeAnthropicMessage(message));
 
-  let promptCacheKey: string | undefined;
-  if (request.metadata?.user_id) {
-    try {
-      const userIdData = JSON.parse(request.metadata.user_id);
-      if (userIdData.session_id) {
-        promptCacheKey = userIdData.session_id;
-      }
-    } catch {}
-  }
-  if (!promptCacheKey) {
-    promptCacheKey = makeDatePromptCacheKey();
-  }
+  // Anthropic has no prompt_cache_key; derive a per-conversation key the same way Claude subscriptions derive session ids.
+  const promptCacheKey = resolveSessionId(request, { namespace: "prompt_cache_key", clientHeaders: getClientRequestHeaders(), clientIp: getClientIp() });
   const tools = request.tools?.flatMap((tool) => {
     const normalized = normalizeAnthropicTool(tool);
     return normalized ? [normalized] : [];
@@ -158,9 +151,11 @@ export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): No
     parallelToolCalls: normalizedToolChoice?.type === "none" ? undefined : normalizedToolChoice?.disableParallel === undefined ? undefined : !normalizedToolChoice.disableParallel,
     promptCacheKey,
     reasoningEffort:
-      request.thinking?.type === "adaptive"
-        ? request.output_config?.effort ?? null
-        : normalizeReasoningEffortFromBudget(request.thinking?.type === "enabled" ? request.thinking.budget_tokens : null),
+      request.thinking?.type === "disabled"
+        ? "none"
+        : request.thinking?.type === "adaptive"
+          ? request.output_config?.effort ?? null
+          : normalizeReasoningEffortFromBudget(request.thinking?.type === "enabled" ? request.thinking.budget_tokens : null),
     thinkingBudgetTokens: request.thinking?.type === "enabled" ? request.thinking.budget_tokens : null,
     textVerbosity: null,
     responseFormat: request.output_config?.format ? { type: "json_schema", name: "anthropic_output", schema: request.output_config.format.schema } : undefined,
@@ -380,13 +375,6 @@ export function denormalizeToAnthropicRequest(request: NormalizedRequest, option
   };
 }
 
-function makeDatePromptCacheKey(now = new Date()): string {
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  return `${year}${month}${day}`;
-}
-
 function normalizeOpenAIChatMessage(message: any): NormalizedMessage[] {
   switch (message.role) {
     case "system":
@@ -411,9 +399,8 @@ function normalizeOpenAIChatToolResultParts(content: any): NormalizedMessage["pa
     if (part.type === "text") return text(part.text);
     if (part.type === "image_url") return { type: "image_url", url: part.image_url.url, detail: part.image_url.detail };
     if (part.type === "input_audio") return { type: "input_audio", data: part.input_audio.data, format: part.input_audio.format };
-    if (part.type === "document_url") return { type: "document_url", url: part.document_url.url, title: part.document_url.title ?? null };
-    if (part.type === "document_base64") return { type: "document_base64", data: part.document_base64.data, mediaType: part.document_base64.media_type ?? null, title: part.document_base64.title ?? null };
     if (part.type === "refusal") return refusal(part.refusal);
+    if (part.type === "file") rejectFileContent('Chat "file" content');
     fail(`Unsupported chat tool content part "${part.type}"`);
   });
 }
@@ -424,6 +411,7 @@ function normalizeOpenAIChatUserParts(content: any): NormalizedMessage["parts"] 
     if (part.type === "text") return text(part.text);
     if (part.type === "image_url") return { type: "image_url", url: part.image_url.url, detail: part.image_url.detail };
     if (part.type === "input_audio") return { type: "input_audio", data: part.input_audio.data, format: part.input_audio.format };
+    if (part.type === "file") rejectFileContent('Chat "file" content');
     fail(`Unsupported chat user content part "${part.type}"`);
   });
 }
@@ -548,11 +536,7 @@ function normalizeOpenAIResponsesMessage(item: any): NormalizedMessage {
         return { type: "image_url", url: part.image_url, detail: part.detail === "original" ? "auto" : part.detail ?? undefined };
       }
       if (part.type === "input_audio") return { type: "input_audio", data: part.input_audio.data, format: part.input_audio.format };
-      if (part.type === "input_file") {
-        if (part.file_url) return { type: "document_url", url: part.file_url, title: part.filename ?? null };
-        if (part.file_data) return { type: "document_base64", data: part.file_data, title: part.filename ?? null };
-        fail("Responses input_file without file_url or file_data is not supported");
-      }
+      if (part.type === "input_file") rejectFileContent('Responses "input_file" content');
       fail(`Unsupported Responses content part "${part.type}"`);
     }),
   };
@@ -566,11 +550,7 @@ function normalizeOpenAIResponsesToolOutput(output: any): NormalizedMessage["par
       if (!part.image_url) fail("Responses tool output input_image without image_url is not supported");
       return { type: "image_url", url: part.image_url, detail: part.detail === "original" ? "auto" : part.detail ?? undefined };
     }
-    if (part.type === "input_file") {
-      if (part.file_url) return { type: "document_url", url: part.file_url, title: part.filename ?? null };
-      if (part.file_data) return { type: "document_base64", data: part.file_data, title: part.filename ?? null };
-      fail("Responses tool output input_file without file_url or file_data is not supported");
-    }
+    if (part.type === "input_file") rejectFileContent('Responses "input_file" tool output');
     fail(`Unsupported Responses tool output part "${part.type}"`);
   });
 }
@@ -642,9 +622,8 @@ function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
       continue;
     }
     if (block.type === "document") {
-      if (block.source.type === "url") normalized.push({ role: "user", parts: [{ type: "document_url", url: block.source.url, title: block.title ?? null, cacheControl: block.cache_control }] });
-      else if (block.source.type === "base64") normalized.push({ role: "user", parts: [{ type: "document_base64", data: block.source.data, mediaType: block.source.media_type, title: block.title ?? null, cacheControl: block.cache_control }] });
-      else if (block.source.type === "text") normalized.push({ role: "user", parts: [{ type: "text", text: block.source.data, cacheControl: block.cache_control }] });
+      // Plain-text documents are just text; url/base64/file sources are files and are not converted.
+      if (block.source.type === "text") normalized.push({ role: "user", parts: [{ type: "text", text: block.source.data, cacheControl: block.cache_control }] });
       else if (block.source.type === "content") {
         const textParts: NormalizedMessage["parts"] = [];
         for (const child of block.source.content) {
@@ -653,8 +632,10 @@ function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
         }
         if (textParts.length > 0) normalized.push({ role: "user", parts: textParts });
       }
+      else rejectFileContent(`Anthropic "document" content with a "${block.source.type}" source`);
       continue;
     }
+    if (block.type === "container_upload") rejectFileContent('Anthropic "container_upload" content');
     if (block.type === "tool_result") {
       normalized.push({ role: "tool", toolCallId: block.tool_use_id, isError: block.is_error, parts: normalizeAnthropicToolResultParts(block.content) });
       continue;
@@ -688,8 +669,9 @@ function normalizeAnthropicServerToolResultParts(content: any): NormalizedMessag
   }
 
   if (content.type === "web_fetch_result") {
-    const documentParts = normalizeAnthropicToolResultParts([content.content]);
-    if (documentParts.length > 0) return documentParts;
+    // A fetched web page is a text document; a fetched PDF is a file, so only its URL is kept.
+    const source = content.content?.source;
+    if (source?.type === "text" && typeof source.data === "string") return [text(source.data)];
     return [text(content.url ?? "web_fetch_result")];
   }
 
@@ -707,9 +689,8 @@ function normalizeAnthropicToolResultParts(content: any): NormalizedMessage["par
     if (block.type === "text") return text(block.text);
     if (block.type === "image") return { type: "image_url", url: block.source.type === "url" ? block.source.url : makeDataUrl(block.source.media_type, block.source.data) };
     if (block.type === "document") {
-      if (block.source.type === "url") return { type: "document_url", url: block.source.url, title: block.title ?? null };
-      if (block.source.type === "base64") return { type: "document_base64", data: block.source.data, mediaType: block.source.media_type, title: block.title ?? null };
       if (block.source.type === "text") return text(block.source.data);
+      rejectFileContent(`Anthropic "document" tool_result content with a "${block.source.type}" source`);
     }
     fail(`Anthropic tool_result block "${block.type}" is not supported`);
   });
@@ -834,8 +815,7 @@ function denormalizeOpenAIChatToolResultMessage(message: NormalizedMessage, iden
     .join("\n");
   const tag = (ptype: string) =>
     ptype === "image_url" ? "image" :
-    ptype === "input_audio" ? "audio" :
-    ptype === "document_url" || ptype === "document_base64" ? "file" : ptype;
+    ptype === "input_audio" ? "audio" : ptype;
   const omittedTypes = [...new Set(message.parts.filter((p) => p.type !== "text" && p.type !== "refusal").map((p) => tag(p.type)))];
   const omittedNote = omittedTypes.length > 0 ? `\n[${omittedTypes.join(", ")} content omitted - not supported by current model]` : "";
   const content = (textContent + omittedNote) || `Tool result for ${identifier}: [multimedia content omitted - not supported by current model]`;
@@ -854,24 +834,14 @@ function stringifyOpenAIChatPart(part: NormalizedMessage["parts"][number], conte
   if (part.type === "text" || part.type === "refusal") return part.text;
   if (part.type === "image_url") return part.detail ? `Attached image: ${part.url} (detail: ${part.detail})` : `Attached image: ${part.url}`;
   if (part.type === "input_audio") return `Attached audio (${part.format})`;
-  if (part.type === "document_url" || part.type === "document_base64") return describeNormalizedDocumentPart(part);
   if (part.type === "thinking" || part.type === "redacted_thinking") return "";
   fail(`${context} cannot stringify part "${part.type}"`);
-}
-
-function describeNormalizedDocumentPart(part: Extract<NormalizedMessage["parts"][number], { type: "document_url" | "document_base64" }>): string {
-  if (part.type === "document_url") {
-    return part.title ? `Attached file: ${part.title} (${part.url})` : `Attached file URL: ${part.url}`;
-  }
-  return part.title ? `Attached file: ${part.title} (${part.mediaType ?? "application/octet-stream"})` : `Attached file content (${part.mediaType ?? "application/octet-stream"})`;
 }
 
 function denormalizeOpenAIResponsesToolOutput(parts: NormalizedMessage["parts"], context: string): any {
   const outputParts = parts.map((part) => {
     if (part.type === "text" || part.type === "refusal") return { type: "input_text", text: part.text };
     if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
-    if (part.type === "document_url") return { type: "input_file", file_url: part.url, filename: part.title ?? undefined };
-    if (part.type === "document_base64") return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
     fail(`${context} does not support part "${part.type}"`);
   });
 
@@ -889,9 +859,7 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
           if (part.type === "text") return { type: "input_text", text: part.text };
           if (part.type === "refusal") return { type: "refusal", refusal: part.text };
           if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
-          if (part.type === "input_audio") return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
-          if (part.type === "document_url") return { type: "input_file", file_url: part.url, filename: part.title ?? undefined };
-          return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
+          return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
         });
       
       return contentParts.length > 0 ? [{ type: "message", role: message.role, content: contentParts }] : [];
@@ -903,9 +871,7 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
           if (part.type === "text") return { type: "output_text", text: part.text, annotations: [] };
           if (part.type === "refusal") return { type: "refusal", refusal: part.text };
           if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
-          if (part.type === "input_audio") return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
-          if (part.type === "document_url") return { type: "input_file", file_url: part.url, filename: part.title ?? undefined };
-          return { type: "input_file", file_data: part.data, filename: part.title ?? undefined };
+          return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
         });
       
       const toolCallItems = message.toolCalls?.map((toolCall) => {
@@ -950,9 +916,10 @@ function denormalizeAnthropicMessage(message: NormalizedMessage, preserveThinkin
       return content.length > 0 ? [{ role: "assistant", content }] : [];
     }
     case "tool":
-      return [{ role: "user", content: [{ type: "tool_result", tool_use_id: message.toolCallId ?? "", is_error: message.isError ?? false, content: denormalizeAnthropicToolResultParts(message.parts) }] as any }];
+      return [{ role: "user", content: [{ type: "tool_result", tool_use_id: sanitizeAnthropicToolId(message.toolCallId ?? ""), is_error: message.isError ?? false, content: denormalizeAnthropicToolResultParts(message.parts) }] as any }];
     case "function":
-      return [{ role: "user", content: [{ type: "tool_result", tool_use_id: message.name ?? "function", is_error: message.isError ?? false, content: collapseText(requireTextOnly(message.parts, "Anthropic function result")) }] as any }];
+      // Legacy Chat function calls are normalized with id "<name>:legacy", so the result must point at the same id.
+      return [{ role: "user", content: [{ type: "tool_result", tool_use_id: sanitizeAnthropicToolId(`${message.name ?? "function"}:legacy`), is_error: message.isError ?? false, content: collapseText(requireTextOnly(message.parts, "Anthropic function result")) }] as any }];
     default:
       fail(`Anthropic Messages does not support role "${message.role}" in message array`);
   }
@@ -966,8 +933,6 @@ function denormalizeAnthropicUserParts(parts: NormalizedMessage["parts"]): any {
       const dataUrl = parseDataUrl(part.url);
       return dataUrl ? { type: "image", source: { type: "base64", media_type: dataUrl.mediaType, data: dataUrl.data }, cache_control: part.cacheControl } : { type: "image", source: { type: "url", url: part.url }, cache_control: part.cacheControl };
     }
-    if (part.type === "document_url") return { type: "document", title: part.title ?? undefined, source: { type: "url", url: part.url }, cache_control: part.cacheControl };
-    if (part.type === "document_base64") return { type: "document", title: part.title ?? undefined, source: { type: "base64", media_type: part.mediaType ?? "application/pdf", data: part.data }, cache_control: part.cacheControl };
     fail(`Anthropic does not support user part "${part.type}"`);
   });
 }
@@ -984,7 +949,7 @@ function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserve
   });
   for (const toolCall of message.toolCalls ?? []) {
     if (toolCall.kind !== "function") fail("Anthropic assistant output only supports function-style tool calls");
-    blocks.push({ type: "tool_use", id: toolCall.id, caller: { type: "direct" }, name: toolCall.name, input: parseJson(toolCall.payload, `Anthropic tool call "${toolCall.name}"`) });
+    blocks.push({ type: "tool_use", id: sanitizeAnthropicToolId(toolCall.id), caller: { type: "direct" }, name: toolCall.name, input: parseToolArguments(toolCall.payload, `Anthropic tool call "${toolCall.name}"`) });
   }
   return blocks;
 }
@@ -997,8 +962,6 @@ function denormalizeAnthropicToolResultParts(parts: NormalizedMessage["parts"]):
       const dataUrl = parseDataUrl(part.url);
       return dataUrl ? { type: "image", source: { type: "base64", media_type: dataUrl.mediaType, data: dataUrl.data } } : { type: "image", source: { type: "url", url: part.url } };
     }
-    if (part.type === "document_url") return { type: "document", title: part.title ?? undefined, source: { type: "url", url: part.url } };
-    if (part.type === "document_base64") return { type: "document", title: part.title ?? undefined, source: { type: "base64", media_type: part.mediaType ?? "application/pdf", data: part.data } };
     fail(`Anthropic tool_result does not support part "${part.type}"`);
   });
 }
@@ -1155,43 +1118,66 @@ function getAnthropicToolResultId(message: NormalizedMessage): string | undefine
   return undefined;
 }
 
+/** Anthropic metadata only accepts a string `user_id`; other OpenAI metadata tags are dropped. */
 function denormalizeAnthropicMetadata(metadata: NormalizedRequest["metadata"]) {
-  if (!metadata) return undefined;
-  const keys = Object.keys(metadata).filter((key) => metadata[key] !== undefined && metadata[key] !== null);
-  if (keys.length === 0) return undefined;
-  if (keys.length === 1 && keys[0] === "user_id" && typeof metadata.user_id === "string") return { user_id: metadata.user_id };
-  fail("Anthropic metadata only supports user_id");
+  return typeof metadata?.user_id === "string" && metadata.user_id ? { user_id: metadata.user_id } : undefined;
+}
+
+/** Map an OpenAI-style effort onto Anthropic: "none" means thinking off, "minimal" is below Anthropic's lowest level. */
+function toAnthropicEffort(reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined): string | null {
+  const effort = reasoningEffort ?? normalizeReasoningEffortFromBudget(thinkingBudgetTokens);
+  if (effort === "none") return null;
+  if (effort === "minimal") return "low";
+  return effort;
 }
 
 function denormalizeAnthropicOutputConfig(responseFormat: NormalizedRequest["responseFormat"], reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined) {
-  const effort = reasoningEffort ?? normalizeReasoningEffortFromBudget(thinkingBudgetTokens);
+  const effort = toAnthropicEffort(reasoningEffort, thinkingBudgetTokens);
   const format = responseFormat?.type === "json_schema" ? { type: "json_schema", schema: responseFormat.schema ?? {} } : undefined;
   if (!format && !effort) return undefined;
   return { ...(format ? { format } : {}), ...(effort ? { effort } : {}) };
 }
 
 function denormalizeAnthropicThinking(reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined) {
+  if (reasoningEffort === "none") return { type: "disabled" as const };
   if (!reasoningEffort && thinkingBudgetTokens == null) return undefined;
   return { type: "adaptive" as const };
 }
 
+// OpenAI Chat/Responses accept auto | default | flex | scale | priority; Anthropic accepts auto | standard_only.
+// Codex clients also send "fast" as an alias of priority. Values with no counterpart are omitted (upstream default).
+const OPENAI_SERVICE_TIERS = new Map<string, "auto" | "default" | "flex" | "scale" | "priority">([
+  ["auto", "auto"],
+  ["default", "default"],
+  ["flex", "flex"],
+  ["scale", "scale"],
+  ["priority", "priority"],
+  ["fast", "priority"],
+  ["standard_only", "default"],
+]);
+
+// Anthropic "auto" uses Priority Tier capacity when the org has it, so priority-like tiers map to auto;
+// "standard_only" never does, so default/flex map there.
+const ANTHROPIC_SERVICE_TIERS = new Map<string, "auto" | "standard_only">([
+  ["auto", "auto"],
+  ["priority", "auto"],
+  ["fast", "auto"],
+  ["scale", "auto"],
+  ["default", "standard_only"],
+  ["flex", "standard_only"],
+  ["standard_only", "standard_only"],
+]);
+
 function normalizeOpenAIServiceTier(tier: string | null | undefined): OpenAIChatRequest["service_tier"] | undefined {
-  if (!tier) return undefined;
-  if (["auto", "default", "flex", "scale", "priority"].includes(tier)) return tier as OpenAIChatRequest["service_tier"];
-  fail(`OpenAI Chat does not support service tier "${tier}"`);
+  return tier ? OPENAI_SERVICE_TIERS.get(tier.toLowerCase()) : undefined;
 }
 
 function normalizeOpenAIResponsesServiceTier(tier: string | null | undefined): OpenAIResponsesRequest["service_tier"] | undefined {
-  if (!tier) return undefined;
-  if (["auto", "default", "flex", "scale", "priority"].includes(tier)) return tier as OpenAIResponsesRequest["service_tier"];
-  fail(`OpenAI Responses does not support service tier "${tier}"`);
+  return tier ? OPENAI_SERVICE_TIERS.get(tier.toLowerCase()) : undefined;
 }
 
 function normalizeAnthropicServiceTier(tier: string | null | undefined): MessageCreateParamsBase["service_tier"] | undefined {
-  if (!tier) return undefined;
-  if (tier === "auto") return "auto";
-  if (tier === "default" || tier === "standard_only") return "standard_only";
-  fail(`Anthropic does not support service tier "${tier}"`);
+  return tier ? ANTHROPIC_SERVICE_TIERS.get(tier.toLowerCase()) : undefined;
 }
 
 function denormalizeOpenAIChatResponseFormat(format: NormalizedRequest["responseFormat"]): OpenAIChatRequest["response_format"] {

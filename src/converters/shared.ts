@@ -23,9 +23,7 @@ export type NormalizedPart =
   | { type: "thinking"; thinking: string; signature?: string }
   | { type: "redacted_thinking"; data: string }
   | { type: "image_url"; url: string; detail?: "auto" | "low" | "high"; cacheControl?: { type: "ephemeral" } }
-  | { type: "input_audio"; data: string; format: "mp3" | "wav" }
-  | { type: "document_url"; url: string; title?: string | null; cacheControl?: { type: "ephemeral" } }
-  | { type: "document_base64"; data: string; mediaType?: string; title?: string | null; cacheControl?: { type: "ephemeral" } };
+  | { type: "input_audio"; data: string; format: "mp3" | "wav" };
 
 export type NormalizedTool =
   | {
@@ -113,6 +111,21 @@ export function fail(message: string): never {
   throw new Error(message);
 }
 
+/** Request content the converters deliberately do not translate; reported to the client as 400 instead of an upstream failure. */
+export class UnsupportedContentError extends Error {
+  readonly status = 400;
+}
+
+/** File content is only forwarded unchanged to a model that uses the same protocol as the request. */
+export function rejectFileContent(kind: string): never {
+  throw new UnsupportedContentError(`${kind} is not converted between protocols; send it to a model that uses the same protocol as the request`);
+}
+
+/** Anthropic tool_use ids must match ^[a-zA-Z0-9_-]+$; replace anything else (e.g. ":" in "name:legacy") with "_". */
+export function sanitizeAnthropicToolId(id: string): string {
+  return id.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
 export function text(textValue: string): NormalizedPart {
   return { type: "text", text: textValue };
 }
@@ -148,6 +161,12 @@ export function parseJson(textValue: string, context: string): unknown {
   } catch {
     fail(`${context} contains invalid JSON`);
   }
+}
+
+/** Parse tool-call arguments; providers often send "" for tools without parameters, which means `{}`. */
+export function parseToolArguments(textValue: string | null | undefined, context: string): unknown {
+  if (textValue == null || textValue.trim() === "") return {};
+  return parseJson(textValue, context);
 }
 
 export function stringifyJson(value: unknown): string {

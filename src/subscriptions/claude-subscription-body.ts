@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { parseClaudeMetadataIdentity, resolveSessionId } from "../core/session-id.js";
 
 export const CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS = 128000;
 
@@ -15,53 +15,15 @@ export interface ClaudeSubscriptionIdentityOptions {
   sessionId?: string;
 }
 
-function metadataIdentity(body: unknown): Record<string, unknown> | undefined {
-  if (!hasClaudeMetadataUserId(body) || !isRecord(body) || !isRecord(body.metadata)) return undefined;
-  try {
-    const identity: unknown = JSON.parse(body.metadata.user_id as string);
-    return isRecord(identity) ? identity : undefined;
-  } catch { return undefined; }
-}
-
 export function resolveClaudeSubscriptionSessionId(body: unknown, options: ClaudeSubscriptionIdentityOptions): string {
-  const explicit = options.sessionId?.trim() || options.clientHeaders?.get("x-claude-code-session-id")?.trim();
-  if (explicit) return explicit;
-  const identity = metadataIdentity(body);
-  if (typeof identity?.session_id === "string" && identity.session_id.trim()) return identity.session_id.trim();
-  if (isRecord(body) && isRecord(body.metadata) && typeof body.metadata.user_id === "string") {
-    const legacy = /^user_[a-f0-9]{64}_account_[a-f0-9-]*_session_([a-f0-9-]{36})$/i.exec(body.metadata.user_id);
-    if (legacy) return legacy[1]!;
-  }
-  let source = "fallback";
-  let value = "";
-  for (const name of ["session_id", "thread_id", "conversation_id"]) {
-    const hint = options.clientHeaders?.get(name)?.trim();
-    if (hint) { source = name; value = hint; break; }
-  }
-  if (!value && options.promptCacheKey?.trim()) {
-    source = "prompt_cache_key";
-    value = options.promptCacheKey.trim();
-  }
-  if (!value) {
-    const firstUser = isRecord(body) && Array.isArray(body.messages)
-      ? body.messages.find((message) => isRecord(message) && message.role === "user") : undefined;
-    const content = isRecord(firstUser) ? firstUser.content : undefined;
-    const text = typeof content === "string" ? content : Array.isArray(content)
-      ? content.filter((block) => isRecord(block) && block.type === "text" && typeof block.text === "string").map((block) => block.text).join("\n") : "";
-    value = JSON.stringify([options.clientIp ?? "", options.clientHeaders?.get("user-agent") ?? "", text]);
-  }
-  const hash = createHash("sha256").update(JSON.stringify([options.provider, source, value])).digest();
-  hash[6] = (hash[6]! & 0x0f) | 0x40;
-  hash[8] = (hash[8]! & 0x3f) | 0x80;
-  const hex = hash.subarray(0, 16).toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  return resolveSessionId(body, { ...options, namespace: options.provider });
 }
 
 export function addClaudeSubscriptionUserId(body: unknown, options: ClaudeSubscriptionIdentityOptions): unknown {
   if (!isRecord(body)) return body;
   const sessionId = resolveClaudeSubscriptionSessionId(body, options);
   if (hasClaudeMetadataUserId(body)) {
-    const identity = metadataIdentity(body);
+    const identity = parseClaudeMetadataIdentity(body);
     if (identity) {
       if (identity.session_id === sessionId) return body;
       return { ...body, metadata: { ...(body.metadata as Record<string, unknown>), user_id: JSON.stringify({ ...identity, session_id: sessionId }) } };

@@ -23,7 +23,8 @@ import {
   responsesResponseToAnthropicMessage,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
-import { denormalizeToAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { UnsupportedContentError } from "../src/converters/shared.js";
+import { denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
 import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
@@ -31,14 +32,14 @@ import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
 import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/pages/admin-config-form.js";
 import { buildModelTestRequest, extractModelTestReply } from "../src/proxy/model-test.js";
 import { buildSubscriptionModelsRequest } from "../src/subscriptions/openai-subscription.js";
-import { fetchLatestCodexVersion, parseCodexReleaseVersion } from "../src/subscriptions/codex-version.js";
+import { createCodexVersionSource, fetchLatestCodexVersion, parseCodexReleaseVersion } from "../src/subscriptions/codex-version.js";
 import { buildClaudeModelsHeaders } from "../src/subscriptions/claude-subscription.js";
 import { CODEX_CLI_ORIGINATOR, CODEX_CLI_USER_AGENT, CODEX_CLI_VERSION } from "../src/subscriptions/subscription-client-compat.js";
 import { extractUpstreamModelIds, fetchUpstreamModels } from "../src/proxy/upstream-models.js";
 import { ConfigManager } from "../src/core/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/proxy/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/core/http-log.js";
-import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, forwardRequest, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy/proxy.js";
+import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, applyCodexSubscriptionIdentityHeaders, forwardRequest, mergeHeaders, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy/proxy.js";
 import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "../src/proxy/response-cache.js";
 import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/core/response-compression.js";
 import { renderRecordPage } from "../src/pages/record-page.js";
@@ -64,7 +65,7 @@ import {
   useMemoryRecordStore,
   useSqliteRecordStore,
 } from "../src/storage/record.js";
-import { runWithRequestId, setClientRequestHeaders } from "../src/core/request-context.js";
+import { runWithRequestId, setClientIp, setClientRequestHeaders } from "../src/core/request-context.js";
 import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/storage/status.js";
 import { shouldIgnoreStreamReadError } from "../src/core/stream-errors.js";
 import { extractErrorCauses, formatErrorWithCauses } from "../src/core/error-details.js";
@@ -712,17 +713,48 @@ run("responses image tool output becomes anthropic image tool_result block", () 
   assert.equal(toolResult.content[0].source?.url, "https://example.com/tool.png");
 });
 
-run("responses file tool output becomes anthropic document tool_result block", () => {
-  const result = responsesRequestToAnthropicMessageRequest({
-    model: "gpt-4o-mini",
-    input: [{ type: "function_call_output", call_id: "call_file", output: [{ type: "input_file", file_url: "https://example.com/tool.pdf", filename: "tool.pdf" }] }],
-  } as any);
+run("file content is rejected with a 400 error when converting between protocols", () => {
+  const rejects = (convert: () => unknown, kind: RegExp) => assert.throws(convert, (error: any) => {
+    assert.ok(error instanceof UnsupportedContentError);
+    assert.equal(error.status, 400);
+    assert.match(error.message, kind);
+    return true;
+  });
+  const pdf = { type: "document", title: "report.pdf", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0xLjQK" } };
+  rejects(() => chatParamsToAnthropicMessageRequest({
+    model: "m", messages: [{ role: "user", content: [{ type: "file", file: { filename: "a.pdf", file_data: "data:application/pdf;base64,JVBERi0xLjQK" } }] }],
+  } as any), /Chat "file" content/);
+  rejects(() => responsesRequestToAnthropicMessageRequest({
+    model: "m", input: [{ role: "user", content: [{ type: "input_file", file_url: "https://example.com/a.pdf" }] }],
+  } as any), /Responses "input_file" content/);
+  rejects(() => responsesRequestToChatParams({
+    model: "m", input: [{ type: "function_call_output", call_id: "c1", output: [{ type: "input_file", file_id: "file-1" }] }],
+  } as any), /Responses "input_file" tool output/);
+  rejects(() => anthropicMessageRequestToChatParams({ model: "m", max_tokens: 10, messages: [{ role: "user", content: [pdf] }] } as any), /Anthropic "document" content with a "base64" source/);
+  rejects(() => anthropicMessageRequestToResponsesRequest({
+    model: "m", max_tokens: 10, messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: [{ ...pdf, source: { type: "url", url: "https://example.com/a.pdf" } }] }] }],
+  } as any), /Anthropic "document" tool_result content with a "url" source/);
+  rejects(() => anthropicMessageRequestToChatParams({
+    model: "m", max_tokens: 10, messages: [{ role: "user", content: [{ type: "document", source: { type: "file", file_id: "file_1" } }] }],
+  } as any), /"file" source/);
+});
 
-  const toolResult = (result.messages[0].content as Array<{ type: string; content: Array<{ type: string; title?: string; source?: { url?: string } }> }>)[0];
-  assert.equal(toolResult.type, "tool_result");
-  assert.equal(toolResult.content[0].type, "document");
-  assert.equal(toolResult.content[0].title, "tool.pdf");
-  assert.equal(toolResult.content[0].source?.url, "https://example.com/tool.pdf");
+run("plain-text anthropic documents and fetched web pages still convert to text", () => {
+  const chat = anthropicMessageRequestToChatParams({
+    model: "m", max_tokens: 10,
+    messages: [{ role: "user", content: [{ type: "document", source: { type: "text", media_type: "text/plain", data: "notes body" } }] }],
+  } as any) as any;
+  assert.match(String(chat.messages[0].content), /notes body/);
+
+  const fetched = (document: unknown) => (anthropicMessageRequestToChatParams({
+    model: "m", max_tokens: 10,
+    messages: [
+      { role: "assistant", content: [{ type: "server_tool_use", id: "srv_1", name: "web_fetch", input: { url: "https://example.com/x" } }] },
+      { role: "user", content: [{ type: "web_fetch_tool_result", tool_use_id: "srv_1", content: { type: "web_fetch_result", url: "https://example.com/x", content: document } }] },
+    ],
+  } as any) as any).messages.find((message: any) => message.role === "tool").content;
+  assert.equal(fetched({ type: "document", source: { type: "text", media_type: "text/plain", data: "page text" } }), "page text");
+  assert.equal(fetched({ type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0xLjQK" } }), "https://example.com/x");
 });
 
 run("responses text image tool output becomes anthropic mixed tool_result block", () => {
@@ -1379,22 +1411,6 @@ run("object content survives anthropic to responses conversion for images", () =
   assert.equal(first.content[0].image_url, "https://example.com/a.png");
 });
 
-run("anthropic document user content degrades to chat text instead of failing", () => {
-  const chat = anthropicMessageRequestToChatParams({
-    model: "claude-sonnet-4-5",
-    max_tokens: 1024,
-    messages: [
-      {
-        role: "user",
-        content: [{ type: "document", title: "report.pdf", source: { type: "url", url: "https://example.com/report.pdf" } }],
-      },
-    ],
-  });
-
-  assert.equal(chat.messages[0].role, "user");
-  assert.match(String(chat.messages[0].content), /report\.pdf/);
-  assert.match(String(chat.messages[0].content), /https:\/\/example\.com\/report\.pdf/);
-});
 
 run("anthropic image user content stays chat multimodal array when image is enabled", () => {
   const chat = anthropicMessageRequestToChatParams({
@@ -2045,30 +2061,6 @@ run("anthropic image tool_result becomes responses image tool output", () => {
   assert.equal(output.output[0].image_url, "https://example.com/from-anthropic.png");
 });
 
-run("anthropic document tool_result becomes responses file tool output", () => {
-  const responses = anthropicMessageRequestToResponsesRequest({
-    model: "claude-sonnet-4-5",
-    max_tokens: 1024,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "tool_result",
-            tool_use_id: "file_resp",
-            content: [{ type: "document", title: "report.pdf", source: { type: "url", url: "https://example.com/report.pdf" } }],
-          },
-        ],
-      },
-    ],
-  });
-
-  const output = (responses.input as Array<{ type: string; output: Array<{ type: string; file_url?: string; filename?: string }> }>)[0];
-  assert.equal(output.type, "function_call_output");
-  assert.equal(output.output[0].type, "input_file");
-  assert.equal(output.output[0].file_url, "https://example.com/report.pdf");
-  assert.equal(output.output[0].filename, "report.pdf");
-});
 
 run("chat parallel_tool_calls false survives anthropic conversion without explicit tool_choice", () => {
   const anthropic = chatParamsToAnthropicMessageRequest({
@@ -2648,6 +2640,81 @@ run("anthropic five common effort levels are preserved in both OpenAI protocols"
     assert.deepEqual(chat.reasoning, { effort });
     assert.deepEqual(anthropicMessageRequestToResponsesRequest(request as any).reasoning, { effort });
   }
+});
+
+run("chat none effort disables anthropic thinking and minimal maps to low", () => {
+  const convert = (reasoning_effort: string) => chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini", reasoning_effort, messages: [{ role: "user", content: "hi" }],
+  } as any) as any;
+  const none = convert("none");
+  assert.deepEqual(none.thinking, { type: "disabled" });
+  assert.equal(none.output_config, undefined);
+  const minimal = convert("minimal");
+  assert.deepEqual(minimal.thinking, { type: "adaptive" });
+  assert.deepEqual(minimal.output_config, { effort: "low" });
+});
+
+run("anthropic disabled thinking maps to none effort in both OpenAI protocols", () => {
+  const request = { model: "test-model", max_tokens: 100, messages: [{ role: "user", content: "hi" }], thinking: { type: "disabled" } };
+  const chat = anthropicMessageRequestToChatParams(request as any) as any;
+  assert.equal(chat.reasoning_effort, "none");
+  assert.deepEqual(chat.reasoning, { effort: "none" });
+  assert.deepEqual(anthropicMessageRequestToResponsesRequest(request as any).reasoning, { effort: "none" });
+  const noThinking = anthropicMessageRequestToChatParams({ ...request, thinking: undefined } as any) as any;
+  assert.equal(noThinking.reasoning_effort, undefined);
+});
+
+run("service tiers map between OpenAI and Anthropic without failing", () => {
+  const toAnthropic = (service_tier: string) => (chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini", service_tier, messages: [{ role: "user", content: "hi" }],
+  } as any) as any).service_tier;
+  assert.equal(toAnthropic("auto"), "auto");
+  assert.equal(toAnthropic("default"), "standard_only");
+  assert.equal(toAnthropic("flex"), "standard_only");
+  assert.equal(toAnthropic("scale"), "auto");
+  assert.equal(toAnthropic("priority"), "auto");
+  assert.equal(toAnthropic("fast"), "auto");
+  assert.equal(toAnthropic("ultrafast"), undefined);
+  assert.equal(toAnthropic("constructor"), undefined);
+
+  const fromAnthropic = (service_tier: string) => {
+    const request = { model: "test-model", max_tokens: 100, service_tier, messages: [{ role: "user", content: "hi" }] };
+    return [(anthropicMessageRequestToChatParams(request as any) as any).service_tier, (anthropicMessageRequestToResponsesRequest(request as any) as any).service_tier];
+  };
+  assert.deepEqual(fromAnthropic("auto"), ["auto", "auto"]);
+  assert.deepEqual(fromAnthropic("standard_only"), ["default", "default"]);
+  assert.equal((chatParamsToResponsesRequest({ model: "gpt-5", service_tier: "fast", messages: [{ role: "user", content: "hi" }] } as any) as any).service_tier, "priority");
+});
+
+run("anthropic metadata keeps user_id and drops other OpenAI metadata keys", () => {
+  const convert = (metadata: Record<string, unknown>) => (chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini", metadata, messages: [{ role: "user", content: "hi" }],
+  } as any) as any).metadata;
+  assert.deepEqual(convert({ user_id: "u1", app: "demo" }), { user_id: "u1" });
+  assert.equal(convert({ app: "demo" }), undefined);
+});
+
+run("empty tool-call arguments become an empty anthropic input object", () => {
+  const request = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "user", content: "time?" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_now", type: "function", function: { name: "now", arguments: "" } }] },
+      { role: "tool", tool_call_id: "call_now", content: "12:00" },
+    ],
+  } as any) as any;
+  const toolUse = request.messages.flatMap((message: any) => Array.isArray(message.content) ? message.content : []).find((block: any) => block.type === "tool_use");
+  assert.deepEqual(toolUse.input, {});
+
+  const response = chatCompletionToAnthropicMessage({
+    id: "chatcmpl_empty", object: "chat.completion", created: 1, model: "m",
+    choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: "call_now", type: "function", function: { name: "now", arguments: "  " } }] } }],
+  } as any) as any;
+  assert.deepEqual(response.content.find((block: any) => block.type === "tool_use").input, {});
+  assert.throws(() => chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "assistant", content: null, tool_calls: [{ id: "call_bad", type: "function", function: { name: "now", arguments: "{bad" } }] }],
+  } as any), /invalid JSON/);
 });
 
 run("chat medium reasoning maps to anthropic adaptive thinking", () => {
@@ -4159,6 +4226,73 @@ run("OpenAI conversion retains explicit prompt cache keys for Claude subscriptio
   assert.equal(requests[1].promptCacheKey, "conversation-key");
 });
 
+run("anthropic prompt cache key uses the metadata session id when present", () => {
+  const normalized = normalizeAnthropicRequest({
+    model: "claude", max_tokens: 10,
+    metadata: { user_id: JSON.stringify({ device_id: "d", session_id: "session-123" }) },
+    messages: [{ role: "user", content: "hello" }],
+  } as any);
+  assert.equal(normalized.promptCacheKey, "session-123");
+});
+
+run("anthropic prompt cache key falls back to a per-conversation hash instead of the date", () => {
+  const key = (messages: unknown[], ip = "127.0.0.1") => runWithRequestId("req_cache_key_" + ip, () => {
+    setClientRequestHeaders(new Headers({ "user-agent": "client" }));
+    setClientIp(ip);
+    return normalizeAnthropicRequest({ model: "claude", max_tokens: 10, messages } as any).promptCacheKey;
+  });
+  const first = { role: "user", content: "hello" };
+  const grown = key([first, { role: "assistant", content: "answer" }, { role: "user", content: "next" }]);
+  assert.match(key([first]), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.equal(key([first]), grown);
+  assert.notEqual(key([first]), key([{ role: "user", content: "new chat" }]));
+  assert.notEqual(key([first]), key([first], "127.0.0.2"));
+  assert.equal(
+    runWithRequestId("req_cache_key_header", () => {
+      setClientRequestHeaders(new Headers({ "x-claude-code-session-id": "header-session" }));
+      return normalizeAnthropicRequest({ model: "claude", max_tokens: 10, messages: [first] } as any).promptCacheKey;
+    }),
+    "header-session",
+  );
+});
+
+run("tool ids with characters Anthropic rejects are sanitized in requests", () => {
+  const result = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "user", content: "read it" },
+      { role: "assistant", content: null, tool_calls: [{ id: "functions.read:0", type: "function", function: { name: "read", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "functions.read:0", content: "done" },
+      { role: "assistant", content: null, function_call: { name: "get_weather", arguments: "{}" } },
+      { role: "function", name: "get_weather", content: "Sunny" },
+    ],
+  } as any) as any;
+  const blocks = result.messages.flatMap((message: any) => Array.isArray(message.content) ? message.content : []);
+  const toolUseIds = blocks.filter((block: any) => block.type === "tool_use").map((block: any) => block.id);
+  const toolResultIds = blocks.filter((block: any) => block.type === "tool_result").map((block: any) => block.tool_use_id);
+  assert.deepEqual(toolUseIds, ["functions_read_0", "get_weather_legacy"]);
+  assert.deepEqual(toolResultIds, ["functions_read_0", "get_weather_legacy"]);
+});
+
+run("tool ids with characters Anthropic rejects are sanitized in responses and streams", () => {
+  const message = chatCompletionToAnthropicMessage({
+    id: "chatcmpl_ids", object: "chat.completion", created: 1, model: "kimi",
+    choices: [{ index: 0, finish_reason: "tool_calls", message: { role: "assistant", content: null, tool_calls: [{ id: "functions.read:0", type: "function", function: { name: "read", arguments: "{}" } }] } }],
+  } as any) as any;
+  assert.equal(message.content.find((block: any) => block.type === "tool_use").id, "functions_read_0");
+
+  const converter = createSSEConverter("openai-chat", "anthropic");
+  const chunks = [
+    ...converter.push([
+      { id: "chatcmpl_ids", object: "chat.completion.chunk", created: 1, model: "kimi", choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "functions.read:0", type: "function", function: { name: "read", arguments: "{}" } }] }, finish_reason: null }] },
+      { id: "chatcmpl_ids", object: "chat.completion.chunk", created: 1, model: "kimi", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n"),
+    ...converter.flush(),
+  ];
+  const start = parseSSEObjects(chunks).find((event) => event.data.type === "content_block_start" && event.data.content_block?.type === "tool_use");
+  assert.equal(start?.data.content_block.id, "functions_read_0");
+});
+
 run("claude subscription fills missing defaults and removes tool_choice without tools", () => {
   const original = { model: "claude-sonnet-4-6", messages: [], tool_choice: { type: "auto" } };
   assert.deepEqual(sanitizeClaudeSubscriptionBody(original), {
@@ -5361,6 +5495,32 @@ await runAsync("record store compacts generated images in responses and image_ge
   await stopRecording();
 });
 
+run("mergeHeaders replaces names case-insensitively instead of duplicating them", () => {
+  assert.deepEqual(mergeHeaders({ "user-agent": "client/1", accept: "*/*" }, undefined, { "User-Agent": "configured/1" }), { accept: "*/*", "User-Agent": "configured/1" });
+});
+
+await runAsync("upstream requests carry exactly one User-Agent whatever case each header source uses", async () => {
+  const userAgents: string[][] = [];
+  await withHTTPServer((req, res) => {
+    userAgents.push(req.rawHeaders.filter((_, index) => index % 2 === 1 && req.rawHeaders[index - 1].toLowerCase() === "user-agent"));
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(req.url?.includes("/images/") ? JSON.stringify({ created: 1, data: [] }) : JSON.stringify({ id: "chatcmpl_1", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+    });
+  }, async (baseURL) => {
+    const base = { name: "alpha", base_url: baseURL, api_key: "test-key", model: "upstream-alpha" };
+    // Configured headers override the client's User-Agent even when their case differs.
+    await passthroughRequest({ ...base, provider: "openai-chat", headers: { "user-agent": "configured/1" } },
+      { model: "alpha", messages: [{ role: "user", content: "hi" }] }, { userAgent: "client/1" });
+    // Raw passthrough copies incoming headers in lowercase and then sets User-Agent on top.
+    const imageBody = JSON.stringify({ model: "alpha", prompt: "a cat" });
+    await passthroughRawRequest({ ...base, provider: "openai-image" }, new TextEncoder().encode(imageBody),
+      new Headers({ "content-type": "application/json", "user-agent": "client/1" }), { userAgent: "client/1", imageOperation: "generations" });
+  });
+  assert.deepEqual(userAgents, [["configured/1"], ["client/1"]]);
+});
+
 await runAsync("record summary keeps fallback actual model and failure status", async () => {
   await startRecording();
   const requestId = "fedcba98-7654-3210-abcd-ef1234567890";
@@ -6041,6 +6201,63 @@ run("record page stream parser keeps data-like text inside JSON payloads", () =>
   assert.match(html, /if \(line === ""\) \{\n            flushEvent\(\);/);
   assert.match(html, /currentDataLines\.push\(line\.slice\(5\)\.trimStart\(\)\)/);
   assert.match(html, /currentDataLines\[currentDataLines\.length - 1\] \+= "\\n" \+ line/);
+});
+
+run("record page stream reconstructor handles Anthropic server_tool_use events", () => {
+  const html = renderRecordPage({
+    enabled: true,
+    capturedCount: 1,
+    limit: 100,
+    sessionStartedAt: Date.UTC(2026, 3, 20, 10, 0, 0),
+    recentKeys: [],
+  });
+  const script = /<script>([\s\S]*)<\/script>/.exec(html)?.[1];
+  assert.ok(script, "record page script");
+  const sandbox: any = {
+    document: {
+      createElement: () => ({ appendChild: () => {}, addEventListener: () => {} }),
+      getElementById: () => ({ addEventListener: () => {}, appendChild: () => {}, classList: { toggle: () => {} } }),
+    },
+    window: { location: { search: "" } },
+    history: { replaceState: () => {} },
+    fetch: async () => ({ ok: true, json: async () => ({}) }),
+    setInterval: () => 0,
+    URLSearchParams,
+  };
+  vm.runInContext(script + "\n;globalThis.__reconstruct = reconstructStreamResponse;\nglobalThis.__parse = parseStreamEvents;", vm.createContext(sandbox));
+  const rawStream = [
+    'event: message_start',
+    'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-3-7-sonnet","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}',
+    '',
+    'event: content_block_start',
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_01LdVih7HhXB9cYvPoTWw7oE","name":"web_search","input":{}}}',
+    '',
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"query\\":\\"test search\\"}"}}',
+    '',
+    'event: content_block_stop',
+    'data: {"type":"content_block_stop","index":0}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":20}}',
+    '',
+    'event: message_stop',
+    'data: {"type":"message_stop"}',
+  ].join("\n");
+
+  const events = sandbox.__parse(rawStream);
+  assert.ok(events && events.length > 0);
+  const reconstructed = JSON.parse(JSON.stringify(sandbox.__reconstruct(events)));
+  assert.ok(reconstructed, "reconstructed response");
+  assert.equal(reconstructed.id, "msg_1");
+  assert.equal(reconstructed.stop_reason, "tool_use");
+  assert.equal(reconstructed.content.length, 1);
+  assert.deepEqual(reconstructed.content[0], {
+    type: "server_tool_use",
+    id: "srvtoolu_01LdVih7HhXB9cYvPoTWw7oE",
+    name: "web_search",
+    input: { query: "test search" },
+  });
 });
 
 run("server.ts keeps @ts-nocheck as its first line so the build stays type-check free", () => {
@@ -6754,6 +6971,21 @@ run("codex model catalog request carries the Codex CLI identity and a version at
   assert.equal("ChatGPT-Account-Id" in buildSubscriptionModelsRequest("tok").headers, false);
 });
 
+run("codex subscription identity is fixed whichever client and OS made the call", () => {
+  const expected = { originator: "codex-tui", "User-Agent": "codex-tui/0.160.0 (Mac OS 26.5.1; arm64) xterm-256color (codex-tui; 0.160.0)" };
+  const fromWindows: Record<string, string> = { originator: "codex_vscode", "user-agent": "codex_vscode/0.150.0 (Windows 10.0.26200; x86_64) vscode/1.105.0" };
+  applyCodexSubscriptionIdentityHeaders(fromWindows);
+  assert.deepEqual(fromWindows, expected);
+  const withoutClient: Record<string, string> = {};
+  applyCodexSubscriptionIdentityHeaders(withoutClient);
+  assert.deepEqual(withoutClient, expected);
+  assert.equal(CODEX_CLI_USER_AGENT, expected["User-Agent"]);
+
+  const synced: Record<string, string> = {};
+  applyCodexSubscriptionIdentityHeaders(synced, "0.170.0");
+  assert.equal(synced["User-Agent"], "codex-tui/0.170.0 (Mac OS 26.5.1; arm64) xterm-256color (codex-tui; 0.170.0)", "the version follows the synced release in both places");
+});
+
 run("claude model list request uses the Claude Code identity headers over the plain oauth fallback", () => {
   const identity: Record<string, string> = {};
   applyClaudeSubscriptionHeaders(identity);
@@ -6762,7 +6994,8 @@ run("claude model list request uses the Claude Code identity headers over the pl
   assert.equal(headers["anthropic-version"], "2023-06-01");
   assert.match(headers["anthropic-beta"], /claude-code-20250219/);
   assert.match(headers["anthropic-beta"], /oauth-2025-04-20/);
-  assert.match(headers["User-Agent"], /^claude-cli\//);
+  assert.deepEqual(Object.keys(headers).filter(name => name.toLowerCase() === "user-agent"), ["user-agent"]);
+  assert.match(headers["user-agent"], /^claude-cli\//);
   assert.equal(headers["x-app"], "cli");
   assert.equal(headers.Accept, "application/json");
 
@@ -6799,6 +7032,31 @@ await runAsync("fetchLatestCodexVersion reads the latest stable release and reje
     await assert.rejects(fetchLatestCodexVersion({ url: baseURL }), /unusable version/);
     status = 500;
     await assert.rejects(fetchLatestCodexVersion({ url: baseURL }), /500/);
+  });
+});
+
+await runAsync("codex version source serves the cached release without waiting and never reports below the built-in version", async () => {
+  const [major, minor] = CODEX_CLI_VERSION.split(".").map(Number);
+  const newer = `${major}.${minor + 10}.0`;
+  let tag = `rust-v${newer}`, status = 200, requests = 0;
+  await withHTTPServer((_req, res) => {
+    requests += 1;
+    res.statusCode = status;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ tag_name: tag }));
+  }, async (baseURL) => {
+    const source = createCodexVersionSource({ url: baseURL });
+    assert.equal(source.current(), CODEX_CLI_VERSION, "the first read does not wait for GitHub");
+    assert.equal(await source.latest(), newer, "the background sync started by current() is shared");
+    assert.equal(requests, 1);
+    assert.equal(source.current(), newer);
+    assert.equal(await source.latest(), newer);
+    assert.equal(requests, 1, "a fresh value is served from the cache");
+
+    tag = "rust-v0.150.0";
+    assert.equal(await createCodexVersionSource({ url: baseURL }).latest(), CODEX_CLI_VERSION, "an older release does not downgrade the built-in version");
+    status = 500;
+    assert.equal(await createCodexVersionSource({ url: baseURL }).latest(), CODEX_CLI_VERSION, "a failed sync falls back to the built-in version");
   });
 });
 

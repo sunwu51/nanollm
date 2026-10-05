@@ -12,8 +12,11 @@ export interface JobExecutor {
   /** `requestId` is stored on the attempt before the call so even timed-out attempts link to their request record. */
   execute(job: Job, model: ModelConfig, signal: AbortSignal, context?: { requestId: string }): Promise<ExecutionOutput>;
 }
-/** Sends a client-format request for `model` and returns the client-format response (the gateway's own /v1 routes in production). */
-export type JobRequestSender = (model: ModelConfig, request: { path: string; body: Record<string, unknown> }) => Promise<Response>;
+/**
+ * Sends a client-format request for `model` and returns the client-format response (the gateway's own /v1 routes in production).
+ * `signal` aborts the request, which also aborts the gateway's upstream call before the first byte arrives.
+ */
+export type JobRequestSender = (model: ModelConfig, request: { path: string; body: Record<string, unknown> }, signal: AbortSignal) => Promise<Response>;
 export function outputMediaType(text: string): string {
   let content = text.trim().replace(/^\x60{3}(?:html|svg|xml|json)?[^\n]*\n([\s\S]*?)\x60{3}\s*$/i, "$1").trim();
   content = content.replace(/^<\?xml[\s\S]*?\?>\s*/i, "");
@@ -33,7 +36,7 @@ export const createModelRequestExecutor = (send: JobRequestSender): JobExecutor 
   type: "model_request",
   async execute(job, model, signal) {
     const started = Date.now();
-    const response = await send(model, buildModelTestRequest(model.provider, model.name, job.request.message));
+    const response = await send(model, buildModelTestRequest(model.provider, model.name, job.request.message), signal);
     if (signal.aborted) { await response.body?.cancel(signal.reason).catch(() => {}); signal.throwIfAborted(); }
     if (!response.ok || !response.body) throw new Error(await errorMessage(response));
     const parser = new SSEParser(true), collector = createUsageCollector(model.provider), decoder = new TextDecoder();

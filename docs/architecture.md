@@ -34,7 +34,7 @@ docs/                Reference docs
 
 | Module | Files | Responsibility |
 |---|---|---|
-| `core` | `config`, `config-manager`, `auth`, `request-context`, `shutdown`, `startup-error`, `error-details`, `http-log`, `response-compression`, `stream-errors` | YAML config parsing and hot reload, bearer auth, per-request context, graceful shutdown, error formatting, response compression |
+| `core` | `config`, `config-manager`, `auth`, `request-context`, `session-id`, `shutdown`, `startup-error`, `error-details`, `http-log`, `response-compression`, `stream-errors` | YAML config parsing and hot reload, bearer auth, per-request context, session id derivation, graceful shutdown, error formatting, response compression |
 | `converters` | `shared`, `requests`, `responses`, `streams`, `index` (+ `test`, `testres`) | Normalized types and the three-way protocol conversion. See [converters.md](converters.md) |
 | `proxy` | `proxy`, `fallback`, `response-cache`, `model-test`, `upstream-models` | Upstream HTTP calls, fallback-group failure tracking and ordering, in-memory cache of Responses API output items (resolves `item_reference`), model test request builder, upstream model listing |
 | `subscriptions` | `openai-subscription`, `claude-subscription`, `claude-subscription-body`, `claude-billing`, `codex-version`, `subscription-client-compat`, `oauth-transport` | OAuth credential storage/refresh, client identity constants, Claude body transform, Rust helper transport |
@@ -50,7 +50,7 @@ jobs ──► proxy, storage, core, converters
 proxy ──► subscriptions, converters, storage, core
 subscriptions ──► core, proxy/upstream-models
 storage ──► core, converters/shared
-converters ──► core/request-context
+converters ──► core/request-context, core/session-id
 core ──► (nothing)
 ```
 
