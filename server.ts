@@ -234,7 +234,7 @@ app.use("*", async (c, next) => {
 
 type Normalizer = (body: unknown) => NormalizedRequest;
 type Denormalizer = (normalized: NormalizedResponse) => unknown;
-type UpstreamOptions = { userAgent?: string; attemptIndex?: number; modelName?: string };
+type UpstreamOptions = { userAgent?: string; attemptIndex?: number; modelName?: string; signal?: AbortSignal };
 const fallbackFailureTracker = new FallbackFailureTracker();
 const statusStore: StatusStoreLike = sqliteStorage ? new SqliteStatusStore(sqliteStorage.client) : new StatusStore();
 const usageStore: UsageStoreLike = sqliteStorage ? new SqliteUsageStore(sqliteStorage.client) : new UsageStore();
@@ -246,7 +246,7 @@ const jobModelCatalog = new JobModelCatalog(() => configManager.getActiveSnapsho
 // status/usage exactly like client requests. The job's catalog-resolved model is pinned to the
 // request id for getCandidateModels, so the call uses the connection snapshotted when the run started.
 const jobRequestModels = new Map<string, ModelConfig>();
-const jobRequestExecutor = createModelRequestExecutor(async (model, request) => {
+const jobRequestExecutor = createModelRequestExecutor(async (model, request, signal) => {
   const config = configManager.getActiveSnapshot().effectiveConfig;
   const requestId = getRequestId() ?? createRequestId();
   const headers = new Headers({ "content-type": "application/json" });
@@ -254,7 +254,7 @@ const jobRequestExecutor = createModelRequestExecutor(async (model, request) => 
   if (config.auth?.token) headers.set("authorization", `Bearer ${config.auth.token}`);
   jobRequestModels.set(requestId, model);
   try {
-    return await app.fetch(new Request(`http://127.0.0.1:${config.port}${request.path}`, { method: "POST", headers, body: JSON.stringify(request.body) }));
+    return await app.fetch(new Request(`http://127.0.0.1:${config.port}${request.path}`, { method: "POST", headers, body: JSON.stringify(request.body), signal }));
   } finally {
     jobRequestModels.delete(requestId);
   }
@@ -439,6 +439,19 @@ const HOP_BY_HOP_HEADERS = new Set([
   "content-length",
   "content-encoding",
 ]);
+
+/**
+ * The client disconnected, so the upstream call was aborted through its request signal.
+ * Nobody reads this response; it only records the outcome without fallback or failure accounting.
+ */
+function clientClosedResponse(path: string): Response {
+  console.warn(withRequestId(`[CLIENT CLOSED] path=${path} upstream request aborted`));
+  setRecordedRequestError({ message: "Client closed the connection" });
+  const response = new Response(null, { status: 499 });
+  setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
+  finalizeRecordedRequest({});
+  return response;
+}
 
 function tryParseJSON(text: string): unknown {
   try {
@@ -689,7 +702,8 @@ function createRoute(incomingFormat: StreamFormat) {
     const snapshot = configManager.getActiveSnapshot();
     const config = snapshot.effectiveConfig;
     const userAgent = c.req.header("user-agent");
-    const upstreamOptions = { userAgent };
+    const clientSignal = c.req.raw.signal;
+    const upstreamOptions = { userAgent, signal: clientSignal };
     const rawBody = await c.req.json();
     const modelName = extractModel(rawBody);
     const stream = isStreamRequest(rawBody);
@@ -750,6 +764,10 @@ function createRoute(incomingFormat: StreamFormat) {
 
           if (result.kind === "stream") {
             const { body, upstreamFormat, timing } = result;
+            if (clientSignal.aborted) {
+              await body.cancel(clientSignal.reason).catch(() => {});
+              return clientClosedResponse(c.req.path);
+            }
 
             const responseHeaders: Record<string, string> = {
               "Content-Type": "text/event-stream",
@@ -775,6 +793,7 @@ function createRoute(incomingFormat: StreamFormat) {
               timing,
               candidateIndex + 1,
               rawBody.store !== false,
+              clientSignal,
             );
 
             const response = new Response(readable, { headers: responseHeaders });
@@ -792,6 +811,7 @@ function createRoute(incomingFormat: StreamFormat) {
           finalizeRecordedRequest({});
           return response;
         } catch (error) {
+          if (clientSignal.aborted) return clientClosedResponse(c.req.path);
           const err = error as Error & { status?: number; upstream?: string; cause?: unknown };
           // Content the converter refuses (e.g. files across protocols) is the request's fault, not the model's:
           // don't demote the model in its fallback group, but still let a same-protocol candidate try.
@@ -856,7 +876,7 @@ function createAlphaSearchRoute() {
       const started = Date.now();
       recordModelAttempt(modelConfig.name, started);
       try {
-        const result = await passthroughAlphaSearchRequest(modelConfig, rawBody, { userAgent: c.req.header("user-agent"), attemptIndex: candidateIndex + 1, modelName: modelConfig.name });
+        const result = await passthroughAlphaSearchRequest(modelConfig, rawBody, { userAgent: c.req.header("user-agent"), signal: c.req.raw.signal, attemptIndex: candidateIndex + 1, modelName: modelConfig.name });
         if (result.status >= 400) {
           const error = Object.assign(new Error(`Upstream ${result.status}: ${result.responseText}`), { status: result.status, upstream: result.responseText });
           throw error;
@@ -869,6 +889,7 @@ function createAlphaSearchRoute() {
         if (requestId) { setRecordedClientResponseMeta({ status: response.status, headers: response.headers }); setRecordedClientResponseBody({ body: result.body }); finalizeRecordedRequest({}); }
         return response;
       } catch (error) {
+        if (c.req.raw.signal.aborted) return clientClosedResponse(c.req.path);
         recordModelFailure(modelConfig.name, Date.now() - started, started);
         lastError = error;
       }
@@ -886,7 +907,8 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
     const snapshot = configManager.getActiveSnapshot();
     const config = snapshot.effectiveConfig;
     const userAgent = c.req.header("user-agent");
-    const upstreamOptions = { userAgent };
+    const clientSignal = c.req.raw.signal;
+    const upstreamOptions = { userAgent, signal: clientSignal };
     const { bytes, recordedBody } = await readImageRequestBody(c);
     const modelName = extractModel(recordedBody);
     const requestId = getRequestId();
@@ -965,6 +987,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
           finalizeRecordedRequest({});
           return response;
         } catch (error) {
+          if (clientSignal.aborted) return clientClosedResponse(c.req.path);
           const err = error as Error & { status?: number; upstream?: string; cause?: unknown };
           fallbackFailureTracker.recordFailure(modelConfig.name, requestStartedAt);
           recordModelFailure(modelConfig.name, Date.now() - requestStartedAt, requestStartedAt);
@@ -1022,6 +1045,7 @@ function buildStreamReadable(
   timing: { startedAt: number; ttfbMs: number },
   attemptIndex: number,
   storeResponseItems: boolean,
+  clientSignal?: AbortSignal,
 ): ReadableStream<Uint8Array> {
   return buildManagedStream(
     body,
@@ -1033,6 +1057,7 @@ function buildStreamReadable(
     {
       converter: upstreamFormat !== incomingFormat ? createSSEConverter(upstreamFormat, incomingFormat) : undefined,
       cacheResponseItems: shouldCacheResponseItems(incomingFormat, storeResponseItems),
+      clientSignal,
     },
   );
 }
@@ -1051,6 +1076,8 @@ function buildManagedStream(
   options: {
     converter?: ReturnType<typeof createSSEConverter>;
     cacheResponseItems: boolean;
+    /** Aborted when the client disconnects; also covers a socket already gone before the response is piped, which never cancels the stream. */
+    clientSignal?: AbortSignal;
   },
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
@@ -1104,6 +1131,25 @@ function buildManagedStream(
     });
     return true;
   }
+
+  function cancel(reason: unknown) {
+    if (cancelled || finished) return cancelPromise;
+    cancelled = true;
+    if (usageCollector.hasCompleted()) {
+      settleSuccess(usageCollector.getLatestUsage());
+      finalizeRecord();
+      console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (client closed after completion)`, cachedRequestId));
+    } else {
+      finalizeRecord();
+      console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`, cachedRequestId));
+    }
+    cancelPromise = reader.cancel(reason).catch((error) => {
+      console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`, cachedRequestId), error);
+    });
+    return cancelPromise;
+  }
+
+  options.clientSignal?.addEventListener("abort", () => void cancel(options.clientSignal!.reason), { once: true });
 
   return new ReadableStream({
     async pull(controller) {
@@ -1183,22 +1229,7 @@ function buildManagedStream(
         controller.error(error);
       }
     },
-    cancel(reason) {
-      if (cancelled || finished) return cancelPromise;
-      cancelled = true;
-      if (usageCollector.hasCompleted()) {
-        settleSuccess(usageCollector.getLatestUsage());
-        finalizeRecord();
-        console.log(withRequestId(`[HTTP STREAM END] path=${path} duration=${Date.now() - started}ms (client closed after completion)`, cachedRequestId));
-      } else {
-        finalizeRecord();
-        console.warn(withRequestId(`[HTTP STREAM CANCEL] path=${path} duration=${Date.now() - started}ms`, cachedRequestId));
-      }
-      cancelPromise = reader.cancel(reason).catch((error) => {
-        console.warn(withRequestId(`[HTTP STREAM CANCEL ERROR] path=${path} duration=${Date.now() - started}ms`, cachedRequestId), error);
-      });
-      return cancelPromise;
-    },
+    cancel,
   });
 }
 

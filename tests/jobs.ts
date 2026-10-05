@@ -242,6 +242,18 @@ test("executor sends client-format requests, parses the stream, bounds output an
   assert.ok(closed > closedBefore, "hanging stream was closed");
 });
 
+test("executor hands its abort signal to the sender so a cancel before the first byte aborts the call", async () => {
+  let received: AbortSignal | undefined;
+  const executor = createModelRequestExecutor((_model, _request, signal) => {
+    received = signal;
+    return new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+  });
+  const controller = new AbortController(), task = executor.execute(job(), model, controller.signal);
+  controller.abort(new Error("cancelled"));
+  await assert.rejects(task, /cancelled/);
+  assert.equal(received, controller.signal);
+});
+
 test("scheduler gives every attempt a request id and passes it to the executor", async t => {
   const store = fixture(t), runs = new MemoryJobRunStore(), seen: Array<string | undefined> = [];
   let calls = 0;
