@@ -25,7 +25,8 @@ import { Agent, ProxyAgent, fetch as undiciFetch } from "undici";
 import { extractErrorCauses } from "../core/error-details.js";
 import { getClientIp, getClientRequestHeaders } from "../core/request-context.js";
 import { getCachedSubscriptionCredential, ensureSubscriptionCredential, SUBSCRIPTION_URL } from "../subscriptions/openai-subscription.js";
-import { CLAUDE_CODE_DEFAULT_HEADERS, CODEX_CLI_ORIGINATOR, CODEX_CLI_USER_AGENT } from "../subscriptions/subscription-client-compat.js";
+import { getCurrentCodexVersion } from "../subscriptions/codex-version.js";
+import { CLAUDE_CODE_DEFAULT_HEADERS, CLAUDE_CODE_PLATFORM_HEADERS, CODEX_CLI_ORIGINATOR, CODEX_CLI_VERSION, buildCodexCliUserAgent } from "../subscriptions/subscription-client-compat.js";
 import { addClaudeBillingBlock } from "../subscriptions/claude-billing.js";
 import { applyClaudeSubscriptionSessionIdentity, hasClaudeMetadataUserId, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../subscriptions/claude-subscription-body.js";
 import {
@@ -520,7 +521,9 @@ function getHeader(headers: Record<string, string>, name: string): string | unde
  * Claude subscription headers use sub2api's Claude Code defaults:
  * https://github.com/Wei-Shaw/sub2api/blob/9a62841fd124d026cf3694fcf9b79e98addcdbdc/backend/internal/pkg/claude/constants.go
  * Add the OAuth and Claude Code betas alongside those defaults.
- * Client-supplied values win; only absent headers receive defaults.
+ * Client-supplied values win; only absent headers receive defaults. The exceptions: the platform headers are
+ * always pinned, so one credential reports one OS whichever machine the client runs on, and a user-agent that
+ * is not a Claude client's own (curl, SDKs, other agents) is replaced with the Claude Code CLI one.
  */
 export function applyClaudeSubscriptionHeaders(headers: Record<string, string>, stream = false): void {
   const betas = (getHeader(headers, "anthropic-beta") ?? "").split(",").map((beta) => beta.trim()).filter(Boolean);
@@ -529,35 +532,48 @@ export function applyClaudeSubscriptionHeaders(headers: Record<string, string>, 
   for (const [name, value] of Object.entries(CLAUDE_CODE_DEFAULT_HEADERS)) {
     if (!getHeader(headers, name)) setHeader(headers, name, value);
   }
+  for (const [name, value] of Object.entries(CLAUDE_CODE_PLATFORM_HEADERS)) setHeader(headers, name, value);
+  // One lowercase `user-agent` (the name keeps its case on the wire): the client's own Claude one, else the CLI default.
+  const userAgent = getHeader(headers, "user-agent")?.trim() ?? "";
+  setHeader(headers, "user-agent", /^claude/i.test(userAgent) ? userAgent : CLAUDE_CODE_DEFAULT_HEADERS["User-Agent"]);
   if (stream && !getHeader(headers, "x-stainless-helper-method")) setHeader(headers, "x-stainless-helper-method", "stream");
   if (!getHeader(headers, "x-client-request-id")) setHeader(headers, "x-client-request-id", randomUUID());
 }
 
-function applyCodexSubscriptionIdentityHeaders(headers: Record<string, string>, incoming = getClientRequestHeaders()): void {
-  const originator = incoming?.get("originator")?.trim();
-  const userAgent = incoming?.get("user-agent")?.trim();
-  // Forward an intact client identity; otherwise send one consistent Codex CLI pair.
-  setHeader(headers, "originator", originator && userAgent ? originator : CODEX_CLI_ORIGINATOR);
-  setHeader(headers, "User-Agent", originator && userAgent ? userAgent : CODEX_CLI_USER_AGENT);
+/**
+ * Always the fixed Codex identity; the client's originator and User-Agent are replaced, never forwarded.
+ * `version` follows the latest Codex release (see getCurrentCodexVersion).
+ */
+export function applyCodexSubscriptionIdentityHeaders(headers: Record<string, string>, version = CODEX_CLI_VERSION): void {
+  setHeader(headers, "originator", CODEX_CLI_ORIGINATOR);
+  setHeader(headers, "User-Agent", buildCodexCliUserAgent(version));
+}
+
+/**
+ * Merges header records left to right. Names compare case-insensitively, so a later source replaces an earlier
+ * value instead of adding a second key, which fetch would join into one comma-separated header.
+ */
+export function mergeHeaders(...sources: Array<Record<string, string> | undefined>): Record<string, string> {
+  const merged: Record<string, string> = {};
+  for (const source of sources) {
+    for (const [name, value] of Object.entries(source ?? {})) setHeader(merged, name, value);
+  }
+  return merged;
 }
 
 function getForwardHeaders(config: ModelConfig, body: unknown, options?: UpstreamRequestOptions): Record<string, string> {
-  const headers: Record<string, string> = {
-    ...getForwardedClientHeaders(config),
-    "Content-Type": "application/json",
-    ...getAuthHeaders(config),
-    ...(options?.userAgent ? { "User-Agent": options.userAgent } : {}),
-  };
+  const headers = mergeHeaders(
+    getForwardedClientHeaders(config),
+    { "Content-Type": "application/json" },
+    getAuthHeaders(config),
+    options?.userAgent ? { "User-Agent": options.userAgent } : undefined,
+  );
   if (config.claude_subscription_provider) applyClaudeSubscriptionHeaders(headers, isPlainObject(body) && body.stream === true);
   if (config.subscription_provider) {
-    applyCodexSubscriptionIdentityHeaders(headers);
+    applyCodexSubscriptionIdentityHeaders(headers, getCurrentCodexVersion(resolveProxyUrl(config)));
     applyCodexSubscriptionHeaders(headers, body);
   }
-  if (config.claude_subscription_provider) {
-    for (const [name, value] of Object.entries(config.headers ?? {})) setHeader(headers, name, value);
-    return headers;
-  }
-  return { ...headers, ...(config.headers ?? {}) };
+  return mergeHeaders(headers, config.headers);
 }
 
 export function resolveProxyUrl(config: ModelConfig): string | undefined {
@@ -910,13 +926,9 @@ function getRawForwardHeaders(
     if (skipped.has(key.toLowerCase())) continue;
     headers[key] = value;
   }
-  const forwardHeaders = {
-    ...headers,
-    ...getAuthHeaders(config),
-    ...(options?.userAgent ? { "User-Agent": options.userAgent } : {}),
-  };
-  if (config.subscription_provider) applyCodexSubscriptionIdentityHeaders(forwardHeaders, incomingHeaders);
-  return { ...forwardHeaders, ...(config.headers ?? {}) };
+  const forwardHeaders = mergeHeaders(headers, getAuthHeaders(config), options?.userAgent ? { "User-Agent": options.userAgent } : undefined);
+  if (config.subscription_provider) applyCodexSubscriptionIdentityHeaders(forwardHeaders, getCurrentCodexVersion(resolveProxyUrl(config)));
+  return mergeHeaders(forwardHeaders, config.headers);
 }
 
 export async function passthroughRawRequest(

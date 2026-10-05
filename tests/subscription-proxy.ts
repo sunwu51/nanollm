@@ -9,7 +9,7 @@ import { MockAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { oauthPost, resolveOAuthTransportPath } from "../src/subscriptions/oauth-transport.js";
 import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, ensureClaudeSubscriptionCredential, getCachedClaudeSubscriptionCredential, getOrCreateClaudeSubscriptionDeviceId, parseClaudeCallback, startClaudeLogin } from "../src/subscriptions/claude-subscription.js";
 import { parseConfigText } from "../src/core/config.js";
-import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "../src/proxy/proxy.js";
+import { applyClaudeSubscriptionHeaders, getUpstreamURL, mergeHeaders } from "../src/proxy/proxy.js";
 import { applyClaudeSubscriptionSessionIdentity } from "../src/subscriptions/claude-subscription-body.js";
 import { runWithRequestId, setClientIp, setClientRequestHeaders } from "../src/core/request-context.js";
 import { bootstrapSubscriptionProviders, configureSubscriptionStorage, startDeviceLogin, pollDeviceLogin, ensureSubscriptionCredential, getCachedSubscriptionCredential } from "../src/subscriptions/openai-subscription.js";
@@ -173,12 +173,55 @@ test("claude subscription headers merge betas and default Claude Code identity",
   applyClaudeSubscriptionHeaders(headers);
   assert.equal(headers["anthropic-beta"], "interleaved-thinking-2025-05-14,claude-code-20250219,oauth-2025-04-20");
   assert.equal(headers["x-app"], "cli");
-  assert.equal(headers["User-Agent"], "curl/8");
+  assert.equal(headers["user-agent"], "claude-cli/2.1.289 (external, cli)", "a non-Claude User-Agent is replaced");
+  assert.equal(headers["User-Agent"], undefined, "only the lowercase name is sent");
 
   const fromClaudeCode: Record<string, string> = { "anthropic-beta": "oauth-2025-04-20,claude-code-20250219", "x-app": "cli", "User-Agent": "claude-cli/9.9.9 (external, cli)" };
   applyClaudeSubscriptionHeaders(fromClaudeCode);
   assert.equal(fromClaudeCode["anthropic-beta"], "oauth-2025-04-20,claude-code-20250219");
-  assert.equal(fromClaudeCode["User-Agent"], "claude-cli/9.9.9 (external, cli)");
+  assert.deepEqual(Object.keys(fromClaudeCode).filter(name => name.toLowerCase() === "user-agent"), ["user-agent"]);
+  assert.equal(fromClaudeCode["user-agent"], "claude-cli/9.9.9 (external, cli)");
+});
+
+test("claude subscription sends one lowercase user-agent when the client's arrives under both names", () => {
+  // Mirrors getForwardHeaders: the forwarded client header is lowercase, the route adds the same value as User-Agent.
+  const claudeCode = "claude-cli/2.1.289 (external, cli)";
+  const headers = mergeHeaders({ "user-agent": claudeCode }, { "User-Agent": claudeCode });
+  applyClaudeSubscriptionHeaders(headers);
+  assert.deepEqual(Object.keys(headers).filter(name => name.toLowerCase() === "user-agent"), ["user-agent"]);
+  assert.equal(new Headers(headers).get("user-agent"), claudeCode, "fetch sees one value, not a comma-joined pair");
+});
+
+test("claude subscription keeps only a Claude client's User-Agent and defaults a missing x-app to cli", () => {
+  for (const userAgent of ["claude-cli/2.1.300 (external, sdk-ts)", "claude-code/2.1.300", "Claude-CLI/2.1.300"]) {
+    const headers: Record<string, string> = { "user-agent": userAgent, "x-app": "sdk" };
+    applyClaudeSubscriptionHeaders(headers);
+    assert.equal(headers["user-agent"], userAgent);
+    assert.equal(headers["x-app"], "sdk", "a client-supplied x-app is kept");
+  }
+  for (const userAgent of ["opencode/1.0", "Mozilla/5.0 claude-cli/2.1.300", "", "   "]) {
+    const headers: Record<string, string> = { "user-agent": userAgent };
+    applyClaudeSubscriptionHeaders(headers);
+    assert.deepEqual(Object.keys(headers).filter(name => name.toLowerCase() === "user-agent"), ["user-agent"]);
+    assert.equal(headers["user-agent"], "claude-cli/2.1.289 (external, cli)", JSON.stringify(userAgent));
+    assert.equal(headers["x-app"], "cli");
+  }
+});
+
+test("claude subscription headers pin the platform whichever OS the client reports", () => {
+  const fromMac: Record<string, string> = { "X-Stainless-Lang": "python", "x-stainless-os": "MacOS", "x-stainless-arch": "arm64", "x-stainless-runtime-version": "v24.1.0" };
+  applyClaudeSubscriptionHeaders(fromMac);
+  assert.equal(fromMac["x-stainless-lang"], "js");
+  assert.equal(fromMac["x-stainless-os"], "Windows");
+  assert.equal(fromMac["x-stainless-arch"], "x64");
+  assert.equal(fromMac["x-stainless-runtime-version"], "v24.1.0", "only the platform is pinned");
+  assert.equal(Object.keys(fromMac).filter(name => name.toLowerCase() === "x-stainless-lang").length, 1);
+
+  const defaults: Record<string, string> = {};
+  applyClaudeSubscriptionHeaders(defaults);
+  assert.equal(defaults["x-stainless-lang"], "js");
+  assert.equal(defaults["x-stainless-os"], "Windows");
+  assert.equal(defaults["x-stainless-arch"], "x64");
 });
 
 test("claude subscription uses one stable session ID in headers and metadata", () => {

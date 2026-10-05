@@ -70,6 +70,7 @@ import { renderJobsPage } from "./src/jobs/jobs-page.js";
 import { openSqliteStorage, waitForClientWrites } from "./src/storage/sqlite.js";
 import { buildAdminConfigForm, buildAdminConfigFormFromEffectiveConfig, buildYamlTextFromAdminForm, type AdminConfigForm } from "./src/pages/admin-config-form.js";
 import { extractErrorCauses, formatErrorWithCauses } from "./src/core/error-details.js";
+import { getLatestCodexVersion } from "./src/subscriptions/codex-version.js";
 import { bootstrapSubscriptionProviders, configureSubscriptionStorage, fetchSubscriptionModels, fetchSubscriptionUsage, getCachedSubscriptionCredential, pollDeviceLogin, resetSubscriptionUsage, startDeviceLogin } from "./src/subscriptions/openai-subscription.js";
 import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, fetchClaudeSubscriptionModels, fetchClaudeSubscriptionUsage, getCachedClaudeSubscriptionCredential, startClaudeLogin } from "./src/subscriptions/claude-subscription.js";
 
@@ -136,6 +137,9 @@ const configManager = new ConfigManager(configPath);
 const startupSnapshot = configManager.getActiveSnapshot();
 bootstrapSubscriptionProviders(startupSnapshot.effectiveConfig.providers.filter((provider) => provider.provider === "openai-subscription"));
 bootstrapClaudeSubscriptionProviders(startupSnapshot.effectiveConfig.providers);
+// Codex subscription headers report the latest Codex release; sync it now so the first request already does.
+const codexSubscriptionProvider = startupSnapshot.effectiveConfig.providers.find((provider) => provider.provider === "openai-subscription");
+if (codexSubscriptionProvider) void getLatestCodexVersion(codexSubscriptionProvider.proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY);
 if (sqliteStorage) {
   useSqliteRecordStore(sqliteStorage.client);
 }

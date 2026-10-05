@@ -8,9 +8,6 @@ const SYNC_INTERVAL_MS = 6 * 60 * 60_000;
 const FAILURE_RETRY_MS = 10 * 60_000;
 const REQUEST_TIMEOUT_MS = 5000;
 
-let cached: { version: string; expiresAt: number } | undefined;
-let inflight: Promise<string> | undefined;
-
 function compareVersions(a: string, b: string): number {
   const left = a.split(".").map(Number);
   const right = b.split(".").map(Number);
@@ -46,21 +43,46 @@ export async function fetchLatestCodexVersion(options: { url?: string; proxyUrl?
   }
 }
 
+export interface CodexVersionSource {
+  /** Waits for a sync when the cached version has expired. */
+  latest(proxyUrl?: string): Promise<string>;
+  /** Never waits: returns the cached version and refreshes it in the background once expired. */
+  current(proxyUrl?: string): string;
+}
+
+/**
+ * Follows the latest Codex release (synced every few hours) and never reports a version older than the built-in
+ * default. A failed sync keeps the last known version and retries sooner.
+ */
+export function createCodexVersionSource(options: { url?: string } = {}): CodexVersionSource {
+  let cached: { version: string; expiresAt: number } | undefined;
+  let inflight: Promise<string> | undefined;
+  const latest = async (proxyUrl?: string): Promise<string> => {
+    if (cached && cached.expiresAt > Date.now()) return cached.version;
+    inflight ??= fetchLatestCodexVersion({ url: options.url, proxyUrl })
+      .then((version) => {
+        cached = { version: compareVersions(version, CODEX_CLI_VERSION) > 0 ? version : CODEX_CLI_VERSION, expiresAt: Date.now() + SYNC_INTERVAL_MS };
+        return cached.version;
+      })
+      .catch(() => {
+        cached = { version: cached?.version ?? CODEX_CLI_VERSION, expiresAt: Date.now() + FAILURE_RETRY_MS };
+        return cached.version;
+      })
+      .finally(() => { inflight = undefined; });
+    return inflight;
+  };
+  const current = (proxyUrl?: string): string => {
+    if (!cached || cached.expiresAt <= Date.now()) void latest(proxyUrl);
+    return cached?.version ?? CODEX_CLI_VERSION;
+  };
+  return { latest, current };
+}
+
+const defaultSource = createCodexVersionSource();
 /**
  * The version to report as `client_version`. The model catalog is filtered by client version, so a stale
- * value hides newer models. Follows the latest release (cached for hours) and falls back to the built-in default.
+ * value hides newer models.
  */
-export async function getLatestCodexVersion(proxyUrl?: string): Promise<string> {
-  if (cached && cached.expiresAt > Date.now()) return cached.version;
-  inflight ??= fetchLatestCodexVersion({ proxyUrl })
-    .then((version) => {
-      cached = { version, expiresAt: Date.now() + SYNC_INTERVAL_MS };
-      return version;
-    })
-    .catch(() => {
-      cached = { version: CODEX_CLI_VERSION, expiresAt: Date.now() + FAILURE_RETRY_MS };
-      return CODEX_CLI_VERSION;
-    })
-    .finally(() => { inflight = undefined; });
-  return inflight;
-}
+export const getLatestCodexVersion = defaultSource.latest;
+/** The version subscription request headers report; request paths use this so they never wait on GitHub. */
+export const getCurrentCodexVersion = defaultSource.current;

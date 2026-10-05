@@ -32,14 +32,14 @@ import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
 import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/pages/admin-config-form.js";
 import { buildModelTestRequest, extractModelTestReply } from "../src/proxy/model-test.js";
 import { buildSubscriptionModelsRequest } from "../src/subscriptions/openai-subscription.js";
-import { fetchLatestCodexVersion, parseCodexReleaseVersion } from "../src/subscriptions/codex-version.js";
+import { createCodexVersionSource, fetchLatestCodexVersion, parseCodexReleaseVersion } from "../src/subscriptions/codex-version.js";
 import { buildClaudeModelsHeaders } from "../src/subscriptions/claude-subscription.js";
 import { CODEX_CLI_ORIGINATOR, CODEX_CLI_USER_AGENT, CODEX_CLI_VERSION } from "../src/subscriptions/subscription-client-compat.js";
 import { extractUpstreamModelIds, fetchUpstreamModels } from "../src/proxy/upstream-models.js";
 import { ConfigManager } from "../src/core/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/proxy/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/core/http-log.js";
-import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, forwardRequest, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy/proxy.js";
+import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, applyCodexSubscriptionIdentityHeaders, forwardRequest, mergeHeaders, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy/proxy.js";
 import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "../src/proxy/response-cache.js";
 import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/core/response-compression.js";
 import { renderRecordPage } from "../src/pages/record-page.js";
@@ -5495,6 +5495,32 @@ await runAsync("record store compacts generated images in responses and image_ge
   await stopRecording();
 });
 
+run("mergeHeaders replaces names case-insensitively instead of duplicating them", () => {
+  assert.deepEqual(mergeHeaders({ "user-agent": "client/1", accept: "*/*" }, undefined, { "User-Agent": "configured/1" }), { accept: "*/*", "User-Agent": "configured/1" });
+});
+
+await runAsync("upstream requests carry exactly one User-Agent whatever case each header source uses", async () => {
+  const userAgents: string[][] = [];
+  await withHTTPServer((req, res) => {
+    userAgents.push(req.rawHeaders.filter((_, index) => index % 2 === 1 && req.rawHeaders[index - 1].toLowerCase() === "user-agent"));
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(req.url?.includes("/images/") ? JSON.stringify({ created: 1, data: [] }) : JSON.stringify({ id: "chatcmpl_1", choices: [], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+    });
+  }, async (baseURL) => {
+    const base = { name: "alpha", base_url: baseURL, api_key: "test-key", model: "upstream-alpha" };
+    // Configured headers override the client's User-Agent even when their case differs.
+    await passthroughRequest({ ...base, provider: "openai-chat", headers: { "user-agent": "configured/1" } },
+      { model: "alpha", messages: [{ role: "user", content: "hi" }] }, { userAgent: "client/1" });
+    // Raw passthrough copies incoming headers in lowercase and then sets User-Agent on top.
+    const imageBody = JSON.stringify({ model: "alpha", prompt: "a cat" });
+    await passthroughRawRequest({ ...base, provider: "openai-image" }, new TextEncoder().encode(imageBody),
+      new Headers({ "content-type": "application/json", "user-agent": "client/1" }), { userAgent: "client/1", imageOperation: "generations" });
+  });
+  assert.deepEqual(userAgents, [["configured/1"], ["client/1"]]);
+});
+
 await runAsync("record summary keeps fallback actual model and failure status", async () => {
   await startRecording();
   const requestId = "fedcba98-7654-3210-abcd-ef1234567890";
@@ -6945,6 +6971,21 @@ run("codex model catalog request carries the Codex CLI identity and a version at
   assert.equal("ChatGPT-Account-Id" in buildSubscriptionModelsRequest("tok").headers, false);
 });
 
+run("codex subscription identity is fixed whichever client and OS made the call", () => {
+  const expected = { originator: "codex-tui", "User-Agent": "codex-tui/0.160.0 (Mac OS 26.5.1; arm64) xterm-256color (codex-tui; 0.160.0)" };
+  const fromWindows: Record<string, string> = { originator: "codex_vscode", "user-agent": "codex_vscode/0.150.0 (Windows 10.0.26200; x86_64) vscode/1.105.0" };
+  applyCodexSubscriptionIdentityHeaders(fromWindows);
+  assert.deepEqual(fromWindows, expected);
+  const withoutClient: Record<string, string> = {};
+  applyCodexSubscriptionIdentityHeaders(withoutClient);
+  assert.deepEqual(withoutClient, expected);
+  assert.equal(CODEX_CLI_USER_AGENT, expected["User-Agent"]);
+
+  const synced: Record<string, string> = {};
+  applyCodexSubscriptionIdentityHeaders(synced, "0.170.0");
+  assert.equal(synced["User-Agent"], "codex-tui/0.170.0 (Mac OS 26.5.1; arm64) xterm-256color (codex-tui; 0.170.0)", "the version follows the synced release in both places");
+});
+
 run("claude model list request uses the Claude Code identity headers over the plain oauth fallback", () => {
   const identity: Record<string, string> = {};
   applyClaudeSubscriptionHeaders(identity);
@@ -6953,7 +6994,8 @@ run("claude model list request uses the Claude Code identity headers over the pl
   assert.equal(headers["anthropic-version"], "2023-06-01");
   assert.match(headers["anthropic-beta"], /claude-code-20250219/);
   assert.match(headers["anthropic-beta"], /oauth-2025-04-20/);
-  assert.match(headers["User-Agent"], /^claude-cli\//);
+  assert.deepEqual(Object.keys(headers).filter(name => name.toLowerCase() === "user-agent"), ["user-agent"]);
+  assert.match(headers["user-agent"], /^claude-cli\//);
   assert.equal(headers["x-app"], "cli");
   assert.equal(headers.Accept, "application/json");
 
@@ -6990,6 +7032,31 @@ await runAsync("fetchLatestCodexVersion reads the latest stable release and reje
     await assert.rejects(fetchLatestCodexVersion({ url: baseURL }), /unusable version/);
     status = 500;
     await assert.rejects(fetchLatestCodexVersion({ url: baseURL }), /500/);
+  });
+});
+
+await runAsync("codex version source serves the cached release without waiting and never reports below the built-in version", async () => {
+  const [major, minor] = CODEX_CLI_VERSION.split(".").map(Number);
+  const newer = `${major}.${minor + 10}.0`;
+  let tag = `rust-v${newer}`, status = 200, requests = 0;
+  await withHTTPServer((_req, res) => {
+    requests += 1;
+    res.statusCode = status;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ tag_name: tag }));
+  }, async (baseURL) => {
+    const source = createCodexVersionSource({ url: baseURL });
+    assert.equal(source.current(), CODEX_CLI_VERSION, "the first read does not wait for GitHub");
+    assert.equal(await source.latest(), newer, "the background sync started by current() is shared");
+    assert.equal(requests, 1);
+    assert.equal(source.current(), newer);
+    assert.equal(await source.latest(), newer);
+    assert.equal(requests, 1, "a fresh value is served from the cache");
+
+    tag = "rust-v0.150.0";
+    assert.equal(await createCodexVersionSource({ url: baseURL }).latest(), CODEX_CLI_VERSION, "an older release does not downgrade the built-in version");
+    status = 500;
+    assert.equal(await createCodexVersionSource({ url: baseURL }).latest(), CODEX_CLI_VERSION, "a failed sync falls back to the built-in version");
   });
 });
 
