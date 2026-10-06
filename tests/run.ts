@@ -5989,6 +5989,8 @@ await runAsync("status page renders fallback group priority panel without top hi
   assert.match(html, /class="layout"/);
   assert.match(html, /<a class="back-admin" href="\/admin">/);
   assert.match(html, /fetch\("\/status\/data"/);
+  assert.match(html, /setInterval\(\(\) => \{\n\s*if \(!document\.hidden\) refreshStatus\(\);\n\s*\}, REFRESH_INTERVAL_MS\);/);
+  assert.match(html, /document\.addEventListener\("visibilitychange", \(\) => \{\n\s*if \(!document\.hidden\) refreshStatus\(\);/);
   assert.doesNotMatch(html, /AUTH_TOKEN_KEY = "nanollmAuthToken"/);
   assert.doesNotMatch(html, /sessionStorage\.setItem\(/);
   assert.doesNotMatch(html, /只展示真实模型/);
@@ -6318,6 +6320,8 @@ async function runRecordPageScript(recentKeys: RecentKey[], search: string, reco
   const replacedUrls: string[] = [];
   vm.runInContext(script, vm.createContext({
     document: {
+      hidden: false,
+      addEventListener: () => {},
       getElementById(id: string) {
         if (!elements.has(id)) elements.set(id, new FakeRecordPageElement("div", doc));
         return elements.get(id);
@@ -6371,6 +6375,46 @@ await runAsync("record page hides the pager when all recent requests fit on one 
   assert.equal(pager.children.length, 0);
 });
 
+run("record page skips summary polls while the tab is hidden and refreshes when it is shown", () => {
+  const summary = { enabled: true, capturedCount: 0, limit: 100, sessionStartedAt: Date.UTC(2026, 3, 20), recentKeys: [] };
+  const script = /<script>([\s\S]*)<\/script>/.exec(renderRecordPage(summary))?.[1];
+  assert.ok(script, "record page script");
+  const doc: { hidden: boolean; activeElement?: FakeRecordPageElement } = { hidden: true };
+  const elements = new Map<string, FakeRecordPageElement>();
+  const visibilityListeners: Array<() => void> = [];
+  const fetchedUrls: string[] = [];
+  let poll = () => {};
+  vm.runInContext(script, vm.createContext({
+    document: {
+      get hidden() { return doc.hidden; },
+      addEventListener(type: string, listener: () => void) {
+        if (type === "visibilitychange") visibilityListeners.push(listener);
+      },
+      getElementById(id: string) {
+        if (!elements.has(id)) elements.set(id, new FakeRecordPageElement("div", doc));
+        return elements.get(id);
+      },
+      createElement: (tagName: string) => new FakeRecordPageElement(tagName, doc),
+    },
+    window: { location: { search: "" } },
+    history: { replaceState: () => {} },
+    fetch: async (url: string) => {
+      fetchedUrls.push(url);
+      return { ok: true, json: async () => summary };
+    },
+    setInterval: (callback: () => void) => { poll = callback; return 0; },
+    URLSearchParams,
+  }));
+
+  poll();
+  assert.deepEqual(fetchedUrls, []);
+  doc.hidden = false;
+  for (const listener of visibilityListeners) listener();
+  assert.deepEqual(fetchedUrls, ["/record/summary"]);
+  poll();
+  assert.deepEqual(fetchedUrls, ["/record/summary", "/record/summary"]);
+});
+
 run("record page stream parser keeps data-like text inside JSON payloads", () => {
   const html = renderRecordPage({
     enabled: true,
@@ -6398,6 +6442,7 @@ run("record page stream reconstructor handles Anthropic server_tool_use events",
   assert.ok(script, "record page script");
   const sandbox: any = {
     document: {
+      addEventListener: () => {},
       createElement: () => ({ appendChild: () => {}, addEventListener: () => {} }),
       getElementById: () => ({ addEventListener: () => {}, appendChild: () => {}, classList: { toggle: () => {} } }),
     },
