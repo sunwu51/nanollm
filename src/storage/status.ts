@@ -1,11 +1,13 @@
+import type { InStatement } from "@libsql/client";
 import type { NormalizedUsage } from "../converters/shared.js";
 import type { SqliteClient } from "./sqlite.js";
-import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
+import { allRows, enqueueClientStatements, firstRow, waitForClientWrites } from "./sqlite.js";
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const RETENTION_MS = 6 * 60 * 60 * 1000;
 const MAX_BUCKETS = RETENTION_MS / FIVE_MINUTES_MS;
 const SQLITE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 export interface RequestMetrics {
   totalRequests: number;
@@ -206,6 +208,13 @@ export function formatBucketLabel(bucketStart: number): string {
 
 type StatusRow = RequestMetrics & { bucket_start: number };
 
+function pruneStatement(now: number): InStatement {
+  return {
+    sql: "DELETE FROM status_buckets WHERE bucket_start < ?",
+    args: [floorToFiveMinutes(now - SQLITE_RETENTION_MS)],
+  };
+}
+
 function rowToMetrics(row: Record<string, unknown>): RequestMetrics {
   return {
     totalRequests: Number(row.total_requests ?? 0),
@@ -241,6 +250,7 @@ function buildStatusCell(bucketStart: number, metrics: RequestMetrics): StatusCe
 
 export class SqliteStatusStore implements StatusStoreLike {
   private readonly ready: Promise<void>;
+  private prunedAt = Date.now();
   constructor(private readonly db: SqliteClient) {
     this.ready = this.initialize();
   }
@@ -270,14 +280,7 @@ export class SqliteStatusStore implements StatusStoreLike {
     if (!columns.some((column) => String(column.name) === "cache_write_input_tokens")) {
       await this.db.execute("ALTER TABLE status_buckets ADD COLUMN cache_write_input_tokens INTEGER NOT NULL DEFAULT 0");
     }
-    await this.pruneOldBuckets();
-  }
-
-  private enqueueWrite(task: () => Promise<void>) {
-    enqueueClientWrite(this.db, async () => {
-      await this.ready;
-      await task();
-    });
+    await this.db.execute(pruneStatement(Date.now()));
   }
 
   private async waitForWrites() {
@@ -285,17 +288,13 @@ export class SqliteStatusStore implements StatusStoreLike {
     await waitForClientWrites(this.db);
   }
 
-  private async pruneOldBuckets(now = Date.now()) {
-    const minBucketStart = floorToFiveMinutes(now - SQLITE_RETENTION_MS);
-    await this.db.execute({
-      sql: "DELETE FROM status_buckets WHERE bucket_start < ?",
-      args: [minBucketStart],
-    });
-  }
-
-  private async addMetrics(modelName: string, timestamp: number, delta: Partial<RequestMetrics>) {
+  // Buckets already past retention would be pruned again, so they are never written. Pruning rides
+  // along with a write at most once per interval instead of costing its own round trip every time.
+  private addMetrics(modelName: string, timestamp: number, delta: Partial<RequestMetrics>) {
+    const now = Date.now();
     const bucketStart = floorToFiveMinutes(timestamp);
-    await this.db.execute({
+    if (bucketStart < floorToFiveMinutes(now - SQLITE_RETENTION_MS)) return;
+    const statements: InStatement[] = [{
       sql: `
       INSERT INTO status_buckets (
         model_name,
@@ -343,12 +342,16 @@ export class SqliteStatusStore implements StatusStoreLike {
         delta.cacheReadInputTokens ?? 0,
         delta.outputTokens ?? 0,
       ],
-    });
-    await this.pruneOldBuckets();
+    }];
+    if (now - this.prunedAt >= PRUNE_INTERVAL_MS) {
+      this.prunedAt = now;
+      statements.push(pruneStatement(now));
+    }
+    enqueueClientStatements(this.db, statements, this.ready);
   }
 
   recordAttempt(modelName: string, timestamp = Date.now()) {
-    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, { totalRequests: 1 }));
+    this.addMetrics(modelName, timestamp, { totalRequests: 1 });
   }
 
   recordSuccess(
@@ -359,7 +362,7 @@ export class SqliteStatusStore implements StatusStoreLike {
     timestamp = Date.now(),
     streamDurationMs?: number,
   ) {
-    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, {
+    this.addMetrics(modelName, timestamp, {
       successRequests: 1,
       totalDurationMs: durationMs,
       durationSamples: 1,
@@ -371,12 +374,12 @@ export class SqliteStatusStore implements StatusStoreLike {
       ...(typeof streamDurationMs === "number" && Number.isFinite(streamDurationMs) && streamDurationMs > 0
         ? { totalStreamMs: streamDurationMs, streamSamples: 1 }
         : {}),
-    }));
+    });
   }
 
   recordFailure(modelName: string, durationMs?: number, timestamp = Date.now()) {
     if (typeof durationMs !== "number" || !Number.isFinite(durationMs)) return;
-    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, { totalDurationMs: durationMs, durationSamples: 1 }));
+    this.addMetrics(modelName, timestamp, { totalDurationMs: durationMs, durationSamples: 1 });
   }
 
   listBuckets(now = Date.now()): number[] {

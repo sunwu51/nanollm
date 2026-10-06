@@ -12,7 +12,7 @@ This template runs two Docker services in US West: nanollm and a private quicSQL
 - Generates a unique `NANOLLM_AUTH_TOKEN` for each deployment.
 - Provisions `/data` for gateway configuration and subscription credentials, and `/var/lib/sqld` for SQLite request records and statistics.
 - Connects the gateway to quicSQL automatically over Railway private networking, with no database password or public database endpoint.
-- Enables Serverless for sqld while keeping nanollm always running. The gateway retries a read-only wake-up probe before sending each HTTP database request; uncertain writes are not replayed. Reading records after inactivity may wait for a cold start.
+- Enables Serverless for sqld while keeping nanollm always running. After a quiet minute or a failed request, the gateway retries a read-only wake-up probe before its next HTTP database request; uncertain writes are not replayed. Reading records after inactivity may wait for a cold start.
 - Creates the database automatically on a fresh volume. Both services build from the repository's `dev` branch; sqld watches only `/.railway/quicsql/**`.
 - Sets the Node.js old-generation heap limit to 256 MiB by default.
 - Enables a public Railway domain and checks `/health` before activating the deployment.

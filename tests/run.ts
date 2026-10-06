@@ -52,6 +52,7 @@ import {
   configureRecording,
   ensureRecordedAttempt,
   finalizeRecordedRequest,
+  flushRecording,
   getRecordedImage,
   getRecordedRequest,
   getRecordSummary,
@@ -71,11 +72,30 @@ import { shouldIgnoreStreamReadError } from "../src/core/stream-errors.js";
 import { extractErrorCauses, formatErrorWithCauses } from "../src/core/error-details.js";
 import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/storage/usage.js";
 import { normalizeUsage } from "../src/converters/shared.js";
-import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch } from "../src/storage/sqlite.js";
+import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch, waitForClientWrites } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
 
 function createTestSqliteClient(path: string): Client {
   return createClient({ url: `file:${path}`, intMode: "number", timeout: 5000 });
+}
+
+// Logs every round trip (execute, batch, executeMultiple) with the SQL it carries.
+function recordClientCalls(client: Client) {
+  const calls: Array<{ method: string; sql: string[] }> = [];
+  const sqlOf = (statement: unknown) => typeof statement === "string" ? statement : String((statement as { sql: string }).sql);
+  const recorded = new Proxy(client, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property === "execute" || property === "batch" || property === "executeMultiple") {
+        return (...args: unknown[]) => {
+          calls.push({ method: property, sql: property === "batch" ? (args[0] as unknown[]).map(sqlOf) : [sqlOf(args[0])] });
+          return value.apply(target, args);
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { client: recorded, calls };
 }
 
 function removeTestDir(path: string) {
@@ -4822,6 +4842,45 @@ await runAsync("remote sqlite never sends the write when wake probes are exhaust
   assert.equal(requests, 3);
 });
 
+await runAsync("remote sqlite probes again only after the server goes quiet or a request fails", async () => {
+  const seen: string[] = [];
+  let failWrite = false;
+  await withHTTPServer((req, res) => {
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      const sql = JSON.parse(body).requests[0].stmt.sql as string;
+      seen.push(sql);
+      if (failWrite && sql !== "SELECT 1") { res.statusCode = 502; res.end("Result unknown"); return; }
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ baton: null, base_url: null, results: [
+        { type: "ok", response: { type: "execute", result: { cols: [], rows: [], affected_row_count: 1, last_insert_rowid: null } } },
+        { type: "ok", response: { type: "close" } },
+      ] }));
+    });
+  }, async baseURL => {
+    const client = createClient({ url: baseURL, fetch: createSqliteWakeFetch(baseURL, undefined, { delayMs: 0, maxAttempts: 3 }) });
+    try {
+      await client.execute("UPDATE a SET n = n + 1");
+      await client.execute("UPDATE b SET n = n + 1");
+      assert.deepEqual(seen, ["SELECT 1", "UPDATE a SET n = n + 1", "UPDATE b SET n = n + 1"]);
+      failWrite = true;
+      await assert.rejects(client.execute("UPDATE c SET n = n + 1"));
+      failWrite = false;
+      await client.execute("UPDATE d SET n = n + 1");
+      assert.deepEqual(seen.slice(3), ["UPDATE c SET n = n + 1", "SELECT 1", "UPDATE d SET n = n + 1"]);
+    } finally { client.close(); }
+
+    seen.length = 0;
+    const quiet = createClient({ url: baseURL, fetch: createSqliteWakeFetch(baseURL, undefined, { delayMs: 0, maxAttempts: 3, idleMs: 0 }) });
+    try {
+      await quiet.execute("UPDATE a SET n = n + 1");
+      await quiet.execute("UPDATE b SET n = n + 1");
+      assert.deepEqual(seen, ["SELECT 1", "UPDATE a SET n = n + 1", "SELECT 1", "UPDATE b SET n = n + 1"]);
+    } finally { quiet.close(); }
+  });
+});
+
 await runAsync("sqlite status store persists sparse buckets for a month while UI series stays at 6 hours", async () => {
   const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-status-"));
   const db = createTestSqliteClient(join(dir, "status.sqlite3"));
@@ -5028,6 +5087,36 @@ await runAsync("sqlite usage store migrates cache write column for existing data
     store.recordAttempt("new", timestamp);
     store.recordSuccess("new", 10, { cacheWriteInputTokens: 7 }, timestamp);
     assert.equal((await store.getModelDay("new", "2026-01-02"))?.cacheWriteInputTokens, 7);
+  } finally {
+    db.close();
+    removeTestDir(dir);
+  }
+});
+
+await runAsync("sqlite status and usage counters of one event share a single write batch", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-counter-batch-"));
+  const db = createTestSqliteClient(join(dir, "counters.sqlite3"));
+  const { client, calls } = recordClientCalls(db);
+  try {
+    const now = Date.now();
+    const day = formatLocalDay(now);
+    const status = new SqliteStatusStore(client);
+    const usage = new SqliteUsageStore(client);
+    await status.listModelNames(now);
+    await usage.listModelNames({ start: day, end: day });
+    calls.length = 0;
+
+    status.recordAttempt("alpha", now);
+    usage.recordAttempt("alpha", now);
+    status.recordAttempt("alpha", now - 31 * 24 * 60 * 60 * 1000);
+    await waitForClientWrites(client);
+    // No per-write prune: the expired bucket is dropped before it is written.
+    assert.deepEqual(calls.map((call) => call.method), ["batch"]);
+    assert.equal(calls[0].sql.length, 2);
+    assert.match(calls[0].sql[0], /INSERT INTO status_buckets/);
+    assert.match(calls[0].sql[1], /INSERT INTO usage_days/);
+    assert.equal((await status.getModelSeries("alpha", now)).at(-1)?.totalRequests, 1);
+    assert.equal((await usage.getModelDay("alpha", day))?.totalRequests, 1);
   } finally {
     db.close();
     removeTestDir(dir);
@@ -5700,6 +5789,100 @@ await runAsync("sqlite record store restores compacted images after restart", as
     const streamed = String((await getRecordedRequest(streamRequestId))?.clientResponse.body);
     const ref = JSON.parse(streamed.trim().slice(5)).item.result.__nanollm_record_image_ref;
     assert.equal(await getRecordedImage(ref), `data:image/png;base64,${generated.result}`);
+  } finally {
+    useMemoryRecordStore();
+    db.close();
+    removeTestDir(dir);
+  }
+});
+
+await runAsync("sqlite record store compresses entries and sends one batch per flush without re-sending stored images", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-record-batch-"));
+  const db = createTestSqliteClient(join(dir, "record.sqlite3"));
+  const { client, calls } = recordClientCalls(db);
+  const imageData = "c".repeat(64 * 1024);
+  const recordTurn = (requestId: string, messages: unknown[]) => {
+    const body = { model: "alpha", messages };
+    beginRecordedRequest({ requestId, path: "/v1/messages", headers: {}, body, stream: true });
+    ensureRecordedAttempt({ requestId, index: 0, provider: "anthropic", modelName: "alpha", url: "https://example.com/v1/messages", requestHeaders: {}, requestBody: JSON.stringify(body) });
+    appendRecordedAttemptResponseBody({ requestId, index: 0, chunk: "data: {\"type\":\"message_stop\"}\n\n" });
+    appendRecordedClientResponseBody({ requestId, chunk: "data: {\"type\":\"message_stop\"}\n\n" });
+    finalizeRecordedRequest({ requestId });
+  };
+  try {
+    useSqliteRecordStore(client);
+    await startRecording({ maxSize: 5 });
+    const fileText = Array.from({ length: 400 }, (_, index) => `line ${index}: const value${index} = read("src/${(index * 7919) % 1000}.ts");`).join("\n");
+    const history = [{ role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: imageData } },
+      { type: "text", text: fileText },
+    ] }];
+    recordTurn("batch001-1234-5678-9abc-def012345678", history);
+    await flushRecording();
+    calls.length = 0;
+    recordTurn("batch002-1234-5678-9abc-def012345678", [...history, { role: "assistant", content: "ok" }, { role: "user", content: "next" }]);
+    await flushRecording();
+
+    // The lookup finds the image already stored; refs, the record and the trim then share one batch.
+    assert.deepEqual(calls.map((call) => call.method), ["execute", "batch"]);
+    assert.match(calls[0].sql[0], /SELECT hash FROM record_images WHERE hash IN/);
+    assert.equal(calls[1].sql.some((sql) => /INTO record_images/.test(sql)), false);
+    assert.equal(calls[1].sql.some((sql) => /INSERT INTO records/.test(sql)), true);
+    assert.equal(calls[1].sql.some((sql) => /DELETE FROM records/.test(sql)), true);
+    assert.equal(Number((await db.execute("SELECT COUNT(*) AS count FROM record_images")).rows[0].count), 1);
+
+    const row = (await db.execute({
+      sql: "SELECT typeof(entry_json) AS type, length(entry_json) AS bytes FROM records WHERE key = ?",
+      args: ["batch002-1234-5678-9abc-def012345678"],
+    })).rows[0];
+    assert.equal(row.type, "blob");
+    const stored = await getRecordedRequest("batch002-1234-5678-9abc-def012345678");
+    assert.ok(Number(row.bytes) * 4 < JSON.stringify(stored).length, "the client and attempt copies of the body compress together");
+    const record = await getRecordedRequest("batch002-1234-5678-9abc-def012345678", { hydrateImages: true });
+    assert.equal((record?.clientRequest.body as any).messages[0].content[0].source.data, imageData);
+    assert.equal((record?.attempts[0].request.body as any).messages[0].content[1].text, fileText);
+    assert.equal((record?.attempts[0].request.body as any).messages[1].content, "ok");
+
+    // Rows written before compression hold plain JSON text and still read back.
+    const legacyId = "legacy01-1234-5678-9abc-def012345678";
+    await db.execute({
+      sql: "INSERT INTO records (key, request_id, created_at, path, source, status, entry_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      args: [legacyId, legacyId, Date.now(), "/v1/messages", "other", "success", JSON.stringify({ requestId: legacyId, key: legacyId, attempts: [] })],
+    });
+    assert.equal((await getRecordedRequest(legacyId))?.requestId, legacyId);
+  } finally {
+    useMemoryRecordStore();
+    db.close();
+    removeTestDir(dir);
+  }
+});
+
+await runAsync("sqlite record summary reads in one round trip and evicts the oldest row for an in-flight record", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-record-summary-"));
+  const db = createTestSqliteClient(join(dir, "record.sqlite3"));
+  const { client, calls } = recordClientCalls(db);
+  const ids = [1, 2, 3].map((index) => `summary${index}-1234-5678-9abc-def012345678`);
+  try {
+    useSqliteRecordStore(client);
+    await startRecording({ maxSize: 2 });
+    for (const requestId of ids.slice(0, 2)) {
+      beginRecordedRequest({ requestId, path: "/v1/responses", headers: {}, body: { model: "alpha" }, stream: false });
+      finalizeRecordedRequest({ requestId });
+      await flushRecording();
+    }
+    beginRecordedRequest({ requestId: ids[2], path: "/v1/responses", headers: {}, body: { model: "alpha" }, stream: false });
+    calls.length = 0;
+
+    const summary = await getRecordSummary();
+    assert.deepEqual(calls.map((call) => call.method), ["batch", "execute"]);
+    assert.match(calls[1].sql[0], /DELETE FROM records WHERE key IN/);
+    assert.equal(summary.size, 2);
+    assert.deepEqual(summary.recentKeys.map((item) => item.requestId), [ids[2], ids[1]]);
+    assert.equal(await getRecordedRequest(ids[0]), undefined);
+
+    calls.length = 0;
+    assert.equal((await getRecordSummary()).size, 2);
+    assert.deepEqual(calls.map((call) => call.method), ["batch"]);
   } finally {
     useMemoryRecordStore();
     db.close();

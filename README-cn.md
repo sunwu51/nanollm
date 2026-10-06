@@ -576,7 +576,7 @@ npx nanollm --config /path/to/config.yaml --storage sqlite
 
 不传 `--storage` 时默认使用 `memory`，行为与旧版本一致。
 
-当 `--storage sqlite` 且未配置远程 SQLite URL 时，会继续使用本地 SQLite 文件，路径固定为 `~/.nanollm/nanollm.sqlite3`。现有本地数据库文件可以直接复用，不需要迁移格式。
+当 `--storage sqlite` 且未配置远程 SQLite URL 时，会继续使用本地 SQLite 文件，路径固定为 `~/.nanollm/nanollm.sqlite3`。现有本地数据库文件可以直接复用，不需要迁移格式。请求记录以 brotli 压缩后写入，以减少数据库流量；旧版本写入的记录仍可直接读取。
 
 如果希望把 SQLite 存储切到远程 libSQL/quicSQL 服务，可以配置以下环境变量：
 
@@ -590,7 +590,7 @@ URL 可以是 HTTP(S) 的 libSQL/quicSQL 服务地址，也可以不配置而使
 
 本程序不再在正常启动流程中执行远程数据库自动迁移。需要迁移已有本地文件时，请先使用仓库中的一次性迁移脚本完成复制和校验，再配置远程 SQLite URL。
 
-HTTP(S)/libSQL 连接每次发送正式数据库请求前，先用独立连接执行只读 `SELECT 1` 探测。
+HTTP(S)/libSQL 连接在数据库 60 秒内没有成功响应、或上一次请求失败后，发送下一个正式数据库请求前先用独立连接执行只读 `SELECT 1` 探测；数据库持续响应期间不再探测。
 探测失败时按 1、2、4、5 秒（随后保持 5 秒）等待重试，最多 20 次，每次探测超时为 5 秒；
 探测成功后立即发送正式请求。批量 SQL 整批探测一次，保持事务和批处理语义。
 正式请求失败不会自动重发，避免已提交但响应丢失时重复累加统计；探测耗尽或正式写入失败会记录错误，

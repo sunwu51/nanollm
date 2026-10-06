@@ -536,7 +536,7 @@ Without `--storage` the default is `memory`: `/status`, usage and `/record` data
 npx nanollm --config /path/to/config.yaml --storage sqlite
 ```
 
-With `--storage sqlite` and no remote SQLite URL, a local SQLite file at `~/.nanollm/nanollm.sqlite3` is used. An existing local database file can be reused as is; no format migration is needed.
+With `--storage sqlite` and no remote SQLite URL, a local SQLite file at `~/.nanollm/nanollm.sqlite3` is used. An existing local database file can be reused as is; no format migration is needed. Request records are written brotli-compressed to cut database traffic; rows written by earlier versions are still read as they are.
 
 To store data in a remote libSQL/quicSQL service instead, set these environment variables:
 
@@ -546,7 +546,7 @@ export NANOLLM_SQLITE_AUTH_TOKEN="your-token" # can be omitted for an unauthenti
 npx nanollm --config /path/to/config.yaml --storage sqlite
 ```
 
-The URL is the address of an HTTP(S) libSQL/quicSQL service. Before every real database request over HTTP(S)/libSQL, nanollm first runs a read-only `SELECT 1` probe on a separate connection. A failed probe is retried after 1, 2, 4 and then 5 seconds (staying at 5 seconds) up to 20 times, with a 5-second timeout per probe, and the real request is sent as soon as a probe succeeds. A batch of SQL statements is probed once as a whole, keeping transaction and batch semantics. A failed real request is never resent automatically, to avoid double counting when a write was committed but its response was lost. Exhausted probes or failed writes are logged; this is not a durable delivery queue. Probes only run when there is a database operation, so no background heartbeat keeps the database awake. The Railway template enables Serverless for sqld while nanollm stays running, so viewing records and statistics may wait for the database to wake up.
+The URL is the address of an HTTP(S) libSQL/quicSQL service. When the database has not answered successfully in the last 60 seconds, or the previous request failed, nanollm first runs a read-only `SELECT 1` probe on a separate connection before the next real request over HTTP(S)/libSQL; while the database keeps answering, requests go out without a probe. A failed probe is retried after 1, 2, 4 and then 5 seconds (staying at 5 seconds) up to 20 times, with a 5-second timeout per probe, and the real request is sent as soon as a probe succeeds. A batch of SQL statements is probed once as a whole, keeping transaction and batch semantics. A failed real request is never resent automatically, to avoid double counting when a write was committed but its response was lost. Exhausted probes or failed writes are logged; this is not a durable delivery queue. Probes only run when there is a database operation, so no background heartbeat keeps the database awake. The Railway template enables Serverless for sqld while nanollm stays running, so viewing records and statistics may wait for the database to wake up.
 
 ### Data migration
 

@@ -1,4 +1,7 @@
+import type { InStatement, ResultSet } from "@libsql/client";
 import { createHash } from "node:crypto";
+import { promisify } from "node:util";
+import { brotliCompress, brotliDecompress, constants as zlibConstants } from "node:zlib";
 import { getRequestId } from "../core/request-context.js";
 import { DEFAULT_RECORD_MAX_SIZE } from "../core/config.js";
 import type { SqliteClient } from "./sqlite.js";
@@ -561,15 +564,39 @@ class RecordStore implements RecordStoreLike {
 }
 
 type RecordRow = {
-  entry_json: string;
+  entry_json: string | ArrayBuffer;
 };
 
-function parseRecordEntry(json: string): RecordEntry | undefined {
+const compressBrotli = promisify(brotliCompress);
+const decompressBrotli = promisify(brotliDecompress);
+
+// entry_json holds the brotli-compressed record JSON as a BLOB (rows written before compression are
+// JSON text and still read back). A record repeats the request body in each attempt and the stream in
+// the client response, and a remote database receives the whole row on every insert. The window spans
+// the whole record so those copies are matched, while memory stays proportional to the record size.
+async function encodeRecordEntry(record: RecordEntry): Promise<Buffer> {
+  const json = Buffer.from(JSON.stringify(record));
+  return compressBrotli(json, {
+    params: {
+      [zlibConstants.BROTLI_PARAM_MODE]: zlibConstants.BROTLI_MODE_TEXT,
+      [zlibConstants.BROTLI_PARAM_QUALITY]: 5,
+      [zlibConstants.BROTLI_PARAM_LGWIN]: Math.min(zlibConstants.BROTLI_MAX_WINDOW_BITS, Math.max(16, Math.ceil(Math.log2(json.length + 1)))),
+      [zlibConstants.BROTLI_PARAM_SIZE_HINT]: json.length,
+    },
+  });
+}
+
+async function decodeRecordEntry(value: string | ArrayBuffer): Promise<RecordEntry | undefined> {
   try {
+    const json = typeof value === "string" ? value : (await decompressBrotli(Buffer.from(value))).toString("utf8");
     return JSON.parse(json) as RecordEntry;
   } catch {
     return undefined;
   }
+}
+
+function countFromResult(result: ResultSet | undefined): number {
+  return Number(result ? firstRow<{ count?: number }>(result)?.count ?? 0 : 0);
 }
 
 function updateSummaryFields(record: RecordEntry) {
@@ -638,7 +665,7 @@ class SqliteRecordStore implements RecordStoreLike {
   }
 
   private enqueueWrite(task: () => Promise<void>) {
-    enqueueClientWrite(this.db, async () => {
+    return enqueueClientWrite(this.db, async () => {
       await this.waitForReady();
       await task();
     });
@@ -649,20 +676,27 @@ class SqliteRecordStore implements RecordStoreLike {
     await waitForClientWrites(this.db);
   }
 
+  // Trim statements end with the remaining row count so they can share a batch with the inserts.
+  private trimStatements(): InStatement[] {
+    return [
+      {
+        sql: `
+          DELETE FROM records
+          WHERE key IN (
+            SELECT key FROM records ORDER BY created_at ASC, key ASC LIMIT max((SELECT COUNT(*) FROM records) - ?, 0)
+          )
+        `,
+        args: [this.limit],
+      },
+      "DELETE FROM record_image_refs WHERE record_key NOT IN (SELECT key FROM records)",
+      "DELETE FROM record_images WHERE hash NOT IN (SELECT DISTINCT image_hash FROM record_image_refs)",
+      "SELECT COUNT(*) AS count FROM records",
+    ];
+  }
+
   private async trimToLimit() {
-    await this.waitForReady();
-    await this.db.execute({
-      sql: `
-        DELETE FROM records
-        WHERE key IN (
-          SELECT key FROM records ORDER BY created_at ASC, key ASC LIMIT max((SELECT COUNT(*) FROM records) - ?, 0)
-        )
-      `,
-      args: [this.limit],
-    });
-    await this.db.execute("DELETE FROM record_image_refs WHERE record_key NOT IN (SELECT key FROM records)");
-    await this.db.execute("DELETE FROM record_images WHERE hash NOT IN (SELECT DISTINCT image_hash FROM record_image_refs)");
-    this.capturedCount = await this.countRecords();
+    const results = await this.db.batch(this.trimStatements(), "write");
+    this.capturedCount = countFromResult(results.at(-1));
   }
 
   // SQLite owns completed images. Keep only blobs needed by active or queued records.
@@ -674,50 +708,27 @@ class SqliteRecordStore implements RecordStoreLike {
     for (const hash of this.images.keys()) if (!referenced.has(hash)) this.images.delete(hash);
   }
 
-  private getOldestVolatileKey(): string | undefined {
-    let oldest: { key: string; createdAt: number } | undefined;
-    for (const record of [...this.activeRecords.values(), ...this.persistQueue.values()]) {
-      if (!oldest || record.createdAt < oldest.createdAt || (record.createdAt === oldest.createdAt && record.key < oldest.key)) {
-        oldest = { key: record.key, createdAt: record.createdAt };
-      }
+  // Evict the oldest records, persisted or still in memory, until in-flight records fit in the limit.
+  // `oldestPersisted` holds the oldest persisted rows, at least as many as the overflow.
+  private async evictOldest(overflow: number, oldestPersisted: Array<{ key: string; created_at: number }>) {
+    if (overflow <= 0 || this.limit <= 0) return [];
+    const evicted = [
+      ...oldestPersisted.map((row) => ({ key: row.key, createdAt: row.created_at, persisted: true })),
+      ...[...this.activeRecords.values(), ...this.persistQueue.values()].map((record) => ({ key: record.key, createdAt: record.createdAt, persisted: false })),
+    ]
+      .sort((a, b) => a.createdAt - b.createdAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+      .slice(0, overflow);
+    const persistedKeys = evicted.filter((item) => item.persisted).map((item) => item.key);
+    for (const item of evicted) {
+      if (item.persisted) continue;
+      this.activeRecords.delete(item.key);
+      this.persistQueue.delete(item.key);
     }
-    return oldest?.key;
-  }
-
-  private async getOldestPersistedRow(): Promise<{ key: string; created_at: number } | undefined> {
-    return firstRow<{ key: string; created_at: number }>(await this.db.execute(`
-      SELECT key, created_at
-      FROM records
-      ORDER BY created_at ASC, key ASC
-      LIMIT 1
-    `));
-  }
-
-  private async countVisibleRecords(): Promise<number> {
-    return (await this.countRecords()) + this.activeRecords.size + this.persistQueue.size;
-  }
-
-  private async evictOldestIfNeeded(incomingCount = 0) {
-    while ((await this.countVisibleRecords()) + incomingCount > this.limit && this.limit > 0) {
-      const volatileKey = this.getOldestVolatileKey();
-      const volatileRecord = volatileKey ? (this.activeRecords.get(volatileKey) ?? this.persistQueue.get(volatileKey)) : undefined;
-      const persistedRow = await this.getOldestPersistedRow();
-      const evictVolatile =
-        volatileRecord &&
-        (!persistedRow ||
-          volatileRecord.createdAt < persistedRow.created_at ||
-          (volatileRecord.createdAt === persistedRow.created_at && volatileRecord.key < persistedRow.key));
-      if (evictVolatile && volatileKey) {
-        this.activeRecords.delete(volatileKey);
-        this.persistQueue.delete(volatileKey);
-      } else if (persistedRow?.key) {
-        await this.db.execute({ sql: "DELETE FROM records WHERE key = ?", args: [persistedRow.key] });
-      } else {
-        break;
-      }
+    if (persistedKeys.length > 0) {
+      await this.db.execute({ sql: `DELETE FROM records WHERE key IN (${persistedKeys.map(() => "?").join(", ")})`, args: persistedKeys });
     }
     this.pruneStagedImages();
-    this.capturedCount = Math.min(this.limit, await this.countVisibleRecords());
+    return persistedKeys;
   }
 
   private async hydrateRecordImages(record: RecordEntry): Promise<RecordEntry> {
@@ -743,7 +754,7 @@ class SqliteRecordStore implements RecordStoreLike {
       sql: "SELECT entry_json FROM records WHERE key = ?",
       args: [key],
     }));
-    const record = row ? parseRecordEntry(row.entry_json) : undefined;
+    const record = row ? await decodeRecordEntry(row.entry_json) : undefined;
     return record && hydrateImages ? this.hydrateRecordImages(record) : record;
   }
 
@@ -754,7 +765,7 @@ class SqliteRecordStore implements RecordStoreLike {
     return this.activeRecords.get(key) ?? this.persistQueue.get(key);
   }
 
-  private buildRecordStatement(record: RecordEntry) {
+  private async buildRecordStatement(record: RecordEntry): Promise<InStatement> {
     const summary = updateSummaryFields(record);
     return {
       sql: `
@@ -791,25 +802,33 @@ class SqliteRecordStore implements RecordStoreLike {
         summary.source,
         summary.status,
         summary.responseStatus,
-        JSON.stringify(record),
+        await encodeRecordEntry(record),
       ],
     };
   }
 
-  private buildImageStatements(records: RecordEntry[]) {
-    const statements: Array<{ sql: string; args: any[] }> = [];
-    const hashes = new Set<string>();
+  // Images are content-addressed and every later request of a conversation repeats them, so only
+  // images the database does not hold yet are sent. Staged data is read before the lookup is awaited
+  // because pruneStagedImages may drop the blobs of records that already left the persist queue.
+  private async buildImageStatements(records: RecordEntry[]) {
+    const statements: InStatement[] = [];
+    const staged = new Map<string, string>();
     for (const record of records) {
-      const recordHashes = [...collectImageReferences(record)];
       statements.push({ sql: "DELETE FROM record_image_refs WHERE record_key = ?", args: [record.key] });
-      for (const hash of recordHashes) {
-        hashes.add(hash);
+      for (const hash of collectImageReferences(record)) {
         statements.push({ sql: "INSERT OR IGNORE INTO record_image_refs (record_key, image_hash) VALUES (?, ?)", args: [record.key, hash] });
+        const dataUrl = this.images.get(hash);
+        if (dataUrl) staged.set(hash, dataUrl);
       }
     }
-    for (const hash of hashes) {
-      const dataUrl = this.images.get(hash);
-      if (dataUrl) statements.push({ sql: "INSERT OR IGNORE INTO record_images (hash, data_url) VALUES (?, ?)", args: [hash, dataUrl] });
+    if (staged.size === 0) return statements;
+    const hashes = [...staged.keys()];
+    const stored = new Set(allRows<{ hash: string }>(await this.db.execute({
+      sql: `SELECT hash FROM record_images WHERE hash IN (${hashes.map(() => "?").join(", ")})`,
+      args: hashes,
+    })).map((row) => row.hash));
+    for (const [hash, dataUrl] of staged) {
+      if (!stored.has(hash)) statements.push({ sql: "INSERT OR IGNORE INTO record_images (hash, data_url) VALUES (?, ?)", args: [hash, dataUrl] });
     }
     return statements;
   }
@@ -819,35 +838,41 @@ class SqliteRecordStore implements RecordStoreLike {
     this.persistScheduled = true;
     queueMicrotask(() => {
       this.persistScheduled = false;
-      this.enqueueWrite(() => this.flush());
+      void this.enqueueWrite(() => this.persistQueued());
     });
   }
 
-  async flush() {
-    await this.waitForReady();
+  // Records, image rows and the trim go out as one batch: a single round trip per flush.
+  private async persistQueued() {
     if (this.persistQueue.size === 0) return;
     const records = Array.from(this.persistQueue.values());
     this.persistQueue.clear();
-    const statements = [...this.buildImageStatements(records), ...records.map((record) => this.buildRecordStatement(record))];
-    if (statements.length > 0) {
-      await this.db.batch(statements, "write");
-    }
-    await this.trimToLimit();
+    const [imageStatements, recordStatements] = await Promise.all([
+      this.buildImageStatements(records),
+      Promise.all(records.map((record) => this.buildRecordStatement(record))),
+    ]);
+    const results = await this.db.batch([...imageStatements, ...recordStatements, ...this.trimStatements()], "write");
+    this.capturedCount = countFromResult(results.at(-1));
     this.pruneStagedImages();
+  }
+
+  // Runs on the write queue, so readers that wait for queued writes also see these rows.
+  async flush() {
+    await this.enqueueWrite(() => this.persistQueued());
   }
 
   async start(options?: { maxSize?: number }) {
     this.limit = options?.maxSize ?? DEFAULT_RECORD_MAX_SIZE;
     this.enabled = true;
     if (!this.sessionStartedAt) this.sessionStartedAt = Date.now();
-    await this.trimToLimit();
+    await this.enqueueWrite(() => this.trimToLimit());
     return this.summary();
   }
 
   async configure(options?: { maxSize?: number }) {
     if (options?.maxSize !== undefined) {
       this.limit = options.maxSize;
-      await this.trimToLimit();
+      await this.enqueueWrite(() => this.trimToLimit());
     }
     return this.summary();
   }
@@ -861,7 +886,29 @@ class SqliteRecordStore implements RecordStoreLike {
 
   async summary(): Promise<RecordSummary> {
     await this.flush();
-    await this.evictOldestIfNeeded();
+    const volatileCount = this.activeRecords.size + this.persistQueue.size;
+    // One round trip: the row count, the newest rows to list and the oldest rows that in-flight records displace.
+    const [countResult, recentResult, oldestResult] = await this.db.batch([
+      "SELECT COUNT(*) AS count FROM records",
+      {
+        sql: `
+          SELECT key, request_id, created_at, path, model, actual_model, source, status, response_status
+          FROM records
+          ORDER BY created_at DESC, key DESC
+          LIMIT ?
+        `,
+        args: [this.limit],
+      },
+      {
+        sql: "SELECT key, created_at FROM records ORDER BY created_at ASC, key ASC LIMIT max((SELECT COUNT(*) FROM records) + ? - ?, 0)",
+        args: [volatileCount, this.limit],
+      },
+    ], "deferred");
+    const persistedCount = countFromResult(countResult);
+    const evictedKeys = new Set(await this.evictOldest(
+      persistedCount + volatileCount - this.limit,
+      allRows<{ key: string; created_at: number }>(oldestResult),
+    ));
     const rows = allRows<{
       key: string;
       request_id: string;
@@ -872,15 +919,7 @@ class SqliteRecordStore implements RecordStoreLike {
       source: RequestSource;
       status: RequestStatus;
       response_status?: number | null;
-    }>(await this.db.execute({
-      sql: `
-        SELECT key, request_id, created_at, path, model, actual_model, source, status, response_status
-        FROM records
-        ORDER BY created_at DESC, key DESC
-        LIMIT ?
-      `,
-      args: [this.limit],
-    }));
+    }>(recentResult).filter((row) => !evictedKeys.has(row.key));
     const volatileSummaries = [...this.activeRecords.values(), ...this.persistQueue.values()].map((record) => {
       const summary = updateSummaryFields(record);
       return {
@@ -899,7 +938,7 @@ class SqliteRecordStore implements RecordStoreLike {
     const combinedRows = [...volatileSummaries, ...rows.filter((row) => !volatileKeys.has(row.key))]
       .sort((a, b) => b.created_at - a.created_at || b.key.localeCompare(a.key))
       .slice(0, this.limit);
-    const size = Math.min(this.limit, (await this.countRecords()) + this.activeRecords.size + this.persistQueue.size);
+    const size = Math.min(this.limit, persistedCount - evictedKeys.size + this.activeRecords.size + this.persistQueue.size);
     this.capturedCount = size;
     return {
       enabled: this.enabled,
