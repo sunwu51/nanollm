@@ -24,7 +24,7 @@ import {
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { UnsupportedContentError } from "../src/converters/shared.js";
-import { denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
 import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
@@ -2712,6 +2712,127 @@ run("anthropic metadata keeps user_id and drops other OpenAI metadata keys", () 
   } as any) as any).metadata;
   assert.deepEqual(convert({ user_id: "u1", app: "demo" }), { user_id: "u1" });
   assert.equal(convert({ app: "demo" }), undefined);
+});
+
+run("response formats map between chat response_format and responses text.format", () => {
+  const schema = { type: "object", properties: { city: { type: "string" } }, required: ["city"], additionalProperties: false };
+  const pairs = [
+    [{ type: "text" }, { type: "text" }],
+    [{ type: "json_object" }, { type: "json_object" }],
+    [
+      { type: "json_schema", json_schema: { name: "place", description: "Where the user lives", schema, strict: true } },
+      { type: "json_schema", name: "place", description: "Where the user lives", schema, strict: true },
+    ],
+  ];
+  for (const [chatFormat, responsesFormat] of pairs) {
+    const responses = chatParamsToResponsesRequest({ model: "gpt-5", response_format: chatFormat, messages: [{ role: "user", content: "hi" }] } as any) as any;
+    assert.deepEqual(responses.text.format, responsesFormat);
+    const chat = responsesRequestToChatParams({ model: "gpt-5", input: "hi", text: { format: responsesFormat } } as any) as any;
+    assert.deepEqual(chat.response_format, chatFormat);
+  }
+  assert.equal((chatParamsToResponsesRequest({ model: "gpt-5", messages: [{ role: "user", content: "hi" }] } as any) as any).text, undefined);
+  assert.equal((responsesRequestToChatParams({ model: "gpt-5", input: "hi" } as any) as any).response_format, undefined);
+});
+
+run("json_schema response formats map to and from anthropic output_config.format", () => {
+  const wire = (value: unknown) => JSON.parse(JSON.stringify(value));
+  const schema = { type: "object", properties: { city: { type: "string" } }, required: ["city"], additionalProperties: false };
+  const fromChat = chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", reasoning_effort: "high", messages: [{ role: "user", content: "hi" }],
+    response_format: { type: "json_schema", json_schema: { name: "place", schema, strict: true } },
+  } as any) as any;
+  assert.deepEqual(fromChat.output_config, { format: { type: "json_schema", schema }, effort: "high" });
+  assert.equal(fromChat.messages.at(-1).content, "hi");
+  const fromResponses = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5", input: "hi", text: { format: { type: "json_schema", name: "place", schema, strict: true } },
+  } as any) as any;
+  assert.deepEqual(fromResponses.output_config, { format: { type: "json_schema", schema } });
+
+  const anthropic = { model: "test-model", max_tokens: 100, messages: [{ role: "user", content: "hi" }], output_config: { format: { type: "json_schema", schema } } };
+  assert.deepEqual(wire((anthropicMessageRequestToChatParams(anthropic as any) as any).response_format), { type: "json_schema", json_schema: { name: "anthropic_output", schema } });
+  assert.deepEqual(wire((anthropicMessageRequestToResponsesRequest(anthropic as any) as any).text.format), { type: "json_schema", name: "anthropic_output", schema });
+});
+
+run("json_object toward anthropic appends a JSON instruction after a cache breakpoint on the last user message", () => {
+  const wire = (value: unknown) => JSON.parse(JSON.stringify(value));
+  const instruction = { type: "text", text: ANTHROPIC_JSON_OBJECT_INSTRUCTION };
+  const breakpoint = { cache_control: { type: "ephemeral" } };
+  const chat = chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "Return the city as JSON." },
+      { role: "user", content: "I was born in Lyon" },
+      { role: "assistant", content: "Noted." },
+      { role: "user", content: "I live in Paris" },
+    ],
+  } as any) as any;
+  assert.equal(chat.output_config, undefined);
+  assert.deepEqual(chat.system, [{ type: "text", text: "Return the city as JSON." }]);
+  assert.equal(chat.messages[0].content, "I was born in Lyon");
+  assert.deepEqual(chat.messages.at(-1), { role: "user", content: [{ type: "text", text: "I live in Paris", ...breakpoint }, instruction] });
+  assert.deepEqual(chat.cache_control, { type: "ephemeral" });
+
+  const responses = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5", text: { format: { type: "json_object" } },
+    input: [{ role: "user", content: [{ type: "input_text", text: "Where is this?" }, { type: "input_image", image_url: "https://example.com/tower.png" }] }],
+  } as any) as any;
+  assert.deepEqual(wire(responses.messages), [{
+    role: "user",
+    content: [{ type: "text", text: "Where is this?" }, { type: "image", source: { type: "url", url: "https://example.com/tower.png" }, ...breakpoint }, instruction],
+  }]);
+
+  // Anthropic only allows text after tool_result blocks, so the instruction goes last in that user message.
+  const afterTool = chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", response_format: { type: "json_object" },
+    tools: [{ type: "function", function: { name: "weather", parameters: { type: "object" } } }],
+    messages: [
+      { role: "user", content: "Weather in Paris?" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "weather", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "sunny" },
+    ],
+  } as any) as any;
+  assert.deepEqual(wire(afterTool.messages.at(-1)), {
+    role: "user",
+    content: [{ type: "tool_result", tool_use_id: "call_1", is_error: false, content: "sunny", ...breakpoint }, instruction],
+  });
+
+  const afterAssistant = chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", response_format: { type: "json_object" },
+    messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "{}" }],
+  } as any) as any;
+  assert.deepEqual(afterAssistant.messages.at(-1), { role: "user", content: [{ type: "text", text: "go on", ...breakpoint }, instruction] });
+
+  for (const response_format of [undefined, { type: "text" }]) {
+    const plain = chatParamsToAnthropicMessageRequest({ model: "gpt-5", response_format, messages: [{ role: "user", content: "hi" }] } as any) as any;
+    assert.deepEqual(plain.messages, [{ role: "user", content: "hi" }]);
+    assert.equal(plain.output_config, undefined);
+  }
+});
+
+run("json_object toward anthropic lets the next turn read this turn's cache entry", () => {
+  const wire = (value: unknown) => JSON.parse(JSON.stringify(value));
+  const convert = (messages: any[]) => chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", response_format: { type: "json_object" },
+    messages: [{ role: "system", content: "Return the city as JSON." }, ...messages],
+  } as any) as any;
+  const blocks = (body: any) => body.messages.flatMap((message: any) =>
+    (typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content).map((block: any) => ({ role: message.role, ...block })));
+  const withoutBreakpoint = ({ cache_control, ...block }: any) => wire(block);
+
+  const turn1 = convert([{ role: "user", content: "I was born in Lyon" }]);
+  const turn2 = convert([
+    { role: "user", content: "I was born in Lyon" },
+    { role: "assistant", content: "{\"city\":\"Lyon\"}" },
+    { role: "user", content: "Now I live in Paris" },
+  ]);
+  // Anthropic writes a cache entry only at a breakpoint, so turn 2 can read turn 1's entry only if its prompt
+  // repeats turn 1's prompt up to that breakpoint. The instruction itself is never resent.
+  const turn1Blocks = blocks(turn1);
+  const end = turn1Blocks.findIndex((block: any) => block.cache_control) + 1;
+  assert.equal(end, turn1Blocks.length - 1);
+  assert.deepEqual(turn2.system, turn1.system);
+  assert.deepEqual(blocks(turn2).slice(0, end).map(withoutBreakpoint), turn1Blocks.slice(0, end).map(withoutBreakpoint));
+  assert.notDeepEqual(withoutBreakpoint(blocks(turn2)[end]), withoutBreakpoint(turn1Blocks[end]));
 });
 
 run("empty tool-call arguments become an empty anthropic input object", () => {

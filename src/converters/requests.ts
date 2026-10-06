@@ -355,12 +355,14 @@ export function denormalizeToAnthropicRequest(request: NormalizedRequest, option
     request.sourceFormat === "anthropic"
       ? filteredMessages
       : ensureAnthropicMessagesEndWithUser(reorderMessagesForAnthropicToolResults(filteredMessages));
+  const messages = mergeAnthropicMessages(anthropicMessages.flatMap((message) => denormalizeAnthropicMessage(message, request.sourceFormat === "anthropic", ignoreInvalidHistory)));
+  const cacheControl = request.cacheControl ?? { type: "ephemeral" };
 
   return {
     model: request.model,
     max_tokens: maxTokens,
     system: systemBlocks.length > 0 ? systemBlocks : undefined,
-    messages: mergeAnthropicMessages(anthropicMessages.flatMap((message) => denormalizeAnthropicMessage(message, request.sourceFormat === "anthropic", ignoreInvalidHistory))),
+    messages: request.responseFormat?.type === "json_object" ? appendAnthropicJsonObjectInstruction(messages, cacheControl) : messages,
     metadata: denormalizeAnthropicMetadata(request.metadata),
     service_tier: normalizeAnthropicServiceTier(request.serviceTier),
     stream: request.stream,
@@ -371,7 +373,7 @@ export function denormalizeToAnthropicRequest(request: NormalizedRequest, option
     tool_choice: denormalizeAnthropicToolChoice(request.toolChoice, request.parallelToolCalls, (request.tools?.length ?? 0) > 0),
     output_config: denormalizeAnthropicOutputConfig(request.responseFormat, request.reasoningEffort, request.thinkingBudgetTokens),
     thinking: denormalizeAnthropicThinking(request.reasoningEffort, request.thinkingBudgetTokens),
-    cache_control: request.cacheControl ?? { type: "ephemeral" },
+    cache_control: cacheControl,
   };
 }
 
@@ -1051,6 +1053,24 @@ function ensureAnthropicMessagesEndWithUser(messages: NormalizedMessage[]): Norm
   const last = messages.at(-1);
   if (!last || last.role === "user" || last.role === "tool" || last.role === "function") return messages;
   return [...messages, { role: "user", parts: [text("go on")] }];
+}
+
+export const ANTHROPIC_JSON_OBJECT_INSTRUCTION = "Reply with a single valid JSON object and nothing else: no Markdown code fences and no text before or after it.";
+
+/**
+ * Anthropic has no JSON mode, so json_object asks for a bare JSON object in a text block at the end of the last user message.
+ * Clients never resend that block, so the block before it gets a cache breakpoint: with only the automatic breakpoint on the
+ * instruction, the next turn's prompt would never match this turn's cache entry.
+ */
+function appendAnthropicJsonObjectInstruction(messages: MessageParam[], cacheControl: { type: string }): MessageParam[] {
+  const index = messages.findLastIndex((message) => message.role === "user");
+  if (index === -1) return messages;
+  const { content } = messages[index];
+  const blocks: any[] = typeof content === "string" ? [{ type: "text", text: content }] : [...content];
+  if (blocks.length > 0) blocks[blocks.length - 1] = { ...blocks.at(-1), cache_control: cacheControl };
+  const result = [...messages];
+  result[index] = { ...messages[index], content: [...blocks, { type: "text", text: ANTHROPIC_JSON_OBJECT_INSTRUCTION }] as any };
+  return result;
 }
 
 function reorderMessagesForOpenAIChatToolResults(messages: NormalizedMessage[]): NormalizedMessage[] {
