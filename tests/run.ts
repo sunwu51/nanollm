@@ -27,6 +27,8 @@ import { UnsupportedContentError } from "../src/converters/shared.js";
 import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
+import { webAuth } from "../src/core/web-auth.js";
+import { withWebUIAuth } from "../src/pages/login-page.js";
 import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
 import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
 import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/pages/admin-config-form.js";
@@ -208,32 +210,14 @@ function writeTempConfig(yaml: string): string {
 
 function buildAuthTestApp(token?: string) {
   const app = new Hono();
-  const authCookieName = "nanollm_auth";
-  app.use("*", async (c, next) => {
-    if (c.req.method === "OPTIONS") {
-      return next();
-    }
-    if (c.req.path === "/health") {
-      return next();
-    }
-    if (!token) {
-      return next();
-    }
-    const headerToken = extractBearerToken(c.req.header("authorization"));
-    const queryToken = c.req.query("token") || undefined;
-    const cookieToken = readAuthCookie(c.req.header("cookie"), authCookieName);
-    if (isAuthorizedToken(token, headerToken) || isAuthorizedToken(token, queryToken) || isAuthorizedToken(token, cookieToken)) {
-      c.header("Set-Cookie", `${authCookieName}=${buildAuthCookieValue(token)}; Path=/; HttpOnly; SameSite=Lax`);
-      return next();
-    }
-    c.header("WWW-Authenticate", "Bearer");
-    return c.json({ error: "Unauthorized" }, 401);
-  });
+  app.use("*", webAuth(() => token));
   app.get("/health", (c) => c.json({ ok: true }));
   app.get("/status", (c) => c.text("status-page"));
   app.get("/record", (c) => c.text("record-page"));
   app.post("/record/:requestId/replay", (c) => c.json({ ok: true, requestId: c.req.param("requestId") }));
   app.get("/admin", (c) => c.text("admin-page"));
+  app.get("/jobs", (c) => c.text("jobs-page"));
+  app.get("/admin/config/data", (c) => c.json({ ok: true }));
   app.get("/v1/models", (c) => c.json({ object: "list", data: [] }));
   return app;
 }
@@ -6666,10 +6650,11 @@ await runAsync("auth middleware leaves routes open when token is not configured"
 
 await runAsync("auth middleware rejects unauthenticated requests when token is configured", async () => {
   const app = buildAuthTestApp("top-secret");
-  for (const path of ["/v1/models", "/admin", "/status", "/record", "/record/abcdef/replay"]) {
+  for (const path of ["/v1/models", "/admin/config/data", "/status/data", "/record/abcdef/replay"]) {
     const response = await app.request("http://localhost" + path);
     assert.equal(response.status, 401);
     assert.equal(response.headers.get("www-authenticate"), "Bearer");
+    assert.equal(response.headers.get("x-nanollm-auth-required"), "1");
     assert.deepEqual(await response.json(), { error: "Unauthorized" });
   }
 
@@ -6678,7 +6663,94 @@ await runAsync("auth middleware rejects unauthenticated requests when token is c
   assert.deepEqual(await healthResponse.json(), { ok: true });
 });
 
-await runAsync("auth middleware accepts bearer header, query token, and options preflight", async () => {
+await runAsync("WebUI login redirects pages, validates passwords, and preserves safe return paths", async () => {
+  const app = buildAuthTestApp("top-secret");
+  for (const path of ["/admin", "/admin/config", "/status", "/record", "/jobs"]) {
+    const response = await app.request("http://localhost" + path);
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("location"), "/login?returnTo=" + encodeURIComponent(path));
+  }
+  const page = await app.request("http://localhost/login?returnTo=%2Frecord%3FrequestId%3Dabc");
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get("cache-control"), "no-store");
+  assert.match(await page.text(), /type="password"/);
+  const submit = (password: string, returnTo: string) => app.request("https://localhost/login", {
+    method: "POST",
+    body: new URLSearchParams({ password, returnTo }),
+  });
+  const failure = await submit("wrong", "/record?requestId=abc");
+  assert.equal(failure.status, 401);
+  assert.equal(failure.headers.get("set-cookie"), null);
+  assert.match(await failure.text(), /密码错误/);
+  const success = await submit("top-secret", "/record?requestId=abc&token=secret");
+  assert.equal(success.status, 303);
+  assert.equal(success.headers.get("location"), "/record?requestId=abc");
+  const cookie = success.headers.get("set-cookie") ?? "";
+  assert.match(cookie, /HttpOnly; SameSite=Lax; Max-Age=7776000; Secure/);
+  const revisit = await app.request("http://localhost/record", { headers: { Cookie: cookie.split(";")[0] } });
+  assert.equal(revisit.status, 200);
+  for (const target of ["https://evil.example", "//evil.example", "/\\evil.example", "/login", "/v1/models", "/admin/../login"]) {
+    const response = await submit("top-secret", target);
+    assert.equal(response.headers.get("location"), "/admin");
+  }
+  const expired = await app.request("http://localhost/status", { headers: { Cookie: "nanollm_auth=old-password" } });
+  assert.equal(expired.status, 302);
+  const signedIn = await app.request("http://localhost/login", { headers: { Cookie: "nanollm_auth=top-secret" } });
+  assert.equal(signedIn.status, 303);
+  const openApp = buildAuthTestApp();
+  assert.equal((await openApp.request("http://localhost/admin")).status, 200);
+  assert.equal((await openApp.request("http://localhost/login")).headers.get("location"), "/admin");
+});
+
+await runAsync("WebUI fetch redirects only same-origin unauthorized responses to login", async () => {
+  const navigations: string[] = [];
+  const html = withWebUIAuth("<html><head></head><body></body></html>");
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(script);
+  let status = 401;
+  let authRequired = true;
+  const window = { fetch: async (_input: unknown) => new Response("{}", { status, headers: authRequired ? { "X-Nanollm-Auth-Required": "1" } : {} }) };
+  vm.runInNewContext(script, {
+    window, Request, URL,
+    location: {
+      href: "http://localhost/record?requestId=abc&token=secret",
+      origin: "http://localhost",
+      replace: (url: string) => navigations.push(url),
+    },
+  });
+  await window.fetch("https://external.example/data");
+  assert.equal(navigations.length, 0);
+  status = 200;
+  await window.fetch("/record/summary");
+  assert.equal(navigations.length, 0);
+  status = 401;
+  authRequired = false;
+  await window.fetch("/admin/models/example/test");
+  assert.equal(navigations.length, 0);
+  authRequired = true;
+  const response = await window.fetch(new Request("http://localhost/record/summary"));
+  assert.equal(response.status, 401);
+  assert.deepEqual(navigations, ["/login?returnTo=%2Frecord%3FrequestId%3Dabc"]);
+});
+
+await runAsync("URL tokens do not authenticate WebUI or API requests", async () => {
+  const app = buildAuthTestApp("top-secret");
+  for (const path of ["/admin", "/admin/config", "/status", "/record", "/jobs"]) {
+    const response = await app.request("http://localhost" + path + "?token=top-secret");
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("location"), "/login?returnTo=" + encodeURIComponent(path));
+    assert.equal(response.headers.get("set-cookie"), null);
+  }
+  const login = await app.request("http://localhost/login?token=top-secret");
+  assert.equal(login.status, 200);
+  assert.equal(login.headers.get("set-cookie"), null);
+  assert.match(await login.text(), /type="password"/);
+  const api = await app.request("http://localhost/v1/models?token=top-secret");
+  assert.equal(api.status, 401);
+  assert.equal(api.headers.get("set-cookie"), null);
+});
+
+await runAsync("auth middleware accepts bearer header, cookie, and options preflight", async () => {
   const app = buildAuthTestApp("top-secret");
 
   const headerResponse = await app.request("http://localhost/v1/models", {
@@ -6686,10 +6758,6 @@ await runAsync("auth middleware accepts bearer header, query token, and options 
   });
   assert.equal(headerResponse.status, 200);
   assert.match(headerResponse.headers.get("set-cookie") ?? "", /nanollm_auth=top-secret/);
-
-  const queryResponse = await app.request("http://localhost/admin?token=top-secret");
-  assert.equal(queryResponse.status, 200);
-  assert.match(queryResponse.headers.get("set-cookie") ?? "", /nanollm_auth=top-secret/);
 
   const cookieResponse = await app.request("http://localhost/status", {
     headers: { Cookie: "nanollm_auth=top-secret" },

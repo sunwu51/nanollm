@@ -290,16 +290,18 @@ curl http://localhost:3000/v1/models \
 
 如果你用 OpenAI SDK 或兼容客户端，把这个 token 当成访问 nanollm 的 API key 即可。
 
-浏览器打开页面时，可以用一次性 URL token 入口：
+浏览器直接打开页面：
 
 ```text
-http://localhost:3000/admin?token=YOUR_TOKEN
-http://localhost:3000/status?token=YOUR_TOKEN
-http://localhost:3000/record?token=YOUR_TOKEN
-http://localhost:3000/jobs?token=YOUR_TOKEN
+http://localhost:3000/admin
+http://localhost:3000/status
+http://localhost:3000/record
+http://localhost:3000/jobs
 ```
 
-首次用 `?token=` 或 Bearer header 认证成功后，nanollm 会写入同源认证 cookie。之后同一浏览器里直接访问 `/admin`、`/status`、`/record`、`/jobs`，以及这些页面内部的 `fetch` 请求，都不需要再重复带 `?token=`。
+未配置访问密码时直接进入页面；配置了密码时，未登录会跳转到 `/login`，输入 `server.auth.token`（或环境变量 `NANOLLM_AUTH_TOKEN`）对应的访问密码后返回原页面。URL 中的 `?token=` 不再用于认证，旧链接在未登录时也会跳转到登录页。
+
+登录成功（或 Bearer header 认证成功）后，nanollm 会写入有效期为 90 天的同源 `HttpOnly` 认证 cookie，成功访问时续期，HTTPS 下启用 `Secure`。浏览器会自动携带 cookie，无需重复输入密码。cookie 失效或服务器密码变更后，页面及页面内请求会引导重新登录；API 客户端仍收到标准的 `401 Unauthorized` 响应。
 
 ### 动态请求体表达式
 

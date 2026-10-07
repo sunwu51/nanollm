@@ -275,16 +275,18 @@ curl http://localhost:3000/v1/models \
   -H "Authorization: Bearer $NANOLLM_AUTH_TOKEN"
 ```
 
-In a browser you can authenticate once through a URL token:
+In a browser, open the pages directly:
 
 ```text
-http://localhost:3000/admin?token=YOUR_TOKEN
-http://localhost:3000/status?token=YOUR_TOKEN
-http://localhost:3000/record?token=YOUR_TOKEN
-http://localhost:3000/jobs?token=YOUR_TOKEN
+http://localhost:3000/admin
+http://localhost:3000/status
+http://localhost:3000/record
+http://localhost:3000/jobs
 ```
 
-After the first successful `?token=` or Bearer authentication, nanollm sets a same-origin auth cookie, so later visits to `/admin`, `/status`, `/record` and `/jobs`, and the `fetch` calls made by those pages, no longer need `?token=`.
+Without a configured password, pages remain open. When authentication is enabled, unsigned visitors are redirected to `/login`; enter the access password configured through `server.auth.token` or `NANOLLM_AUTH_TOKEN` to return to the original page. URL query tokens (`?token=`) no longer authenticate requests, so old links also redirect to login when no valid cookie is present.
+
+Successful login (or Bearer authentication) sets a same-origin `HttpOnly` auth cookie lasting 90 days, renewed on successful access, with `Secure` enabled over HTTPS. The browser automatically sends this cookie for later visits and page requests. Expired cookies or password changes send WebUI users back to login; API clients still receive a standard `401 Unauthorized` response.
 
 ### Dynamic request body expression
 

@@ -33,7 +33,7 @@ A Railway account is needed to deploy this template. The template provisions two
 ### After deploying
 
 1. Copy `NANOLLM_AUTH_TOKEN` from the service's Variables tab.
-2. Open `https://YOUR_DOMAIN/admin?token=YOUR_TOKEN`, replacing `YOUR_DOMAIN` and `YOUR_TOKEN` with your service domain and generated token.
+2. Open `https://YOUR_DOMAIN/admin`, replacing `YOUR_DOMAIN` with your service domain, then enter the generated token on the login page.
 3. Add your providers and models, then save.
 4. Set your API client's base URL to `https://YOUR_DOMAIN/v1` and its API key to the generated token.
 
