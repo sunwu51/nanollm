@@ -365,7 +365,7 @@ export const USAGE_SCRIPT = String.raw`
         const unmatchedModels = [];
         for (const item of USAGE_DATA.modelUsage || []) {
           const modelId = String(item.upstreamModel || "").toLowerCase();
-          const price = findModelPrice(modelId);
+          const price = findModelPrice(modelId) || findModelPrice(String(item.name || "").toLowerCase());
           if (price) matchedCost += calculateModelCost(item.metrics, price);
           else {
             unmatchedCost += calculateModelCost(item.metrics, fallbackPrice);
