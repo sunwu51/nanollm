@@ -35,6 +35,7 @@
     <marker id="arrInk" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 Z" fill="#2e2350"/>
     </marker>
+    <clipPath id="frame"><rect width="1200" height="760" rx="28"/></clipPath>
     <path id="spark" d="M0,-10 Q1.5,-1.5 10,0 Q1.5,1.5 0,10 Q-1.5,1.5 -10,0 Q-1.5,-1.5 0,-10 Z"/>
     <g id="cloud">
       <circle cx="0" cy="0" r="22"/><circle cx="26" cy="-10" r="28"/><circle cx="56" cy="2" r="20"/><rect x="0" y="0" width="56" height="22"/>
@@ -56,6 +57,7 @@
   </style>
 
   <!-- background -->
+  <g clip-path="url(#frame)">
   <rect width="1200" height="760" rx="28" fill="url(#sky)"/>
   <rect x="0" y="0" width="300" height="200" fill="url(#dots)"/>
   <rect x="900" y="560" width="300" height="200" fill="url(#dots)"/>
@@ -73,6 +75,8 @@
     <use href="#spark" class="tw" fill="#ffd34d" transform="translate(560 40) scale(1.1)" style="animation-delay:1.6s"/>
     <use href="#spark" class="tw" fill="#ff8fc7" transform="translate(40 150) scale(.7)" style="animation-delay:.9s"/>
     <use href="#spark" class="tw" fill="#7c5cff" transform="translate(600 742) scale(.7)" style="animation-delay:1.9s"/>
+  </g>
+
   </g>
 
   <!-- title -->
@@ -283,16 +287,25 @@
 
   <!-- storage -->
   <g class="ink" stroke-width="2.5">
-    <path d="M86 612 V668 a26 9 0 0 0 52 0 V612" fill="#c4b5fd"/>
-    <ellipse cx="112" cy="612" rx="26" ry="9" fill="#ede9fe"/>
-    <path d="M86 631 a26 9 0 0 0 52 0 M86 650 a26 9 0 0 0 52 0" fill="none" stroke-width="2"/>
+    <path d="M78 588 V614 a17 6 0 0 0 34 0 V588" fill="#c4b5fd"/>
+    <ellipse cx="95" cy="588" rx="17" ry="6" fill="#ede9fe"/>
+    <path d="M78 601 a17 6 0 0 0 34 0" fill="none" stroke-width="2"/>
   </g>
-  <text x="156" y="608" font-size="18" class="h">storage</text>
-  <text x="156" y="630" font-size="12" class="mono" style="fill:#6b5aa6">SQLite · Turso (libsql)</text>
-  <g font-size="12.5" font-weight="700">
-    <text x="156" y="660">♡ request records</text>
-    <text x="156" y="680">♡ status buckets</text>
-    <text x="156" y="700">♡ usage by day</text>
+  <text x="124" y="601" font-size="18" class="h">storage</text>
+  <text x="124" y="619" font-size="11" class="mono" style="fill:#6b5aa6">records · status · usage</text>
+
+  <g class="ink" stroke-width="2.5">
+    <rect x="76" y="632" width="104" height="70" rx="12" fill="#fff3ea"/>
+    <rect x="190" y="632" width="194" height="70" rx="12" fill="#ede9fe"/>
+    <rect x="96" y="660" width="64" height="18" rx="9" fill="#fde68a" stroke-width="2"/>
+  </g>
+  <text x="128" y="653" font-size="14" class="h" text-anchor="middle">memory</text>
+  <text x="128" y="673" font-size="10.5" font-weight="800" text-anchor="middle">★ default</text>
+  <text x="128" y="694" font-size="11" font-weight="700" text-anchor="middle" style="fill:#6b5aa6">gone on exit</text>
+  <text x="202" y="652" font-size="12" class="mono h">--storage sqlite</text>
+  <g font-size="11.5" font-weight="700">
+    <text x="202" y="672">▸ local file <tspan class="mono" font-size="10" style="fill:#6b5aa6;font-family:ui-monospace,Consolas,monospace">~/.nanollm/</tspan></text>
+    <text x="202" y="691">▸ remote libSQL <tspan font-size="10.5" style="fill:#6b5aa6">(sqld, Turso…)</tspan></text>
   </g>
 
   <!-- pages -->
