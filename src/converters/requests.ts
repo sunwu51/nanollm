@@ -340,7 +340,7 @@ export function denormalizeToOpenAIResponsesRequest(request: NormalizedRequest):
 export function denormalizeToAnthropicRequest(request: NormalizedRequest, options?: AnthropicRequestConversionOptions): MessageCreateParamsBase {
   const systemBlocks: { type: "text"; text: string }[] = [];
   const filteredMessages: NormalizedMessage[] = [];
-  const maxTokens = request.maxOutputTokens ?? options?.defaultMaxOutputTokens ?? 32000;
+  const maxTokens = request.maxOutputTokens ?? options?.defaultMaxOutputTokens ?? 128000;
   const ignoreInvalidHistory = options?.ignoreInvalidHistory ?? true;
   
   for (const message of request.messages) {

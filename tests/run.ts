@@ -2849,7 +2849,7 @@ run("chat medium reasoning maps to anthropic adaptive thinking", () => {
     messages: [{ role: "user", content: "hi" }],
   });
 
-  assert.equal(anthropic.max_tokens, 32000);
+  assert.equal(anthropic.max_tokens, 128000);
   assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
 });
 
@@ -4446,9 +4446,9 @@ run("claude subscription temperature default excludes Opus 5.5 and preserves exp
   assert.equal((sanitizeClaudeSubscriptionBody({ model: "claude-sonnet-5-5" }) as any).temperature, 1);
 });
 
-run("claude subscription conversion uses 128k default without changing regular API or explicit limits", () => {
+run("claude subscription conversion uses 128k default without changing explicit limits", () => {
   const request = normalizeOpenAIResponsesRequest({ model: "claude-sonnet-4-6", input: "hello" } as any);
-  assert.equal(denormalizeToAnthropicRequest(request).max_tokens, 32000);
+  assert.equal(denormalizeToAnthropicRequest(request).max_tokens, 128000);
   assert.equal(denormalizeToAnthropicRequest(request, { defaultMaxOutputTokens: CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS }).max_tokens, 128000);
   request.maxOutputTokens = 2048;
   assert.equal(denormalizeToAnthropicRequest(request, { defaultMaxOutputTokens: CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS }).max_tokens, 2048);
@@ -6205,7 +6205,7 @@ run("model test builds provider-native streaming requests", () => {
   assert.deepEqual(responses.body.input, [{ role: "user", content: [{ type: "input_text", text: "hi" }] }]);
   const anthropic = buildModelTestRequest("anthropic", "gamma", "hi");
   assert.equal(anthropic.path, "/v1/messages");
-  assert.equal(anthropic.body.max_tokens, 1024);
+  assert.equal(anthropic.body.max_tokens, 128000);
   assert.throws(() => buildModelTestRequest("openai-image", "img", "hi"), /not supported/);
 });
 
