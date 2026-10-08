@@ -1,5 +1,5 @@
 import type { SqliteClient } from "./sqlite.js";
-import { allRows, enqueueClientWrite, firstRow, waitForClientWrites } from "./sqlite.js";
+import { allRows, enqueueClientStatements, firstRow, waitForClientWrites } from "./sqlite.js";
 import type { NormalizedUsage } from "../converters/shared.js";
 
 export interface UsageDayMetrics {
@@ -231,21 +231,14 @@ export class SqliteUsageStore implements UsageStoreLike {
     await this.backfillFromStatusBuckets();
   }
 
-  private enqueueWrite(task: () => Promise<void>) {
-    enqueueClientWrite(this.db, async () => {
-      await this.ready;
-      await task();
-    });
-  }
-
   private async waitForWrites() {
     await this.ready;
     await waitForClientWrites(this.db);
   }
 
-  private async addMetrics(modelName: string, timestamp: number, delta: Partial<UsageDayMetrics>) {
+  private addMetrics(modelName: string, timestamp: number, delta: Partial<UsageDayMetrics>) {
     const day = formatLocalDay(timestamp);
-    await this.db.execute({
+    enqueueClientStatements(this.db, [{
       sql: `
       INSERT INTO usage_days (
         day,
@@ -287,29 +280,29 @@ export class SqliteUsageStore implements UsageStoreLike {
         delta.outputTokens ?? 0,
         delta.totalTokens ?? 0,
       ],
-    });
+    }], this.ready);
   }
 
   recordAttempt(modelName: string, timestamp = Date.now()) {
-    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, { totalRequests: 1 }));
+    this.addMetrics(modelName, timestamp, { totalRequests: 1 });
   }
 
   recordSuccess(modelName: string, durationMs: number, usage?: NormalizedUsage, timestamp = Date.now()) {
-    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, {
+    this.addMetrics(modelName, timestamp, {
       successRequests: 1,
       totalDurationMs: durationMs,
       durationSamples: 1,
       ...buildTokenDelta(usage),
-    }));
+    });
   }
 
   recordFailure(modelName: string, durationMs?: number, timestamp = Date.now()) {
-    this.enqueueWrite(() => this.addMetrics(modelName, timestamp, {
+    this.addMetrics(modelName, timestamp, {
       failureRequests: 1,
       ...(typeof durationMs === "number" && Number.isFinite(durationMs)
         ? { totalDurationMs: durationMs, durationSamples: 1 }
         : {}),
-    }));
+    });
   }
 
   async listDays(query: UsageQuery): Promise<UsageDayCell[]> {

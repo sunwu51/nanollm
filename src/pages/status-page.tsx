@@ -733,7 +733,13 @@ const SCRIPT = String.raw`
       });
 
       render(currentHours);
-      setInterval(refreshStatus, REFRESH_INTERVAL_MS);
+      // Every refresh queries the database, so a hidden tab skips them and catches up once it is shown again.
+      setInterval(() => {
+        if (!document.hidden) refreshStatus();
+      }, REFRESH_INTERVAL_MS);
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) refreshStatus();
+      });
 `;
 
 function StatusPage({ payload }: { payload: StatusPagePayload }) {

@@ -10,7 +10,8 @@ import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { randomUUID } from "node:crypto";
 import type { ModelConfig, ServerConfig } from "./src/core/config.js";
-import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "./src/core/auth.js";
+import { webAuth } from "./src/core/web-auth.js";
+import { withWebUIAuth } from "./src/pages/login-page.js";
 import { getPublicModelNames, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
 import { ConfigManager } from "./src/core/config-manager.js";
 import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy/proxy.js";
@@ -155,7 +156,6 @@ configManager.onUpdate(({ snapshot }, source) => {
   }
 });
 const app = new Hono();
-const AUTH_COOKIE_NAME = "nanollm_auth";
 const apiCors = cors({
   origin: "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
@@ -206,33 +206,7 @@ app.use("*", async (c, next) => {
   return apiCors(c, next);
 });
 
-app.use("*", async (c, next) => {
-  if (c.req.method === "OPTIONS") {
-    return next();
-  }
-  if (c.req.path === "/health") {
-    return next();
-  }
-
-  const authToken = configManager.getActiveSnapshot().effectiveConfig.auth?.token;
-  if (!authToken) {
-    return next();
-  }
-
-  const headerToken = extractBearerToken(c.req.header("authorization"));
-  const queryToken = c.req.query("token") || undefined;
-  const cookieToken = readAuthCookie(c.req.header("cookie"), AUTH_COOKIE_NAME);
-  if (
-    isAuthorizedToken(authToken, headerToken) ||
-    isAuthorizedToken(authToken, queryToken) ||
-    isAuthorizedToken(authToken, cookieToken)
-  ) {
-    persistAuthCookie(c, authToken);
-    return next();
-  }
-
-  return unauthorizedResponse(c);
-});
+app.use("*", webAuth(() => configManager.getActiveSnapshot().effectiveConfig.auth?.token));
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -276,18 +250,6 @@ function writeConfigAtomic(path: string, text: string) {
   const tempPath = `${path}.${randomUUID()}.tmp`;
   writeFileSync(tempPath, text, "utf-8");
   renameSync(tempPath, path);
-}
-
-function unauthorizedResponse(c: Context) {
-  c.header("WWW-Authenticate", "Bearer");
-  return c.json({ error: "Unauthorized" }, 401);
-}
-
-function persistAuthCookie(c: Context, token: string) {
-  c.header(
-    "Set-Cookie",
-    `${AUTH_COOKIE_NAME}=${buildAuthCookieValue(token)}; Path=/; HttpOnly; SameSite=Lax`,
-  );
 }
 
 function getNormalizer(format: StreamFormat): Normalizer {
@@ -1267,9 +1229,9 @@ app.get("/", (c) => {
 
 app.get("/health", (c) => c.json({ ok: true }));
 
-app.get("/status", async (c) => c.html(renderStatusPage(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c))));
+app.get("/status", async (c) => c.html(withWebUIAuth(renderStatusPage(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c)))));
 app.get("/status/data", async (c) => c.json(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c)));
-app.get("/record", async (c) => c.html(renderRecordPage(await getRecordSummary())));
+app.get("/record", async (c) => c.html(withWebUIAuth(renderRecordPage(await getRecordSummary()))));
 app.get("/record/summary", async (c) => c.json(await getRecordSummary()));
 app.get("/record/:requestId", async (c) => {
   const requestId = c.req.param("requestId");
@@ -1314,8 +1276,8 @@ app.post("/record/:requestId/replay", async (c) => {
   }, result.status);
 });
 
-app.get("/admin", (c) => c.html(renderAdminConfigPage(buildConfigAdminPayload())));
-app.get("/jobs", (c) => c.html(renderJobsPage()));
+app.get("/admin", (c) => c.html(withWebUIAuth(renderAdminConfigPage(buildConfigAdminPayload()))));
+app.get("/jobs", (c) => c.html(withWebUIAuth(renderJobsPage())));
 app.route("/jobs/api", createJobRoutes(jobScheduler,
   () => configManager.getActiveSnapshot().effectiveConfig.models, storageMode, jobModelCatalog));
 app.post("/admin/providers/:name/device-login", async (c) => {
@@ -1379,9 +1341,7 @@ app.post("/admin/providers/:name/device-login/:sessionId/poll", async (c) => {
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 400); }
 });
 app.get("/admin/config", (c) => {
-  const token = c.req.query("token");
-  const target = token ? `/admin?token=${encodeURIComponent(token)}` : "/admin";
-  return c.redirect(target, 302);
+  return c.redirect("/admin", 302);
 });
 app.get("/admin/config/data", (c) => c.json(buildConfigAdminPayload()));
 app.post("/admin/models/:name/test", async (c) => {

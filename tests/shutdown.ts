@@ -5,6 +5,9 @@ import http from "node:http";
 import { test } from "node:test";
 import { resolveShutdownTimeoutMs } from "../src/core/shutdown.js";
 
+// Windows has no POSIX signals: child.kill("SIGTERM"/"SIGINT") ends the child before its handlers run.
+const skipSignalTests = process.platform === "win32" && "Windows cannot deliver a catchable SIGTERM/SIGINT to a child process";
+
 async function startFixture(t: { after: (fn: () => void) => void }, mode = "normal", timeoutMs = 1_000) {
   const moduleUrl = new URL("../src/core/shutdown.js", import.meta.url).href;
   const child = spawn(process.execPath, ["--input-type=module", "--eval", `
@@ -57,7 +60,7 @@ test("shutdown timeout rejects invalid values", () => {
 });
 
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
-  test(`idle server exits cleanly on ${signal} after flushing`, { timeout: 10_000 }, async (t) => {
+  test(`idle server exits cleanly on ${signal} after flushing`, { timeout: 10_000, skip: skipSignalTests }, async (t) => {
     const fixture = await startFixture(t);
     fixture.child.kill(signal);
     assert.deepEqual(await fixture.exited, [0, null]);
@@ -67,7 +70,7 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
   });
 }
 
-test("SIGTERM allows an active request to finish and ignores repeated signals", { timeout: 10_000 }, async (t) => {
+test("SIGTERM allows an active request to finish and ignores repeated signals", { timeout: 10_000, skip: skipSignalTests }, async (t) => {
   const fixture = await startFixture(t);
   // Wait until the server has accepted the request, then initiate shutdown.
   const started = new Promise<void>((resolve) => {
@@ -94,7 +97,7 @@ test("SIGTERM allows an active request to finish and ignores repeated signals", 
   assert.equal(fixture.output().split("Received SIGTERM").length - 1, 1);
 });
 
-test("an endless SSE connection is cut off within the drain deadline", { timeout: 10_000 }, async (t) => {
+test("an endless SSE connection is cut off within the drain deadline", { timeout: 10_000, skip: skipSignalTests }, async (t) => {
   const fixture = await startFixture(t, "normal", 500);
   const response = await request(fixture.port, "/stream");
   response.on("error", () => {}); // Expected when shutdown cuts off the stream.
@@ -108,7 +111,7 @@ test("an endless SSE connection is cut off within the drain deadline", { timeout
 });
 
 for (const mode of ["fail", "hang"]) {
-  test(`cleanup ${mode} remains a real failure`, { timeout: 10_000 }, async (t) => {
+  test(`cleanup ${mode} remains a real failure`, { timeout: 10_000, skip: skipSignalTests }, async (t) => {
     const fixture = await startFixture(t, mode, 500);
     fixture.child.kill("SIGTERM");
     assert.deepEqual(await fixture.exited, [1, null]);

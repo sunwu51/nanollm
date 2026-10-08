@@ -24,9 +24,11 @@ import {
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { UnsupportedContentError } from "../src/converters/shared.js";
-import { denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
+import { webAuth } from "../src/core/web-auth.js";
+import { withWebUIAuth } from "../src/pages/login-page.js";
 import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
 import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
 import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/pages/admin-config-form.js";
@@ -52,6 +54,7 @@ import {
   configureRecording,
   ensureRecordedAttempt,
   finalizeRecordedRequest,
+  flushRecording,
   getRecordedImage,
   getRecordedRequest,
   getRecordSummary,
@@ -71,11 +74,30 @@ import { shouldIgnoreStreamReadError } from "../src/core/stream-errors.js";
 import { extractErrorCauses, formatErrorWithCauses } from "../src/core/error-details.js";
 import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/storage/usage.js";
 import { normalizeUsage } from "../src/converters/shared.js";
-import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch } from "../src/storage/sqlite.js";
+import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch, waitForClientWrites } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
 
 function createTestSqliteClient(path: string): Client {
   return createClient({ url: `file:${path}`, intMode: "number", timeout: 5000 });
+}
+
+// Logs every round trip (execute, batch, executeMultiple) with the SQL it carries.
+function recordClientCalls(client: Client) {
+  const calls: Array<{ method: string; sql: string[] }> = [];
+  const sqlOf = (statement: unknown) => typeof statement === "string" ? statement : String((statement as { sql: string }).sql);
+  const recorded = new Proxy(client, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (property === "execute" || property === "batch" || property === "executeMultiple") {
+        return (...args: unknown[]) => {
+          calls.push({ method: property, sql: property === "batch" ? (args[0] as unknown[]).map(sqlOf) : [sqlOf(args[0])] });
+          return value.apply(target, args);
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { client: recorded, calls };
 }
 
 function removeTestDir(path: string) {
@@ -188,32 +210,14 @@ function writeTempConfig(yaml: string): string {
 
 function buildAuthTestApp(token?: string) {
   const app = new Hono();
-  const authCookieName = "nanollm_auth";
-  app.use("*", async (c, next) => {
-    if (c.req.method === "OPTIONS") {
-      return next();
-    }
-    if (c.req.path === "/health") {
-      return next();
-    }
-    if (!token) {
-      return next();
-    }
-    const headerToken = extractBearerToken(c.req.header("authorization"));
-    const queryToken = c.req.query("token") || undefined;
-    const cookieToken = readAuthCookie(c.req.header("cookie"), authCookieName);
-    if (isAuthorizedToken(token, headerToken) || isAuthorizedToken(token, queryToken) || isAuthorizedToken(token, cookieToken)) {
-      c.header("Set-Cookie", `${authCookieName}=${buildAuthCookieValue(token)}; Path=/; HttpOnly; SameSite=Lax`);
-      return next();
-    }
-    c.header("WWW-Authenticate", "Bearer");
-    return c.json({ error: "Unauthorized" }, 401);
-  });
+  app.use("*", webAuth(() => token));
   app.get("/health", (c) => c.json({ ok: true }));
   app.get("/status", (c) => c.text("status-page"));
   app.get("/record", (c) => c.text("record-page"));
   app.post("/record/:requestId/replay", (c) => c.json({ ok: true, requestId: c.req.param("requestId") }));
   app.get("/admin", (c) => c.text("admin-page"));
+  app.get("/jobs", (c) => c.text("jobs-page"));
+  app.get("/admin/config/data", (c) => c.json({ ok: true }));
   app.get("/v1/models", (c) => c.json({ object: "list", data: [] }));
   return app;
 }
@@ -2694,6 +2698,127 @@ run("anthropic metadata keeps user_id and drops other OpenAI metadata keys", () 
   assert.equal(convert({ app: "demo" }), undefined);
 });
 
+run("response formats map between chat response_format and responses text.format", () => {
+  const schema = { type: "object", properties: { city: { type: "string" } }, required: ["city"], additionalProperties: false };
+  const pairs = [
+    [{ type: "text" }, { type: "text" }],
+    [{ type: "json_object" }, { type: "json_object" }],
+    [
+      { type: "json_schema", json_schema: { name: "place", description: "Where the user lives", schema, strict: true } },
+      { type: "json_schema", name: "place", description: "Where the user lives", schema, strict: true },
+    ],
+  ];
+  for (const [chatFormat, responsesFormat] of pairs) {
+    const responses = chatParamsToResponsesRequest({ model: "gpt-5", response_format: chatFormat, messages: [{ role: "user", content: "hi" }] } as any) as any;
+    assert.deepEqual(responses.text.format, responsesFormat);
+    const chat = responsesRequestToChatParams({ model: "gpt-5", input: "hi", text: { format: responsesFormat } } as any) as any;
+    assert.deepEqual(chat.response_format, chatFormat);
+  }
+  assert.equal((chatParamsToResponsesRequest({ model: "gpt-5", messages: [{ role: "user", content: "hi" }] } as any) as any).text, undefined);
+  assert.equal((responsesRequestToChatParams({ model: "gpt-5", input: "hi" } as any) as any).response_format, undefined);
+});
+
+run("json_schema response formats map to and from anthropic output_config.format", () => {
+  const wire = (value: unknown) => JSON.parse(JSON.stringify(value));
+  const schema = { type: "object", properties: { city: { type: "string" } }, required: ["city"], additionalProperties: false };
+  const fromChat = chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", reasoning_effort: "high", messages: [{ role: "user", content: "hi" }],
+    response_format: { type: "json_schema", json_schema: { name: "place", schema, strict: true } },
+  } as any) as any;
+  assert.deepEqual(fromChat.output_config, { format: { type: "json_schema", schema }, effort: "high" });
+  assert.equal(fromChat.messages.at(-1).content, "hi");
+  const fromResponses = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5", input: "hi", text: { format: { type: "json_schema", name: "place", schema, strict: true } },
+  } as any) as any;
+  assert.deepEqual(fromResponses.output_config, { format: { type: "json_schema", schema } });
+
+  const anthropic = { model: "test-model", max_tokens: 100, messages: [{ role: "user", content: "hi" }], output_config: { format: { type: "json_schema", schema } } };
+  assert.deepEqual(wire((anthropicMessageRequestToChatParams(anthropic as any) as any).response_format), { type: "json_schema", json_schema: { name: "anthropic_output", schema } });
+  assert.deepEqual(wire((anthropicMessageRequestToResponsesRequest(anthropic as any) as any).text.format), { type: "json_schema", name: "anthropic_output", schema });
+});
+
+run("json_object toward anthropic appends a JSON instruction after a cache breakpoint on the last user message", () => {
+  const wire = (value: unknown) => JSON.parse(JSON.stringify(value));
+  const instruction = { type: "text", text: ANTHROPIC_JSON_OBJECT_INSTRUCTION };
+  const breakpoint = { cache_control: { type: "ephemeral" } };
+  const chat = chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: "Return the city as JSON." },
+      { role: "user", content: "I was born in Lyon" },
+      { role: "assistant", content: "Noted." },
+      { role: "user", content: "I live in Paris" },
+    ],
+  } as any) as any;
+  assert.equal(chat.output_config, undefined);
+  assert.deepEqual(chat.system, [{ type: "text", text: "Return the city as JSON." }]);
+  assert.equal(chat.messages[0].content, "I was born in Lyon");
+  assert.deepEqual(chat.messages.at(-1), { role: "user", content: [{ type: "text", text: "I live in Paris", ...breakpoint }, instruction] });
+  assert.deepEqual(chat.cache_control, { type: "ephemeral" });
+
+  const responses = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-5", text: { format: { type: "json_object" } },
+    input: [{ role: "user", content: [{ type: "input_text", text: "Where is this?" }, { type: "input_image", image_url: "https://example.com/tower.png" }] }],
+  } as any) as any;
+  assert.deepEqual(wire(responses.messages), [{
+    role: "user",
+    content: [{ type: "text", text: "Where is this?" }, { type: "image", source: { type: "url", url: "https://example.com/tower.png" }, ...breakpoint }, instruction],
+  }]);
+
+  // Anthropic only allows text after tool_result blocks, so the instruction goes last in that user message.
+  const afterTool = chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", response_format: { type: "json_object" },
+    tools: [{ type: "function", function: { name: "weather", parameters: { type: "object" } } }],
+    messages: [
+      { role: "user", content: "Weather in Paris?" },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "weather", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "sunny" },
+    ],
+  } as any) as any;
+  assert.deepEqual(wire(afterTool.messages.at(-1)), {
+    role: "user",
+    content: [{ type: "tool_result", tool_use_id: "call_1", is_error: false, content: "sunny", ...breakpoint }, instruction],
+  });
+
+  const afterAssistant = chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", response_format: { type: "json_object" },
+    messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "{}" }],
+  } as any) as any;
+  assert.deepEqual(afterAssistant.messages.at(-1), { role: "user", content: [{ type: "text", text: "go on", ...breakpoint }, instruction] });
+
+  for (const response_format of [undefined, { type: "text" }]) {
+    const plain = chatParamsToAnthropicMessageRequest({ model: "gpt-5", response_format, messages: [{ role: "user", content: "hi" }] } as any) as any;
+    assert.deepEqual(plain.messages, [{ role: "user", content: "hi" }]);
+    assert.equal(plain.output_config, undefined);
+  }
+});
+
+run("json_object toward anthropic lets the next turn read this turn's cache entry", () => {
+  const wire = (value: unknown) => JSON.parse(JSON.stringify(value));
+  const convert = (messages: any[]) => chatParamsToAnthropicMessageRequest({
+    model: "gpt-5", response_format: { type: "json_object" },
+    messages: [{ role: "system", content: "Return the city as JSON." }, ...messages],
+  } as any) as any;
+  const blocks = (body: any) => body.messages.flatMap((message: any) =>
+    (typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content).map((block: any) => ({ role: message.role, ...block })));
+  const withoutBreakpoint = ({ cache_control, ...block }: any) => wire(block);
+
+  const turn1 = convert([{ role: "user", content: "I was born in Lyon" }]);
+  const turn2 = convert([
+    { role: "user", content: "I was born in Lyon" },
+    { role: "assistant", content: "{\"city\":\"Lyon\"}" },
+    { role: "user", content: "Now I live in Paris" },
+  ]);
+  // Anthropic writes a cache entry only at a breakpoint, so turn 2 can read turn 1's entry only if its prompt
+  // repeats turn 1's prompt up to that breakpoint. The instruction itself is never resent.
+  const turn1Blocks = blocks(turn1);
+  const end = turn1Blocks.findIndex((block: any) => block.cache_control) + 1;
+  assert.equal(end, turn1Blocks.length - 1);
+  assert.deepEqual(turn2.system, turn1.system);
+  assert.deepEqual(blocks(turn2).slice(0, end).map(withoutBreakpoint), turn1Blocks.slice(0, end).map(withoutBreakpoint));
+  assert.notDeepEqual(withoutBreakpoint(blocks(turn2)[end]), withoutBreakpoint(turn1Blocks[end]));
+});
+
 run("empty tool-call arguments become an empty anthropic input object", () => {
   const request = chatParamsToAnthropicMessageRequest({
     model: "gpt-4o-mini",
@@ -2724,7 +2849,7 @@ run("chat medium reasoning maps to anthropic adaptive thinking", () => {
     messages: [{ role: "user", content: "hi" }],
   });
 
-  assert.equal(anthropic.max_tokens, 32000);
+  assert.equal(anthropic.max_tokens, 128000);
   assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
 });
 
@@ -4321,9 +4446,9 @@ run("claude subscription temperature default excludes Opus 5.5 and preserves exp
   assert.equal((sanitizeClaudeSubscriptionBody({ model: "claude-sonnet-5-5" }) as any).temperature, 1);
 });
 
-run("claude subscription conversion uses 128k default without changing regular API or explicit limits", () => {
+run("claude subscription conversion uses 128k default without changing explicit limits", () => {
   const request = normalizeOpenAIResponsesRequest({ model: "claude-sonnet-4-6", input: "hello" } as any);
-  assert.equal(denormalizeToAnthropicRequest(request).max_tokens, 32000);
+  assert.equal(denormalizeToAnthropicRequest(request).max_tokens, 128000);
   assert.equal(denormalizeToAnthropicRequest(request, { defaultMaxOutputTokens: CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS }).max_tokens, 128000);
   request.maxOutputTokens = 2048;
   assert.equal(denormalizeToAnthropicRequest(request, { defaultMaxOutputTokens: CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS }).max_tokens, 2048);
@@ -4822,6 +4947,45 @@ await runAsync("remote sqlite never sends the write when wake probes are exhaust
   assert.equal(requests, 3);
 });
 
+await runAsync("remote sqlite probes again only after the server goes quiet or a request fails", async () => {
+  const seen: string[] = [];
+  let failWrite = false;
+  await withHTTPServer((req, res) => {
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      const sql = JSON.parse(body).requests[0].stmt.sql as string;
+      seen.push(sql);
+      if (failWrite && sql !== "SELECT 1") { res.statusCode = 502; res.end("Result unknown"); return; }
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ baton: null, base_url: null, results: [
+        { type: "ok", response: { type: "execute", result: { cols: [], rows: [], affected_row_count: 1, last_insert_rowid: null } } },
+        { type: "ok", response: { type: "close" } },
+      ] }));
+    });
+  }, async baseURL => {
+    const client = createClient({ url: baseURL, fetch: createSqliteWakeFetch(baseURL, undefined, { delayMs: 0, maxAttempts: 3 }) });
+    try {
+      await client.execute("UPDATE a SET n = n + 1");
+      await client.execute("UPDATE b SET n = n + 1");
+      assert.deepEqual(seen, ["SELECT 1", "UPDATE a SET n = n + 1", "UPDATE b SET n = n + 1"]);
+      failWrite = true;
+      await assert.rejects(client.execute("UPDATE c SET n = n + 1"));
+      failWrite = false;
+      await client.execute("UPDATE d SET n = n + 1");
+      assert.deepEqual(seen.slice(3), ["UPDATE c SET n = n + 1", "SELECT 1", "UPDATE d SET n = n + 1"]);
+    } finally { client.close(); }
+
+    seen.length = 0;
+    const quiet = createClient({ url: baseURL, fetch: createSqliteWakeFetch(baseURL, undefined, { delayMs: 0, maxAttempts: 3, idleMs: 0 }) });
+    try {
+      await quiet.execute("UPDATE a SET n = n + 1");
+      await quiet.execute("UPDATE b SET n = n + 1");
+      assert.deepEqual(seen, ["SELECT 1", "UPDATE a SET n = n + 1", "SELECT 1", "UPDATE b SET n = n + 1"]);
+    } finally { quiet.close(); }
+  });
+});
+
 await runAsync("sqlite status store persists sparse buckets for a month while UI series stays at 6 hours", async () => {
   const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-status-"));
   const db = createTestSqliteClient(join(dir, "status.sqlite3"));
@@ -5028,6 +5192,36 @@ await runAsync("sqlite usage store migrates cache write column for existing data
     store.recordAttempt("new", timestamp);
     store.recordSuccess("new", 10, { cacheWriteInputTokens: 7 }, timestamp);
     assert.equal((await store.getModelDay("new", "2026-01-02"))?.cacheWriteInputTokens, 7);
+  } finally {
+    db.close();
+    removeTestDir(dir);
+  }
+});
+
+await runAsync("sqlite status and usage counters of one event share a single write batch", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-counter-batch-"));
+  const db = createTestSqliteClient(join(dir, "counters.sqlite3"));
+  const { client, calls } = recordClientCalls(db);
+  try {
+    const now = Date.now();
+    const day = formatLocalDay(now);
+    const status = new SqliteStatusStore(client);
+    const usage = new SqliteUsageStore(client);
+    await status.listModelNames(now);
+    await usage.listModelNames({ start: day, end: day });
+    calls.length = 0;
+
+    status.recordAttempt("alpha", now);
+    usage.recordAttempt("alpha", now);
+    status.recordAttempt("alpha", now - 31 * 24 * 60 * 60 * 1000);
+    await waitForClientWrites(client);
+    // No per-write prune: the expired bucket is dropped before it is written.
+    assert.deepEqual(calls.map((call) => call.method), ["batch"]);
+    assert.equal(calls[0].sql.length, 2);
+    assert.match(calls[0].sql[0], /INSERT INTO status_buckets/);
+    assert.match(calls[0].sql[1], /INSERT INTO usage_days/);
+    assert.equal((await status.getModelSeries("alpha", now)).at(-1)?.totalRequests, 1);
+    assert.equal((await usage.getModelDay("alpha", day))?.totalRequests, 1);
   } finally {
     db.close();
     removeTestDir(dir);
@@ -5707,6 +5901,100 @@ await runAsync("sqlite record store restores compacted images after restart", as
   }
 });
 
+await runAsync("sqlite record store compresses entries and sends one batch per flush without re-sending stored images", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-record-batch-"));
+  const db = createTestSqliteClient(join(dir, "record.sqlite3"));
+  const { client, calls } = recordClientCalls(db);
+  const imageData = "c".repeat(64 * 1024);
+  const recordTurn = (requestId: string, messages: unknown[]) => {
+    const body = { model: "alpha", messages };
+    beginRecordedRequest({ requestId, path: "/v1/messages", headers: {}, body, stream: true });
+    ensureRecordedAttempt({ requestId, index: 0, provider: "anthropic", modelName: "alpha", url: "https://example.com/v1/messages", requestHeaders: {}, requestBody: JSON.stringify(body) });
+    appendRecordedAttemptResponseBody({ requestId, index: 0, chunk: "data: {\"type\":\"message_stop\"}\n\n" });
+    appendRecordedClientResponseBody({ requestId, chunk: "data: {\"type\":\"message_stop\"}\n\n" });
+    finalizeRecordedRequest({ requestId });
+  };
+  try {
+    useSqliteRecordStore(client);
+    await startRecording({ maxSize: 5 });
+    const fileText = Array.from({ length: 400 }, (_, index) => `line ${index}: const value${index} = read("src/${(index * 7919) % 1000}.ts");`).join("\n");
+    const history = [{ role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/png", data: imageData } },
+      { type: "text", text: fileText },
+    ] }];
+    recordTurn("batch001-1234-5678-9abc-def012345678", history);
+    await flushRecording();
+    calls.length = 0;
+    recordTurn("batch002-1234-5678-9abc-def012345678", [...history, { role: "assistant", content: "ok" }, { role: "user", content: "next" }]);
+    await flushRecording();
+
+    // The lookup finds the image already stored; refs, the record and the trim then share one batch.
+    assert.deepEqual(calls.map((call) => call.method), ["execute", "batch"]);
+    assert.match(calls[0].sql[0], /SELECT hash FROM record_images WHERE hash IN/);
+    assert.equal(calls[1].sql.some((sql) => /INTO record_images/.test(sql)), false);
+    assert.equal(calls[1].sql.some((sql) => /INSERT INTO records/.test(sql)), true);
+    assert.equal(calls[1].sql.some((sql) => /DELETE FROM records/.test(sql)), true);
+    assert.equal(Number((await db.execute("SELECT COUNT(*) AS count FROM record_images")).rows[0].count), 1);
+
+    const row = (await db.execute({
+      sql: "SELECT typeof(entry_json) AS type, length(entry_json) AS bytes FROM records WHERE key = ?",
+      args: ["batch002-1234-5678-9abc-def012345678"],
+    })).rows[0];
+    assert.equal(row.type, "blob");
+    const stored = await getRecordedRequest("batch002-1234-5678-9abc-def012345678");
+    assert.ok(Number(row.bytes) * 4 < JSON.stringify(stored).length, "the client and attempt copies of the body compress together");
+    const record = await getRecordedRequest("batch002-1234-5678-9abc-def012345678", { hydrateImages: true });
+    assert.equal((record?.clientRequest.body as any).messages[0].content[0].source.data, imageData);
+    assert.equal((record?.attempts[0].request.body as any).messages[0].content[1].text, fileText);
+    assert.equal((record?.attempts[0].request.body as any).messages[1].content, "ok");
+
+    // Rows written before compression hold plain JSON text and still read back.
+    const legacyId = "legacy01-1234-5678-9abc-def012345678";
+    await db.execute({
+      sql: "INSERT INTO records (key, request_id, created_at, path, source, status, entry_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      args: [legacyId, legacyId, Date.now(), "/v1/messages", "other", "success", JSON.stringify({ requestId: legacyId, key: legacyId, attempts: [] })],
+    });
+    assert.equal((await getRecordedRequest(legacyId))?.requestId, legacyId);
+  } finally {
+    useMemoryRecordStore();
+    db.close();
+    removeTestDir(dir);
+  }
+});
+
+await runAsync("sqlite record summary reads in one round trip and evicts the oldest row for an in-flight record", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-record-summary-"));
+  const db = createTestSqliteClient(join(dir, "record.sqlite3"));
+  const { client, calls } = recordClientCalls(db);
+  const ids = [1, 2, 3].map((index) => `summary${index}-1234-5678-9abc-def012345678`);
+  try {
+    useSqliteRecordStore(client);
+    await startRecording({ maxSize: 2 });
+    for (const requestId of ids.slice(0, 2)) {
+      beginRecordedRequest({ requestId, path: "/v1/responses", headers: {}, body: { model: "alpha" }, stream: false });
+      finalizeRecordedRequest({ requestId });
+      await flushRecording();
+    }
+    beginRecordedRequest({ requestId: ids[2], path: "/v1/responses", headers: {}, body: { model: "alpha" }, stream: false });
+    calls.length = 0;
+
+    const summary = await getRecordSummary();
+    assert.deepEqual(calls.map((call) => call.method), ["batch", "execute"]);
+    assert.match(calls[1].sql[0], /DELETE FROM records WHERE key IN/);
+    assert.equal(summary.size, 2);
+    assert.deepEqual(summary.recentKeys.map((item) => item.requestId), [ids[2], ids[1]]);
+    assert.equal(await getRecordedRequest(ids[0]), undefined);
+
+    calls.length = 0;
+    assert.equal((await getRecordSummary()).size, 2);
+    assert.deepEqual(calls.map((call) => call.method), ["batch"]);
+  } finally {
+    useMemoryRecordStore();
+    db.close();
+    removeTestDir(dir);
+  }
+});
+
 await runAsync("status page renders fallback group priority panel without top hint text", async () => {
   const store = new StatusStore();
   const bucketStarts = store.listBuckets();
@@ -5806,6 +6094,8 @@ await runAsync("status page renders fallback group priority panel without top hi
   assert.match(html, /class="layout"/);
   assert.match(html, /<a class="back-admin" href="\/admin">/);
   assert.match(html, /fetch\("\/status\/data"/);
+  assert.match(html, /setInterval\(\(\) => \{\n\s*if \(!document\.hidden\) refreshStatus\(\);\n\s*\}, REFRESH_INTERVAL_MS\);/);
+  assert.match(html, /document\.addEventListener\("visibilitychange", \(\) => \{\n\s*if \(!document\.hidden\) refreshStatus\(\);/);
   assert.doesNotMatch(html, /AUTH_TOKEN_KEY = "nanollmAuthToken"/);
   assert.doesNotMatch(html, /sessionStorage\.setItem\(/);
   assert.doesNotMatch(html, /只展示真实模型/);
@@ -5915,7 +6205,7 @@ run("model test builds provider-native streaming requests", () => {
   assert.deepEqual(responses.body.input, [{ role: "user", content: [{ type: "input_text", text: "hi" }] }]);
   const anthropic = buildModelTestRequest("anthropic", "gamma", "hi");
   assert.equal(anthropic.path, "/v1/messages");
-  assert.equal(anthropic.body.max_tokens, 1024);
+  assert.equal(anthropic.body.max_tokens, 128000);
   assert.throws(() => buildModelTestRequest("openai-image", "img", "hi"), /not supported/);
 });
 
@@ -6135,6 +6425,8 @@ async function runRecordPageScript(recentKeys: RecentKey[], search: string, reco
   const replacedUrls: string[] = [];
   vm.runInContext(script, vm.createContext({
     document: {
+      hidden: false,
+      addEventListener: () => {},
       getElementById(id: string) {
         if (!elements.has(id)) elements.set(id, new FakeRecordPageElement("div", doc));
         return elements.get(id);
@@ -6188,6 +6480,46 @@ await runAsync("record page hides the pager when all recent requests fit on one 
   assert.equal(pager.children.length, 0);
 });
 
+run("record page skips summary polls while the tab is hidden and refreshes when it is shown", () => {
+  const summary = { enabled: true, capturedCount: 0, limit: 100, sessionStartedAt: Date.UTC(2026, 3, 20), recentKeys: [] };
+  const script = /<script>([\s\S]*)<\/script>/.exec(renderRecordPage(summary))?.[1];
+  assert.ok(script, "record page script");
+  const doc: { hidden: boolean; activeElement?: FakeRecordPageElement } = { hidden: true };
+  const elements = new Map<string, FakeRecordPageElement>();
+  const visibilityListeners: Array<() => void> = [];
+  const fetchedUrls: string[] = [];
+  let poll = () => {};
+  vm.runInContext(script, vm.createContext({
+    document: {
+      get hidden() { return doc.hidden; },
+      addEventListener(type: string, listener: () => void) {
+        if (type === "visibilitychange") visibilityListeners.push(listener);
+      },
+      getElementById(id: string) {
+        if (!elements.has(id)) elements.set(id, new FakeRecordPageElement("div", doc));
+        return elements.get(id);
+      },
+      createElement: (tagName: string) => new FakeRecordPageElement(tagName, doc),
+    },
+    window: { location: { search: "" } },
+    history: { replaceState: () => {} },
+    fetch: async (url: string) => {
+      fetchedUrls.push(url);
+      return { ok: true, json: async () => summary };
+    },
+    setInterval: (callback: () => void) => { poll = callback; return 0; },
+    URLSearchParams,
+  }));
+
+  poll();
+  assert.deepEqual(fetchedUrls, []);
+  doc.hidden = false;
+  for (const listener of visibilityListeners) listener();
+  assert.deepEqual(fetchedUrls, ["/record/summary"]);
+  poll();
+  assert.deepEqual(fetchedUrls, ["/record/summary", "/record/summary"]);
+});
+
 run("record page stream parser keeps data-like text inside JSON payloads", () => {
   const html = renderRecordPage({
     enabled: true,
@@ -6215,6 +6547,7 @@ run("record page stream reconstructor handles Anthropic server_tool_use events",
   assert.ok(script, "record page script");
   const sandbox: any = {
     document: {
+      addEventListener: () => {},
       createElement: () => ({ appendChild: () => {}, addEventListener: () => {} }),
       getElementById: () => ({ addEventListener: () => {}, appendChild: () => {}, classList: { toggle: () => {} } }),
     },
@@ -6317,10 +6650,11 @@ await runAsync("auth middleware leaves routes open when token is not configured"
 
 await runAsync("auth middleware rejects unauthenticated requests when token is configured", async () => {
   const app = buildAuthTestApp("top-secret");
-  for (const path of ["/v1/models", "/admin", "/status", "/record", "/record/abcdef/replay"]) {
+  for (const path of ["/v1/models", "/admin/config/data", "/status/data", "/record/abcdef/replay"]) {
     const response = await app.request("http://localhost" + path);
     assert.equal(response.status, 401);
     assert.equal(response.headers.get("www-authenticate"), "Bearer");
+    assert.equal(response.headers.get("x-nanollm-auth-required"), "1");
     assert.deepEqual(await response.json(), { error: "Unauthorized" });
   }
 
@@ -6329,7 +6663,94 @@ await runAsync("auth middleware rejects unauthenticated requests when token is c
   assert.deepEqual(await healthResponse.json(), { ok: true });
 });
 
-await runAsync("auth middleware accepts bearer header, query token, and options preflight", async () => {
+await runAsync("WebUI login redirects pages, validates passwords, and preserves safe return paths", async () => {
+  const app = buildAuthTestApp("top-secret");
+  for (const path of ["/admin", "/admin/config", "/status", "/record", "/jobs"]) {
+    const response = await app.request("http://localhost" + path);
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("location"), "/login?returnTo=" + encodeURIComponent(path));
+  }
+  const page = await app.request("http://localhost/login?returnTo=%2Frecord%3FrequestId%3Dabc");
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get("cache-control"), "no-store");
+  assert.match(await page.text(), /type="password"/);
+  const submit = (password: string, returnTo: string) => app.request("https://localhost/login", {
+    method: "POST",
+    body: new URLSearchParams({ password, returnTo }),
+  });
+  const failure = await submit("wrong", "/record?requestId=abc");
+  assert.equal(failure.status, 401);
+  assert.equal(failure.headers.get("set-cookie"), null);
+  assert.match(await failure.text(), /密码错误/);
+  const success = await submit("top-secret", "/record?requestId=abc&token=secret");
+  assert.equal(success.status, 303);
+  assert.equal(success.headers.get("location"), "/record?requestId=abc");
+  const cookie = success.headers.get("set-cookie") ?? "";
+  assert.match(cookie, /HttpOnly; SameSite=Lax; Max-Age=7776000; Secure/);
+  const revisit = await app.request("http://localhost/record", { headers: { Cookie: cookie.split(";")[0] } });
+  assert.equal(revisit.status, 200);
+  for (const target of ["https://evil.example", "//evil.example", "/\\evil.example", "/login", "/v1/models", "/admin/../login"]) {
+    const response = await submit("top-secret", target);
+    assert.equal(response.headers.get("location"), "/admin");
+  }
+  const expired = await app.request("http://localhost/status", { headers: { Cookie: "nanollm_auth=old-password" } });
+  assert.equal(expired.status, 302);
+  const signedIn = await app.request("http://localhost/login", { headers: { Cookie: "nanollm_auth=top-secret" } });
+  assert.equal(signedIn.status, 303);
+  const openApp = buildAuthTestApp();
+  assert.equal((await openApp.request("http://localhost/admin")).status, 200);
+  assert.equal((await openApp.request("http://localhost/login")).headers.get("location"), "/admin");
+});
+
+await runAsync("WebUI fetch redirects only same-origin unauthorized responses to login", async () => {
+  const navigations: string[] = [];
+  const html = withWebUIAuth("<html><head></head><body></body></html>");
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(script);
+  let status = 401;
+  let authRequired = true;
+  const window = { fetch: async (_input: unknown) => new Response("{}", { status, headers: authRequired ? { "X-Nanollm-Auth-Required": "1" } : {} }) };
+  vm.runInNewContext(script, {
+    window, Request, URL,
+    location: {
+      href: "http://localhost/record?requestId=abc&token=secret",
+      origin: "http://localhost",
+      replace: (url: string) => navigations.push(url),
+    },
+  });
+  await window.fetch("https://external.example/data");
+  assert.equal(navigations.length, 0);
+  status = 200;
+  await window.fetch("/record/summary");
+  assert.equal(navigations.length, 0);
+  status = 401;
+  authRequired = false;
+  await window.fetch("/admin/models/example/test");
+  assert.equal(navigations.length, 0);
+  authRequired = true;
+  const response = await window.fetch(new Request("http://localhost/record/summary"));
+  assert.equal(response.status, 401);
+  assert.deepEqual(navigations, ["/login?returnTo=%2Frecord%3FrequestId%3Dabc"]);
+});
+
+await runAsync("URL tokens do not authenticate WebUI or API requests", async () => {
+  const app = buildAuthTestApp("top-secret");
+  for (const path of ["/admin", "/admin/config", "/status", "/record", "/jobs"]) {
+    const response = await app.request("http://localhost" + path + "?token=top-secret");
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("location"), "/login?returnTo=" + encodeURIComponent(path));
+    assert.equal(response.headers.get("set-cookie"), null);
+  }
+  const login = await app.request("http://localhost/login?token=top-secret");
+  assert.equal(login.status, 200);
+  assert.equal(login.headers.get("set-cookie"), null);
+  assert.match(await login.text(), /type="password"/);
+  const api = await app.request("http://localhost/v1/models?token=top-secret");
+  assert.equal(api.status, 401);
+  assert.equal(api.headers.get("set-cookie"), null);
+});
+
+await runAsync("auth middleware accepts bearer header, cookie, and options preflight", async () => {
   const app = buildAuthTestApp("top-secret");
 
   const headerResponse = await app.request("http://localhost/v1/models", {
@@ -6337,10 +6758,6 @@ await runAsync("auth middleware accepts bearer header, query token, and options 
   });
   assert.equal(headerResponse.status, 200);
   assert.match(headerResponse.headers.get("set-cookie") ?? "", /nanollm_auth=top-secret/);
-
-  const queryResponse = await app.request("http://localhost/admin?token=top-secret");
-  assert.equal(queryResponse.status, 200);
-  assert.match(queryResponse.headers.get("set-cookie") ?? "", /nanollm_auth=top-secret/);
 
   const cookieResponse = await app.request("http://localhost/status", {
     headers: { Cookie: "nanollm_auth=top-secret" },

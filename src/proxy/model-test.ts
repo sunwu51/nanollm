@@ -1,4 +1,5 @@
 import { SSEParser, type StreamFormat } from "../converters/streams.js";
+import { CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS } from "../subscriptions/claude-subscription-body.js";
 
 export const DEFAULT_MODEL_TEST_MESSAGE = "Reply with only ok.";
 export const PELICAN_MODEL_TEST_MESSAGE = "Generate an SVG animation embedded in HTML of a pelican riding a bicycle. Return only the code, with no explanation.";
@@ -25,7 +26,7 @@ export function buildModelTestRequest(provider: StreamFormat, modelName: string,
     case "anthropic":
       return {
         path: "/v1/messages",
-        body: { model: modelName, max_tokens: 1024, messages: [{ role: "user", content: message }], stream: true },
+        body: { model: modelName, max_tokens: CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, messages: [{ role: "user", content: message }], stream: true },
       };
     default:
       throw new Error(`Model test is not supported for provider '${provider}'`);

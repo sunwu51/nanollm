@@ -1823,9 +1823,14 @@ const SCRIPT = String.raw`
       });
 
       setSummary(INITIAL_SUMMARY);
+      // Every poll queries the database, so a hidden tab skips them and catches up once it is shown again.
       setInterval(() => {
+        if (document.hidden) return;
         refreshSummary().catch(() => {});
       }, ${SUMMARY_POLL_INTERVAL_MS});
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) refreshSummary().catch(() => {});
+      });
 
       const params = new URLSearchParams(window.location.search);
       const preset = params.get("requestId");

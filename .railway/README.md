@@ -15,7 +15,8 @@ service remains an uploaded build and is not bound to GitHub auto-deploys.
 
 The template enables `deploy.sleepApplication` for sqld and disables it for
 nanollm. This applies to new template deployments, not the existing live project.
-The gateway probes with `SELECT 1` before each HTTP database request, retrying
+The gateway probes with `SELECT 1` before the first HTTP database request after
+60 seconds without a successful response or after a failed request, retrying
 only that probe; ambiguous write failures are not replayed. No idle polling is
 added. Cold-start savings still depend on actual quiet periods.
 
