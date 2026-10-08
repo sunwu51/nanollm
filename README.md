@@ -25,6 +25,10 @@ Compatible with OpenAI Chat / Responses, Anthropic Messages and the OpenAI image
 
 nanollm is a `litellm`-like proxy for LLM APIs. It stays small and runs locally, which makes it a good fit for aggregating several model providers on your own machine.
 
+<p align="center">
+  <img src="assets/architecture.svg" alt="nanollm architecture" width="100%" />
+</p>
+
 ## Features
 
 - **Multiple protocols**: configure providers for `chat/completions` (chat), `responses` and `messages` text APIs plus the OpenAI image APIs (`images/generations`, `images/edits`), and expose all of them under the `/v1` prefix. The three text protocols are converted into each other; see [docs/converters.md](docs/converters.md). Google APIs are not supported yet.

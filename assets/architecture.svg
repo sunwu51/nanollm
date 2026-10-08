@@ -1,0 +1,325 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" width="1200" height="760" role="img" aria-labelledby="t d">
+  <title id="t">nanollm architecture</title>
+  <desc id="d">Clients call nanollm's /v1 endpoints. The gateway authenticates, picks a model and fallback group, converts the request, calls an upstream provider or subscription, converts the reply back and records it in storage. Web UI pages read storage, and scheduled jobs call the gateway in-process.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffe4f3"/>
+      <stop offset=".5" stop-color="#ece6ff"/>
+      <stop offset="1" stop-color="#d9f7f1"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="eye" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2e2350"/>
+      <stop offset=".55" stop-color="#5b3fd6"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+    <linearGradient id="gate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f4efff"/>
+    </linearGradient>
+    <pattern id="dots" width="14" height="14" patternUnits="userSpaceOnUse">
+      <circle cx="7" cy="7" r="2" fill="#7c5cff" opacity=".13"/>
+    </pattern>
+    <filter id="pop" x="-10%" y="-10%" width="125%" height="130%">
+      <feDropShadow dx="5" dy="5" stdDeviation="0" flood-color="#2e2350" flood-opacity=".9"/>
+    </filter>
+    <marker id="arrPink" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#ff5fa8"/>
+    </marker>
+    <marker id="arrTeal" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#0d9488"/>
+    </marker>
+    <marker id="arrInk" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#2e2350"/>
+    </marker>
+    <path id="spark" d="M0,-10 Q1.5,-1.5 10,0 Q1.5,1.5 0,10 Q-1.5,1.5 -10,0 Q-1.5,-1.5 0,-10 Z"/>
+    <g id="cloud">
+      <circle cx="0" cy="0" r="22"/><circle cx="26" cy="-10" r="28"/><circle cx="56" cy="2" r="20"/><rect x="0" y="0" width="56" height="22"/>
+    </g>
+  </defs>
+
+  <style>
+    text { font-family: "Nunito", "Segoe UI", "Hiragino Maru Gothic ProN", system-ui, sans-serif; fill: #2e2350; }
+    .mono, .mono text { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+    .h { font-weight: 800; }
+    .ink { stroke: #2e2350; stroke-width: 3; stroke-linejoin: round; }
+    .flow { fill: none; stroke-width: 3.5; stroke-linecap: round; stroke-dasharray: 9 9; animation: flow 1.1s linear infinite; }
+    .tw { transform-box: fill-box; transform-origin: center; animation: tw 2.4s ease-in-out infinite; }
+    .blink { transform-box: fill-box; transform-origin: center; animation: blink 4s infinite; }
+    @keyframes flow { to { stroke-dashoffset: -18; } }
+    @keyframes tw { 0%, 100% { transform: scale(.55); opacity: .5; } 50% { transform: scale(1.1); opacity: 1; } }
+    @keyframes blink { 0%, 92%, 100% { transform: scaleY(1); } 95% { transform: scaleY(.1); } }
+    @media (prefers-reduced-motion: reduce) { .flow, .tw, .blink { animation: none; } }
+  </style>
+
+  <!-- background -->
+  <rect width="1200" height="760" rx="28" fill="url(#sky)"/>
+  <rect x="0" y="0" width="300" height="200" fill="url(#dots)"/>
+  <rect x="900" y="560" width="300" height="200" fill="url(#dots)"/>
+  <g fill="#ffffff" opacity=".75">
+    <use href="#cloud" transform="translate(330 70) scale(.9)"/>
+    <use href="#cloud" transform="translate(1040 80) scale(1.1)"/>
+    <use href="#cloud" transform="translate(20 540) scale(.8)"/>
+    <use href="#cloud" transform="translate(1090 530) scale(.7)"/>
+  </g>
+  <g>
+    <use href="#spark" class="tw" fill="#ffd34d" transform="translate(270 40) scale(1.2)"/>
+    <use href="#spark" class="tw" fill="#ff8fc7" transform="translate(905 60) scale(.9)" style="animation-delay:.6s"/>
+    <use href="#spark" class="tw" fill="#7c5cff" transform="translate(1160 150)" style="animation-delay:1.2s"/>
+    <use href="#spark" class="tw" fill="#2dd4bf" transform="translate(40 735) scale(.8)" style="animation-delay:.3s"/>
+    <use href="#spark" class="tw" fill="#ffd34d" transform="translate(560 40) scale(1.1)" style="animation-delay:1.6s"/>
+    <use href="#spark" class="tw" fill="#ff8fc7" transform="translate(40 150) scale(.7)" style="animation-delay:.9s"/>
+    <use href="#spark" class="tw" fill="#7c5cff" transform="translate(600 742) scale(.7)" style="animation-delay:1.9s"/>
+  </g>
+
+  <!-- title -->
+  <text x="40" y="76" font-size="46" class="h" fill="url(#brand)" stroke="#ffffff" stroke-width="8" paint-order="stroke" stroke-linejoin="round" style="fill:url(#brand)">nanollm</text>
+  <text x="44" y="104" font-size="16" font-weight="700" fill="#6b5aa6" style="fill:#6b5aa6">architecture ✦ one gateway, every model</text>
+
+  <!-- ===== clients ===== -->
+  <g>
+    <rect x="30" y="140" width="250" height="380" rx="22" fill="#fff" fill-opacity=".55" stroke="#ff8fc7" stroke-width="3" stroke-dasharray="2 8" stroke-linecap="round"/>
+    <rect x="70" y="124" width="170" height="34" rx="17" fill="#ff8fc7" class="ink" filter="url(#pop)"/>
+    <text x="155" y="147" font-size="16" class="h" text-anchor="middle" fill="#fff" style="fill:#fff">★ CLIENTS ★</text>
+
+    <g filter="url(#pop)">
+      <rect x="50" y="185" width="210" height="60" rx="14" fill="#fff" class="ink"/>
+      <rect x="50" y="265" width="210" height="60" rx="14" fill="#fff" class="ink"/>
+      <rect x="50" y="345" width="210" height="60" rx="14" fill="#fff" class="ink"/>
+      <rect x="50" y="425" width="210" height="60" rx="14" fill="#fff" class="ink"/>
+    </g>
+    <g class="ink" stroke-width="2.5">
+      <circle cx="80" cy="215" r="16" fill="#c4b5fd"/>
+      <circle cx="80" cy="295" r="16" fill="#99f6e4"/>
+      <circle cx="80" cy="375" r="16" fill="#fdba74"/>
+      <circle cx="80" cy="455" r="16" fill="#fde68a"/>
+    </g>
+    <g font-size="13" class="h mono" text-anchor="middle">
+      <text x="80" y="220">{ }</text>
+      <text x="80" y="300">&gt;_</text>
+      <text x="80" y="381" font-size="17">✳</text>
+      <text x="80" y="460">▦</text>
+    </g>
+    <g font-size="15" class="h">
+      <text x="106" y="211">OpenAI SDKs</text>
+      <text x="106" y="291">Codex CLI</text>
+      <text x="106" y="371">Claude Code</text>
+      <text x="106" y="451">Image apps</text>
+    </g>
+    <g font-size="11" class="mono" fill="#6b5aa6" style="fill:#6b5aa6">
+      <text x="106" y="230" style="fill:#6b5aa6">/v1/chat/completions</text>
+      <text x="106" y="310" style="fill:#6b5aa6">/v1/responses</text>
+      <text x="106" y="390" style="fill:#6b5aa6">/v1/messages</text>
+      <text x="106" y="470" style="fill:#6b5aa6">/v1/images/*</text>
+    </g>
+  </g>
+
+  <!-- clients -> gateway -->
+  <g stroke="#ff5fa8">
+    <path class="flow" d="M266 215 C305 215 320 260 356 260"/>
+    <path class="flow" d="M266 295 C305 295 320 262 356 262"/>
+    <path class="flow" d="M266 375 C310 375 320 264 356 264"/>
+    <path class="flow" d="M266 455 C315 455 318 266 356 266" marker-end="url(#arrPink)"/>
+  </g>
+
+  <!-- ===== gateway ===== -->
+  <rect x="340" y="175" width="520" height="340" rx="26" fill="url(#gate)" stroke="#2e2350" stroke-width="3.5" filter="url(#pop)"/>
+  <rect x="352" y="187" width="496" height="316" rx="18" fill="none" stroke="#c4b5fd" stroke-width="2" stroke-dasharray="6 6"/>
+  <text x="600" y="212" font-size="15" class="h" text-anchor="middle" fill="#7c5cff" style="fill:#7c5cff">nanollm gateway</text>
+
+  <!-- pipeline chips -->
+  <g filter="url(#pop)">
+    <rect x="362" y="228" width="146" height="64" rx="14" fill="#ffe4f3" class="ink"/>
+    <rect x="527" y="228" width="146" height="64" rx="14" fill="#ede9fe" class="ink"/>
+    <rect x="692" y="228" width="146" height="64" rx="14" fill="#ccfbf1" class="ink"/>
+    <rect x="692" y="330" width="146" height="64" rx="14" fill="#fef3c7" class="ink"/>
+    <rect x="527" y="330" width="146" height="64" rx="14" fill="#ccfbf1" class="ink"/>
+    <rect x="362" y="330" width="146" height="64" rx="14" fill="#ede9fe" class="ink"/>
+  </g>
+  <g class="ink" stroke-width="2" fill="#7c5cff">
+    <circle cx="378" cy="244" r="11"/><circle cx="543" cy="244" r="11"/><circle cx="708" cy="244" r="11"/>
+    <circle cx="708" cy="346" r="11"/><circle cx="543" cy="346" r="11"/><circle cx="378" cy="346" r="11"/>
+  </g>
+  <g font-size="12" class="h" text-anchor="middle" fill="#fff">
+    <text x="378" y="248" style="fill:#fff">1</text><text x="543" y="248" style="fill:#fff">2</text><text x="708" y="248" style="fill:#fff">3</text>
+    <text x="708" y="350" style="fill:#fff">4</text><text x="543" y="350" style="fill:#fff">5</text><text x="378" y="350" style="fill:#fff">6</text>
+  </g>
+  <g font-size="14" class="h">
+    <text x="395" y="249">authenticate</text>
+    <text x="560" y="249">pick model</text>
+    <text x="725" y="249">convert req</text>
+    <text x="725" y="351">call upstream</text>
+    <text x="560" y="351">convert reply</text>
+    <text x="395" y="351">record</text>
+  </g>
+  <g font-size="10.5" class="mono">
+    <text x="374" y="278" style="fill:#6b5aa6">core/auth</text>
+    <text x="539" y="278" style="fill:#6b5aa6">proxy/fallback</text>
+    <text x="704" y="278" style="fill:#6b5aa6">converters</text>
+    <text x="704" y="380" style="fill:#6b5aa6">proxy·subscriptions</text>
+    <text x="539" y="380" style="fill:#6b5aa6">JSON / SSE</text>
+    <text x="374" y="380" style="fill:#6b5aa6">storage</text>
+  </g>
+  <g stroke="#2e2350" stroke-width="2.5" fill="none" marker-end="url(#arrInk)">
+    <path d="M512 260 H522"/>
+    <path d="M677 260 H687"/>
+    <path d="M765 297 V324"/>
+    <path d="M687 362 H678"/>
+    <path d="M522 362 H513"/>
+  </g>
+
+  <!-- converter strip -->
+  <text x="600" y="438" font-size="12.5" font-weight="700" text-anchor="middle" fill="#6b5aa6" style="fill:#6b5aa6">three text protocols, converted into each other</text>
+  <g class="ink" stroke-width="2.5">
+    <rect x="393" y="455" width="110" height="30" rx="15" fill="#ffe4f3"/>
+    <rect x="533" y="455" width="150" height="30" rx="15" fill="#ede9fe"/>
+    <rect x="713" y="455" width="95" height="30" rx="15" fill="#ccfbf1"/>
+  </g>
+  <g font-size="13" class="mono h" text-anchor="middle">
+    <text x="448" y="475">openai-chat</text>
+    <text x="608" y="475">openai-responses</text>
+    <text x="760" y="475">anthropic</text>
+    <text x="518" y="476" style="fill:#ff5fa8">⇄</text>
+    <text x="698" y="476" style="fill:#ff5fa8">⇄</text>
+  </g>
+
+  <!-- ===== mascot ===== -->
+  <g transform="translate(600 138)">
+    <g class="ink" stroke-width="2.5">
+      <path d="M-30,-12 L-38,-54 L-6,-32 Z" fill="#7c5cff"/>
+      <path d="M30,-12 L38,-54 L6,-32 Z" fill="#7c5cff"/>
+    </g>
+    <path d="M-28,-22 L-33,-45 L-14,-32 Z" fill="#ffb3d9"/>
+    <path d="M28,-22 L33,-45 L14,-32 Z" fill="#ffb3d9"/>
+    <path d="M2,-38 C6,-60 24,-58 18,-46" fill="none" stroke="#2e2350" stroke-width="6.5" stroke-linecap="round"/>
+    <path d="M2,-38 C6,-60 24,-58 18,-46" fill="none" stroke="#7c5cff" stroke-width="3.5" stroke-linecap="round"/>
+    <ellipse cx="0" cy="0" rx="42" ry="38" fill="#7c5cff" class="ink" stroke-width="2.5"/>
+    <ellipse cx="0" cy="8" rx="33" ry="29" fill="#fff3ea" class="ink" stroke-width="2.5"/>
+    <path d="M-38,4 C-38,-28 -12,-40 0,-38 C12,-40 38,-28 38,4 L30,-6 L24,6 L16,-10 L8,2 L0,-14 L-8,2 L-16,-10 L-24,6 L-30,-6 Z" fill="#7c5cff" class="ink" stroke-width="2.5"/>
+    <path d="M-20,-26 C-12,-32 -4,-33 4,-32" fill="none" stroke="#b9a8ff" stroke-width="3" stroke-linecap="round"/>
+    <use href="#spark" fill="#fde68a" stroke="#2e2350" stroke-width="1.5" transform="translate(-27 -16) scale(.75)"/>
+    <g class="blink">
+      <ellipse cx="-13" cy="14" rx="7.5" ry="10" fill="url(#eye)" stroke="#2e2350" stroke-width="2"/>
+      <ellipse cx="13" cy="14" rx="7.5" ry="10" fill="url(#eye)" stroke="#2e2350" stroke-width="2"/>
+      <circle cx="-15" cy="10" r="3.2" fill="#fff"/><circle cx="-10" cy="18" r="1.5" fill="#fff"/>
+      <circle cx="11" cy="10" r="3.2" fill="#fff"/><circle cx="16" cy="18" r="1.5" fill="#fff"/>
+    </g>
+    <ellipse cx="-24" cy="25" rx="6" ry="3" fill="#ff8fc7" opacity=".75"/>
+    <ellipse cx="24" cy="25" rx="6" ry="3" fill="#ff8fc7" opacity=".75"/>
+    <path d="M-6,27 Q-3,31 0,27 Q3,31 6,27" fill="none" stroke="#2e2350" stroke-width="2" stroke-linecap="round"/>
+  </g>
+  <g class="ink" stroke-width="2.5" fill="#fff3ea">
+    <ellipse cx="574" cy="176" rx="9" ry="7"/>
+    <ellipse cx="626" cy="176" rx="9" ry="7"/>
+  </g>
+
+  <!-- speech bubble -->
+  <path d="M668 92 H878 a14 14 0 0 1 14 14 V124 a14 14 0 0 1 -14 14 H684 L656 150 L668 136 a14 14 0 0 1 -14 -12 V106 a14 14 0 0 1 14 -14 Z" fill="#fff" class="ink" filter="url(#pop)"/>
+  <text x="770" y="120" font-size="14" font-weight="700" text-anchor="middle">leave the routing to me~ ♪</text>
+
+  <!-- gateway -> upstreams -->
+  <g stroke="#0d9488">
+    <path class="flow" d="M844 360 C885 360 890 215 934 215" marker-end="url(#arrTeal)"/>
+    <path class="flow" d="M844 362 C890 362 895 295 934 295" marker-end="url(#arrTeal)"/>
+    <path class="flow" d="M844 364 C890 364 895 375 934 375" marker-end="url(#arrTeal)"/>
+    <path class="flow" d="M844 366 C885 366 890 455 934 455" marker-end="url(#arrTeal)"/>
+  </g>
+
+  <!-- ===== upstreams ===== -->
+  <g>
+    <rect x="920" y="140" width="250" height="380" rx="22" fill="#fff" fill-opacity=".55" stroke="#2dd4bf" stroke-width="3" stroke-dasharray="2 8" stroke-linecap="round"/>
+    <rect x="955" y="124" width="180" height="34" rx="17" fill="#2dd4bf" class="ink" filter="url(#pop)"/>
+    <text x="1045" y="147" font-size="16" class="h" text-anchor="middle" fill="#fff" style="fill:#fff">★ UPSTREAMS ★</text>
+
+    <g filter="url(#pop)">
+      <rect x="940" y="185" width="210" height="60" rx="14" fill="#fff" class="ink"/>
+      <rect x="940" y="265" width="210" height="60" rx="14" fill="#fff" class="ink"/>
+      <rect x="940" y="345" width="210" height="60" rx="14" fill="#fff" class="ink"/>
+      <rect x="940" y="425" width="210" height="60" rx="14" fill="#fff" class="ink"/>
+    </g>
+    <g class="ink" stroke-width="2.5">
+      <circle cx="970" cy="215" r="16" fill="#99f6e4"/>
+      <circle cx="970" cy="295" r="16" fill="#fdba74"/>
+      <circle cx="970" cy="375" r="16" fill="#c4b5fd"/>
+      <circle cx="970" cy="455" r="16" fill="#ffb3d9"/>
+    </g>
+    <g font-size="14" class="h" text-anchor="middle">
+      <text x="970" y="220">◎</text>
+      <text x="970" y="301" font-size="17">✳</text>
+      <text x="970" y="380">⚿</text>
+      <text x="970" y="460">⚿</text>
+    </g>
+    <g font-size="14" class="h">
+      <text x="994" y="211">OpenAI-compatible</text>
+      <text x="994" y="291">Anthropic</text>
+      <text x="994" y="371">Codex subscription</text>
+      <text x="994" y="451">Claude subscription</text>
+    </g>
+    <g font-size="11" class="mono">
+      <text x="994" y="230" style="fill:#6b5aa6">chat·responses·images</text>
+      <text x="994" y="310" style="fill:#6b5aa6">messages</text>
+      <text x="994" y="390" style="fill:#6b5aa6">OAuth · ChatGPT plan</text>
+      <text x="994" y="470" style="fill:#6b5aa6">OAuth · Claude plan</text>
+    </g>
+  </g>
+
+  <!-- ===== bottom row ===== -->
+  <g stroke="#7c5cff">
+    <path class="flow" d="M430 520 C430 545 280 535 262 556" marker-end="url(#arrInk)" stroke="#7c5cff"/>
+    <path class="flow" d="M405 648 H422" stroke="#7c5cff" marker-end="url(#arrInk)"/>
+    <path class="flow" d="M940 560 C940 535 790 548 780 524" marker-end="url(#arrInk)" stroke="#7c5cff"/>
+  </g>
+  <text x="352" y="548" font-size="12" font-weight="700" style="fill:#6b5aa6">save</text>
+  <text x="868" y="540" font-size="12" font-weight="700" style="fill:#6b5aa6">in-process /v1</text>
+
+  <g filter="url(#pop)">
+    <rect x="60" y="565" width="340" height="150" rx="20" fill="#fff" class="ink"/>
+    <rect x="430" y="565" width="340" height="150" rx="20" fill="#fff" class="ink"/>
+    <rect x="800" y="565" width="340" height="150" rx="20" fill="#fff" class="ink"/>
+  </g>
+
+  <!-- storage -->
+  <g class="ink" stroke-width="2.5">
+    <path d="M86 612 V668 a26 9 0 0 0 52 0 V612" fill="#c4b5fd"/>
+    <ellipse cx="112" cy="612" rx="26" ry="9" fill="#ede9fe"/>
+    <path d="M86 631 a26 9 0 0 0 52 0 M86 650 a26 9 0 0 0 52 0" fill="none" stroke-width="2"/>
+  </g>
+  <text x="156" y="608" font-size="18" class="h">storage</text>
+  <text x="156" y="630" font-size="12" class="mono" style="fill:#6b5aa6">SQLite · Turso (libsql)</text>
+  <g font-size="12.5" font-weight="700">
+    <text x="156" y="660">♡ request records</text>
+    <text x="156" y="680">♡ status buckets</text>
+    <text x="156" y="700">♡ usage by day</text>
+  </g>
+
+  <!-- pages -->
+  <g class="ink" stroke-width="2.5">
+    <rect x="454" y="600" width="58" height="46" rx="8" fill="#fff"/>
+    <path d="M454 614 H512" fill="none"/>
+  </g>
+  <circle cx="463" cy="607" r="2.5" fill="#ff5fa8"/><circle cx="471" cy="607" r="2.5" fill="#fde68a"/><circle cx="479" cy="607" r="2.5" fill="#2dd4bf"/>
+  <path d="M464 638 V628 M474 638 V622 M484 638 V632 M494 638 V625 M504 638 V630" stroke="#7c5cff" stroke-width="4" stroke-linecap="round"/>
+  <text x="530" y="608" font-size="18" class="h">Web UI</text>
+  <text x="530" y="630" font-size="12" class="mono" style="fill:#6b5aa6">pages/</text>
+  <g font-size="12.5" class="mono" font-weight="700">
+    <text x="530" y="660">/admin   config</text>
+    <text x="530" y="680">/status  /usage</text>
+    <text x="530" y="700">/record  history</text>
+  </g>
+
+  <!-- jobs -->
+  <g class="ink" stroke-width="2.5">
+    <circle cx="852" cy="625" r="26" fill="#fde68a"/>
+    <path d="M852 609 V625 L864 633" fill="none" stroke-linecap="round"/>
+  </g>
+  <text x="896" y="608" font-size="18" class="h">scheduled jobs</text>
+  <text x="896" y="630" font-size="12" class="mono" style="fill:#6b5aa6">jobs/ · jobs.yaml</text>
+  <g font-size="12.5" font-weight="700">
+    <text x="896" y="660">☆ cron scheduler</text>
+    <text x="896" y="680">☆ runs go through 1 → 6</text>
+    <text x="896" y="700">☆ run history + record links</text>
+  </g>
+</svg>

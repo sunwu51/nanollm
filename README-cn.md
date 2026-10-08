@@ -25,6 +25,10 @@
 
 一个类似 `litellm` 的 LLM 模型代理服务，主打轻量和本地化，适合个人在本地聚合多个模型。
 
+<p align="center">
+  <img src="assets/architecture.svg" alt="nanollm 架构图" width="100%" />
+</p>
+
 ## 特性
 
 - **多协议接入**：可配置 `chat/completions`（下称 chat）、`responses`、`messages` 三种文本接口，以及 OpenAI 图片 `images/generations`、`images/edits` 接口的供应商（暂不支持 Google 接口），并同时对外暴露这些接口（带 `/v1` 前缀）；三种文本协议之间可以互相转换，转换规则见 [docs/converters.md](docs/converters.md)。
