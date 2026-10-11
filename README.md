@@ -29,6 +29,14 @@ nanollm is a `litellm`-like proxy for LLM APIs. It stays small and runs locally,
   <img src="assets/architecture.svg" alt="nanollm architecture" width="100%" />
 </p>
 
+<p align="center">
+  <a href="https://nanollm-assets.wuyao.org/nanollm/how-it-works.mp4">
+    <img src="https://nanollm-assets.wuyao.org/nanollm/converter-loop.gif" alt="How nanollm works (90s video)" width="100%" />
+  </a>
+  <br />
+  <sub>▶ Click to watch <b>How nanollm works</b> (90s video)</sub>
+</p>
+
 ## Features
 
 - **Multiple protocols**: configure providers for `chat/completions` (chat), `responses` and `messages` text APIs plus the OpenAI image APIs (`images/generations`, `images/edits`), and expose all of them under the `/v1` prefix. The three text protocols are converted into each other; see [docs/converters.md](docs/converters.md). Google APIs are not supported yet.

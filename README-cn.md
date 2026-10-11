@@ -29,6 +29,14 @@
   <img src="assets/architecture.svg" alt="nanollm 架构图" width="100%" />
 </p>
 
+<p align="center">
+  <a href="https://nanollm-assets.wuyao.org/nanollm/how-it-works.mp4">
+    <img src="https://nanollm-assets.wuyao.org/nanollm/converter-loop.gif" alt="nanollm 工作原理（90 秒视频）" width="100%" />
+  </a>
+  <br />
+  <sub>▶ 点击观看 <b>nanollm 工作原理</b>（90 秒视频，英文）</sub>
+</p>
+
 ## 特性
 
 - **多协议接入**：可配置 `chat/completions`（下称 chat）、`responses`、`messages` 三种文本接口，以及 OpenAI 图片 `images/generations`、`images/edits` 接口的供应商（暂不支持 Google 接口），并同时对外暴露这些接口（带 `/v1` 前缀）；三种文本协议之间可以互相转换，转换规则见 [docs/converters.md](docs/converters.md)。
