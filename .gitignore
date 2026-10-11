@@ -13,3 +13,4 @@ native/**/target/
 /openai-subscription/
 /claude-subscription/
 *~
+video/
