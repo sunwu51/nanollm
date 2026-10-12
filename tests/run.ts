@@ -6180,7 +6180,7 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /sourceBadge\.className = "source-badge " \+ item\.source/);
   assert.match(html, /statusBadge\.className = getStatusBadgeClass\(item\)/);
   assert.match(html, /actualModel\.textContent = "-> " \+ \(item\.actualModel \|\| "-"\)/);
-  assert.match(html, /meta\.textContent = item\.path \+ " · " \+ new Date\(item\.createdAt\)\.toLocaleTimeString\("zh-CN"\)/);
+  assert.match(html, /meta\.textContent = item\.path \+ " · " \+ formatRecentTime\(item\.createdAt\)/);
   assert.match(html, /renderRecentList/);
   assert.match(html, /items\.slice\(start, start \+ 12\)/);
   assert.match(html, /model\.textContent = item\.model \|\| "-"/);
@@ -6361,6 +6361,10 @@ class FakeRecordPageElement {
     if (!this.disabled) this.listeners.get("click")?.forEach((listener) => listener());
   }
 
+  dispatch(type: string) {
+    this.listeners.get(type)?.forEach((listener) => listener());
+  }
+
   focus() {
     this.doc.activeElement = this;
   }
@@ -6443,7 +6447,7 @@ async function runRecordPageScript(recentKeys: RecentKey[], search: string, reco
     URLSearchParams,
   }));
   await waitForCondition(() => replacedUrls.length > 0);
-  return { doc, recent: elements.get("recent")!, pager: elements.get("recent-pager")!, fetchedUrls };
+  return { doc, elements, recent: elements.get("recent")!, pager: elements.get("recent-pager")!, fetchedUrls };
 }
 
 await runAsync("record page paginates recent requests and jumps to the page of a requestId from the URL", async () => {
@@ -6470,6 +6474,50 @@ await runAsync("record page paginates recent requests and jumps to the page of a
   pager.children.find((child) => child.textContent === "1")!.click();
   assert.deepEqual(recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId), recentKeys.slice(0, 12).map((item) => item.requestId));
   assert.equal(pager.children.find((child) => child.textContent === "‹")?.disabled, true);
+});
+
+await runAsync("record page filters recent requests by model and time range and shows MM-DD times", async () => {
+  const base = new Date(2026, 3, 20, 10, 0, 0).getTime();
+  const recentKeys = makeRecentKeys(30).map((item, index) => ({
+    ...item,
+    model: index % 3 === 0 ? "gpt-5" : "claude-sonnet-4-6",
+    createdAt: base - index * 60_000,
+  }));
+  const { elements, recent, pager } = await runRecordPageScript(recentKeys, "?requestId=" + recentKeys[0].requestId, makeRecordFor(recentKeys[0]));
+  const ids = () => recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId);
+  const modelFilter = elements.get("filter-model")! as FakeRecordPageElement & { value: string };
+  const fromFilter = elements.get("filter-from")! as FakeRecordPageElement & { value: string };
+  const toFilter = elements.get("filter-to")! as FakeRecordPageElement & { value: string };
+
+  assert.deepEqual(modelFilter.children.map((option) => option.textContent), ["全部模型", "claude-sonnet-4-6", "gpt-5"]);
+  assert.match(recent.querySelector(".recent-key")!.textContent, /\/v1\/messages · 04-20 10:00:00/);
+
+  pager.children.find((child) => child.textContent === "2")!.click();
+  modelFilter.value = "gpt-5";
+  modelFilter.dispatch("change");
+  assert.deepEqual(ids(), recentKeys.filter((_, index) => index % 3 === 0).map((item) => item.requestId));
+  assert.equal(pager.children.length, 0);
+
+  // 09:50 through 09:55 inclusive covers indexes 5..10; with gpt-5 that leaves 6 and 9.
+  fromFilter.value = "2026-04-20T09:50";
+  toFilter.value = "2026-04-20T09:55";
+  toFilter.dispatch("change");
+  assert.deepEqual(ids(), [recentKeys[6].requestId, recentKeys[9].requestId]);
+
+  modelFilter.value = "";
+  modelFilter.dispatch("change");
+  assert.deepEqual(ids(), recentKeys.slice(5, 11).map((item) => item.requestId));
+
+  fromFilter.value = "2027-01-01T00:00";
+  fromFilter.dispatch("change");
+  assert.deepEqual(ids(), []);
+  assert.equal(recent.querySelector(".recent-empty")?.textContent, "没有符合筛选条件的记录。");
+
+  elements.get("filter-clear")!.click();
+  assert.equal(fromFilter.value, "");
+  assert.equal(toFilter.value, "");
+  assert.deepEqual(ids(), recentKeys.slice(0, 12).map((item) => item.requestId));
+  assert.equal(pager.querySelector(".current")?.textContent, "1");
 });
 
 await runAsync("record page hides the pager when all recent requests fit on one page", async () => {

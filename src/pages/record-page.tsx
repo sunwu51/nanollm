@@ -152,7 +152,7 @@ const STYLE = /* css */ String.raw`
         font-size: 13px;
         color: var(--muted);
       }
-      input {
+      input, select {
         width: 100%;
         border: 1px solid var(--border);
         border-radius: 12px;
@@ -175,6 +175,17 @@ const STYLE = /* css */ String.raw`
         background: transparent;
         color: var(--accent);
         border: 1px solid rgba(140, 90, 47, 0.28);
+      }
+      .filters {
+        display: grid;
+        grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) auto;
+        gap: 12px;
+        align-items: end;
+        margin-top: 12px;
+      }
+      .recent-empty {
+        color: var(--muted);
+        font-size: 13px;
       }
       .actions {
         display: flex;
@@ -575,7 +586,8 @@ const STYLE = /* css */ String.raw`
         color: var(--danger);
       }
       @media (max-width: 840px) {
-        .toolbar {
+        .toolbar,
+        .filters {
           grid-template-columns: 1fr;
         }
         .kv {
@@ -593,6 +605,58 @@ const SCRIPT = String.raw`
       const recordPanelEl = document.getElementById("record-panel");
       const requestIdInput = document.getElementById("request-id");
       const requestIdOptionsEl = document.getElementById("${REQUEST_ID_DATALIST_ID}");
+      const modelFilterEl = document.getElementById("filter-model");
+      const fromFilterEl = document.getElementById("filter-from");
+      const toFilterEl = document.getElementById("filter-to");
+
+      function pad2(value) {
+        return String(value).padStart(2, "0");
+      }
+
+      // Local "MM-DD hh:mm:ss"; the list spans days, so the time alone is ambiguous.
+      function formatRecentTime(timestamp) {
+        const date = new Date(timestamp);
+        return pad2(date.getMonth() + 1) + "-" + pad2(date.getDate()) + " " +
+          pad2(date.getHours()) + ":" + pad2(date.getMinutes()) + ":" + pad2(date.getSeconds());
+      }
+
+      // datetime-local values are local time; an empty or invalid value means the bound is open.
+      function parseFilterTime(value) {
+        if (!value) return undefined;
+        const time = new Date(value).getTime();
+        return Number.isNaN(time) ? undefined : time;
+      }
+
+      function getFilteredRecentKeys(summary) {
+        const model = modelFilterEl.value || "";
+        const from = parseFilterTime(fromFilterEl.value);
+        const to = parseFilterTime(toFilterEl.value);
+        // The picker has minute precision, so "to" covers the whole selected minute.
+        const toEnd = to === undefined ? undefined : to + 59999;
+        return (summary.recentKeys || []).filter((item) =>
+          (!model || item.model === model) &&
+          (from === undefined || item.createdAt >= from) &&
+          (toEnd === undefined || item.createdAt <= toEnd));
+      }
+
+      function setModelFilterOptions(summary) {
+        const selected = modelFilterEl.value || "";
+        const models = Array.from(new Set((summary.recentKeys || []).map((item) => item.model).filter(Boolean))).sort();
+        // Keep a selected model that has aged out of the list so the filter is not reset under the user.
+        if (selected && !models.includes(selected)) models.unshift(selected);
+        modelFilterEl.textContent = "";
+        const all = document.createElement("option");
+        all.value = "";
+        all.textContent = "全部模型";
+        modelFilterEl.appendChild(all);
+        models.forEach((model) => {
+          const option = document.createElement("option");
+          option.value = model;
+          option.textContent = model;
+          modelFilterEl.appendChild(option);
+        });
+        modelFilterEl.value = selected;
+      }
 
       function normalizeRequestIdInput(value) {
         return value.trim();
@@ -615,7 +679,7 @@ const SCRIPT = String.raw`
             " · " +
             item.path +
             " · " +
-            new Date(item.createdAt).toLocaleTimeString("zh-CN");
+            formatRecentTime(item.createdAt);
           requestIdOptionsEl.appendChild(option);
         });
       }
@@ -690,7 +754,7 @@ const SCRIPT = String.raw`
         button.appendChild(actualModel);
 
         const meta = document.createElement("small");
-        meta.textContent = item.path + " · " + new Date(item.createdAt).toLocaleTimeString("zh-CN");
+        meta.textContent = item.path + " · " + formatRecentTime(item.createdAt);
         button.appendChild(meta);
 
         button.addEventListener("click", () => {
@@ -702,7 +766,13 @@ const SCRIPT = String.raw`
 
       function renderRecentList(summary) {
         recentEl.textContent = "";
-        const items = summary.recentKeys || [];
+        const items = getFilteredRecentKeys(summary);
+        if (items.length === 0 && (summary.recentKeys || []).length > 0) {
+          const empty = document.createElement("div");
+          empty.className = "recent-empty";
+          empty.textContent = "没有符合筛选条件的记录。";
+          recentEl.appendChild(empty);
+        }
         const pageCount = Math.max(1, Math.ceil(items.length / ${RECENT_PAGE_SIZE}));
         recentPage = Math.min(Math.max(recentPage, 0), pageCount - 1);
         const start = recentPage * ${RECENT_PAGE_SIZE};
@@ -765,7 +835,7 @@ const SCRIPT = String.raw`
 
       // Switch to the page holding the given request so its button is rendered; returns false if it is not in the list.
       function showRecentPageFor(summary, requestId) {
-        const index = (summary.recentKeys || []).findIndex((item) => item.requestId === requestId);
+        const index = getFilteredRecentKeys(summary).findIndex((item) => item.requestId === requestId);
         if (index < 0) return false;
         recentPage = Math.floor(index / ${RECENT_PAGE_SIZE});
         return true;
@@ -780,6 +850,7 @@ const SCRIPT = String.raw`
 
       function setSummary(summary) {
         setRequestIdOptions(summary);
+        setModelFilterOptions(summary);
         recordPanelEl.classList.toggle("recording", true);
         summaryEl.textContent = "";
         const items = [
@@ -1822,6 +1893,19 @@ const SCRIPT = String.raw`
         queryRecord().catch((error) => renderError(error instanceof Error ? error.message : "查询失败"));
       });
 
+      function applyRecentFilters() {
+        recentPage = 0;
+        renderRecentList(latestSummary);
+      }
+
+      [modelFilterEl, fromFilterEl, toFilterEl].forEach((el) => el.addEventListener("change", applyRecentFilters));
+      document.getElementById("filter-clear").addEventListener("click", () => {
+        modelFilterEl.value = "";
+        fromFilterEl.value = "";
+        toFilterEl.value = "";
+        applyRecentFilters();
+      });
+
       setSummary(INITIAL_SUMMARY);
       // Every poll queries the database, so a hidden tab skips them and catches up once it is shown again.
       setInterval(() => {
@@ -1865,6 +1949,23 @@ function RecordPage({ summary }: { summary: RecordSummary }) {
           </div>
           <div class="actions">
             <button id="query-button" type="button">查询</button>
+          </div>
+        </div>
+        <div class="filters">
+          <div>
+            <label for="filter-model">模型</label>
+            <select id="filter-model"></select>
+          </div>
+          <div>
+            <label for="filter-from">开始时间</label>
+            <input id="filter-from" type="datetime-local" />
+          </div>
+          <div>
+            <label for="filter-to">结束时间</label>
+            <input id="filter-to" type="datetime-local" />
+          </div>
+          <div class="actions">
+            <button id="filter-clear" type="button" class="secondary">清除筛选</button>
           </div>
         </div>
         <div class="summary" id="summary"></div>
