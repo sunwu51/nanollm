@@ -27,6 +27,7 @@ export interface ModelConfig {
   body_expression?: string;
   response_expression?: string;
   ignore_invalid_history?: boolean;
+  auth_token?: string;
 }
 
 export type SubscriptionProviderType = "openai-subscription" | "claude-subscription";
@@ -53,17 +54,21 @@ export interface ServerConfig {
   models: ModelConfig[];
   providers: CustomProviderConfig[];
   fallback: Record<string, string[]>;
+  /** Access tokens of fallback groups that configure `auth_token`, keyed by group name. */
+  fallback_auth_tokens?: Record<string, string>;
   record: {
     max_size: number;
   };
 }
+
+export type FallbackGroupDocument = string[] | { models?: string[]; auth_token?: string };
 
 export interface ParsedConfigDocument {
   server?: { port?: number; ttfb_timeout?: number; auth?: { token?: string } };
   record?: { max_size?: number };
   models?: Array<Partial<ModelConfig> & Pick<ModelConfig, "name" | "model">>;
   providers?: CustomProviderConfig[];
-  fallback?: Record<string, string[]>;
+  fallback?: Record<string, FallbackGroupDocument>;
 }
 
 export interface MaterializeConfigOptions {
@@ -124,6 +129,10 @@ function normalizeOptionalString(value: unknown): string | undefined {
   return normalized ? normalized : undefined;
 }
 
+function normalizeAuthToken(value: unknown): string | undefined {
+  return value === undefined || value === null ? undefined : normalizeOptionalString(resolveEnvVars(String(value)));
+}
+
 function normalizeBoolean(value: unknown, fieldName: string, defaultValue: boolean): boolean {
   if (value === undefined || value === null || value === "") return defaultValue;
   if (typeof value === "boolean") return value;
@@ -182,6 +191,7 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
   const allow_h2 = normalizeBoolean(model.allow_h2, `models.${model.name || "<unknown>"}.allow_h2`, false);
   const ignore_invalid_history = normalizeBoolean(model.ignore_invalid_history, `models.${model.name || "<unknown>"}.ignore_invalid_history`, true);
   const proxy = normalizeProxyUrl(model.proxy, `models.${model.name || "<unknown>"}.proxy`);
+  const auth_token = normalizeAuthToken(model.auth_token);
 
   const normalized = {
     ...model,
@@ -197,6 +207,8 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
   };
   delete normalized.body_expression;
   delete normalized.response_expression;
+  if (auth_token) normalized.auth_token = auth_token;
+  else delete normalized.auth_token;
   return normalized;
 }
 
@@ -280,7 +292,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
       : { ...sourceModel, api_key: resolveEnvVars(String(sourceModel.api_key || "")) };
     return normalizeModelConfig(expanded as ModelConfig, defaultTTFBTimeout);
   });
-  const fallback = document.fallback ?? {};
+  const { fallback, authTokens: fallbackAuthTokens } = normalizeFallback(document.fallback ?? {});
 
   for (const m of models) {
     if (!m.name) throw new Error("Model config missing 'name'");
@@ -300,6 +312,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
     models,
     providers,
     fallback,
+    ...(Object.keys(fallbackAuthTokens).length > 0 ? { fallback_auth_tokens: fallbackAuthTokens } : {}),
     record: {
       max_size: recordMaxSize,
     },
@@ -343,9 +356,31 @@ export function resolveModelForRequest(config: ServerConfig, name: string): Reso
   };
 }
 
+/** The access token configured on a public model or fallback group name (groups win, like routing). */
+export function getModelAuthToken(config: ServerConfig, name: string): string | undefined {
+  if (name in config.fallback) return config.fallback_auth_tokens?.[name];
+  return resolveModelForRequest(config, name)?.model.auth_token;
+}
+
 export function resolveFallbackModels(config: ServerConfig, name: string): string[] {
   if (name in config.fallback) return config.fallback[name];
   return [name];
+}
+
+/** Accepts both `group: [a, b]` and `group: { models: [a, b], auth_token: x }`. */
+function normalizeFallback(document: Record<string, FallbackGroupDocument>): { fallback: Record<string, string[]>; authTokens: Record<string, string> } {
+  const fallback: Record<string, string[]> = {};
+  const authTokens: Record<string, string> = {};
+  for (const [groupName, group] of Object.entries(document)) {
+    if (Array.isArray(group) || !group || typeof group !== "object") {
+      fallback[groupName] = group as string[];
+      continue;
+    }
+    fallback[groupName] = group.models as string[];
+    const authToken = normalizeAuthToken(group.auth_token);
+    if (authToken) authTokens[groupName] = authToken;
+  }
+  return { fallback, authTokens };
 }
 
 function validateFallback(models: ModelConfig[], fallback: Record<string, string[]>) {

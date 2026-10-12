@@ -23,7 +23,7 @@ docs/                Reference docs
 
 ## Request flow
 
-1. `server.ts` authenticates the request (`core/auth`), resolves the model and fallback group (`core/config`, `proxy/fallback`) and binds a request context (`core/request-context`).
+1. `server.ts` authenticates the request (`core/web-auth`, `core/auth`): the admin token opens everything; a model or fallback group `auth_token` passes the middleware only on model routes, and the route then checks it against the requested model name (`canAccessModel`). It then resolves the model and fallback group (`core/config`, `proxy/fallback`) and binds a request context (`core/request-context`).
 2. The request body is normalized and re-encoded for the upstream format (`converters/requests`).
 3. `proxy/proxy` calls the upstream. Subscription providers obtain tokens and headers through `subscriptions/*`.
 4. The response (or SSE stream) is converted back (`converters/responses`, `converters/streams`) and returned, with errors shaped by `core/error-details` and `core/stream-errors`.
@@ -34,7 +34,7 @@ docs/                Reference docs
 
 | Module | Files | Responsibility |
 |---|---|---|
-| `core` | `config`, `config-manager`, `auth`, `request-context`, `session-id`, `shutdown`, `startup-error`, `error-details`, `http-log`, `response-compression`, `stream-errors`, `i18n` | YAML config parsing and hot reload, bearer auth, per-request context, session id derivation, graceful shutdown, error formatting, response compression, page language selection and switch, web UI request language for server messages (`localize`) |
+| `core` | `config`, `config-manager`, `auth`, `request-context`, `session-id`, `shutdown`, `startup-error`, `error-details`, `http-log`, `response-compression`, `stream-errors`, `i18n` | YAML config parsing and hot reload, bearer / `x-api-key` auth and per-model access tokens, per-request context, session id derivation, graceful shutdown, error formatting, response compression, page language selection and switch, web UI request language for server messages (`localize`) |
 | `converters` | `shared`, `requests`, `responses`, `streams`, `index` (+ `test`, `testres`) | Normalized types and the three-way protocol conversion. See [converters.md](converters.md) |
 | `proxy` | `proxy`, `fallback`, `response-cache`, `model-test`, `upstream-models` | Upstream HTTP calls, fallback-group failure tracking and ordering, in-memory cache of Responses API output items (resolves `item_reference`), model test request builder, upstream model listing |
 | `subscriptions` | `openai-subscription`, `claude-subscription`, `claude-subscription-body`, `claude-billing`, `codex-version`, `subscription-client-compat`, `oauth-transport` | OAuth credential storage/refresh, client identity constants, Claude body transform, Rust helper transport |
