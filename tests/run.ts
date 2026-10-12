@@ -24,11 +24,12 @@ import {
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { UnsupportedContentError } from "../src/converters/shared.js";
-import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
 import { webAuth } from "../src/core/web-auth.js";
-import { withWebUIAuth } from "../src/pages/login-page.js";
+import { renderLoginPage, withWebUIAuth } from "../src/pages/login-page.js";
+import { resolveLang } from "../src/core/i18n.js";
 import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
 import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
 import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/pages/admin-config-form.js";
@@ -73,7 +74,7 @@ import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/storage/st
 import { shouldIgnoreStreamReadError } from "../src/core/stream-errors.js";
 import { extractErrorCauses, formatErrorWithCauses } from "../src/core/error-details.js";
 import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/storage/usage.js";
-import { normalizeUsage } from "../src/converters/shared.js";
+import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, requireTextOnly, type NormalizedPart, type OpenAIChatResponse } from "../src/converters/shared.js";
 import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch, waitForClientWrites } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
 
@@ -320,7 +321,7 @@ run("anthropic tool_result becomes chat tool message", () => {
   assert.equal((result.messages[2] as { tool_call_id: string }).tool_call_id, "call_1");
 });
 
-run("anthropic messages request only keeps function tools and drops typed server/custom tools", () => {
+run("anthropic messages request keeps schema tools including explicit custom type and drops server tools", () => {
   const chat = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -345,9 +346,11 @@ run("anthropic messages request only keeps function tools and drops typed server
     tool_choice: { type: "tool", name: "get_weather" },
   } as any);
 
-  assert.equal(chat.tools?.length ?? 0, 1);
+  assert.equal(chat.tools?.length ?? 0, 2);
   assert.equal((chat.tools?.[0] as any).type, "function");
   assert.equal((chat.tools?.[0] as any).function.name, "get_weather");
+  assert.equal((chat.tools?.[1] as any).type, "function");
+  assert.equal((chat.tools?.[1] as any).function.name, "apply_patch");
   assert.deepEqual((chat as any).tool_choice, { type: "function", function: { name: "get_weather" } });
 });
 
@@ -2598,7 +2601,7 @@ run("responses effort preserves existing levels and maps ultra to max across pro
     assert.equal(chat.reasoning_effort, expected);
     assert.deepEqual(chat.reasoning, { effort: expected });
     const anthropic = responsesRequestToAnthropicMessageRequest(request as any);
-    assert.deepEqual(anthropic.thinking, { type: "adaptive" });
+    assert.deepEqual(anthropic.thinking, { type: "adaptive", display: "summarized" });
     assert.equal(anthropic.output_config?.effort, expected);
     assert.deepEqual(request, snapshot);
   }
@@ -2614,7 +2617,7 @@ run("chat effort preserves five common levels and maps ultra to max from either 
       assert.equal(normalizeOpenAIChatRequest(request as any).reasoningEffort, expected);
       assert.deepEqual(chatParamsToResponsesRequest(request as any).reasoning, { effort: expected });
       const anthropic = chatParamsToAnthropicMessageRequest(request as any);
-      assert.deepEqual(anthropic.thinking, { type: "adaptive" });
+      assert.deepEqual(anthropic.thinking, { type: "adaptive", display: "summarized" });
       assert.equal(anthropic.output_config?.effort, expected);
       assert.deepEqual(request, snapshot);
     }
@@ -2654,7 +2657,7 @@ run("chat none effort disables anthropic thinking and minimal maps to low", () =
   assert.deepEqual(none.thinking, { type: "disabled" });
   assert.equal(none.output_config, undefined);
   const minimal = convert("minimal");
-  assert.deepEqual(minimal.thinking, { type: "adaptive" });
+  assert.deepEqual(minimal.thinking, { type: "adaptive", display: "summarized" });
   assert.deepEqual(minimal.output_config, { effort: "low" });
 });
 
@@ -2666,6 +2669,100 @@ run("anthropic disabled thinking maps to none effort in both OpenAI protocols", 
   assert.deepEqual(anthropicMessageRequestToResponsesRequest(request as any).reasoning, { effort: "none" });
   const noThinking = anthropicMessageRequestToChatParams({ ...request, thinking: undefined } as any) as any;
   assert.equal(noThinking.reasoning_effort, undefined);
+});
+
+run("cache retention uses the canonical spelling across both OpenAI protocols", () => {
+  for (const retention of ["in_memory", "in-memory", "24h", "1h", "provider-extension"]) {
+    const expected = retention === "in-memory" ? "in_memory" : retention;
+    const chat = { model: "test", messages: [{ role: "user", content: "hi" }], prompt_cache_retention: retention };
+    const responses = { model: "test", input: "hi", prompt_cache_retention: retention };
+    assert.equal(chatParamsToResponsesRequest(chat as any).prompt_cache_retention, expected);
+    assert.equal(responsesRequestToChatParams(responses as any).prompt_cache_retention, expected);
+    assert.equal(normalizeOpenAIChatRequest({ ...chat, prompt_cache_retention: undefined, promptCacheRetention: retention } as any).promptCacheRetention, expected);
+    assert.equal(normalizeOpenAIResponsesRequest({ ...responses, prompt_cache_retention: undefined, promptCacheRetention: retention } as any).promptCacheRetention, expected);
+  }
+  assert.equal(chatParamsToResponsesRequest({ model: "test", messages: [] }).prompt_cache_retention, undefined);
+});
+
+run("provider tool choice strings retain their original normalization", () => {
+  for (const choice of ["auto", "required", "none", "provider-extension"]) {
+    assert.deepEqual(normalizeOpenAIChatRequest({ model: "test", messages: [], tool_choice: choice } as any).toolChoice, { type: choice });
+    assert.deepEqual(normalizeOpenAIResponsesRequest({ model: "test", input: "hi", tool_choice: choice } as any).toolChoice, { type: choice });
+  }
+});
+
+run("text-only validation preserves the input array and rejects multimedia", () => {
+  const parts: NormalizedPart[] = [{ type: "text", text: "hello" }, { type: "refusal", text: "refused" }];
+  assert.strictEqual(requireTextOnly(parts, "test"), parts);
+  assert.throws(() => requireTextOnly([{ type: "image_url", url: "https://example.com/image.png" }], "test"), /test only supports text content/);
+});
+
+run("Chat responses accept provider content arrays and standard strings", () => {
+  const base: OpenAIChatResponse = {
+    id: "chat_content", object: "chat.completion", created: 1, model: "test",
+    choices: [{ index: 0, finish_reason: "stop", logprobs: null, message: {
+      role: "assistant", refusal: null, content: [{ type: "text", text: "hello" }, { type: "refusal", refusal: "refused" }],
+    } }],
+  };
+  const blocks = chatCompletionToResponsesResponse(base);
+  assert.deepEqual((blocks.output[0] as any).content, [
+    { type: "output_text", text: "hello", annotations: [] }, { type: "refusal", refusal: "refused" },
+  ]);
+  base.choices[0].message.content = "hello";
+  assert.equal((chatCompletionToResponsesResponse(base).output[0] as any).content[0].text, "hello");
+});
+
+run("Chat responses preserve content blocks and refusals for compatible providers", () => {
+  const result = responsesResponseToChatCompletion({
+    id: "resp_content", model: "test", created_at: 1, status: "completed",
+    output: [{ type: "message", role: "assistant", content: [
+      { type: "output_text", text: "first", annotations: [] },
+      { type: "output_text", text: "second", annotations: [] },
+      { type: "refusal", refusal: "refused" },
+    ] }],
+  } as any);
+  assert.deepEqual(result.choices[0].message.content, [
+    { type: "text", text: "first" }, { type: "text", text: "second" }, { type: "refusal", refusal: "refused" },
+  ]);
+  assert.equal(result.choices[0].message.refusal, "refused");
+  const refusalOnly = responsesResponseToChatCompletion({
+    id: "resp_refusal", model: "test", created_at: 1, status: "completed",
+    output: [{ type: "message", role: "assistant", content: [{ type: "refusal", refusal: "refused" }] }],
+  } as any);
+  assert.deepEqual(refusalOnly.choices[0].message.content, [{ type: "refusal", refusal: "refused" }]);
+  assert.equal(refusalOnly.choices[0].message.refusal, "refused");
+});
+
+run("usage conversion preserves missing fields and null input", () => {
+  assert.deepEqual(denormalizeUsageToOpenAIChat({ outputTokens: 9 }), { completion_tokens: 9, total_tokens: 9 });
+  assert.deepEqual(denormalizeUsageToOpenAIResponses({ outputTokens: 9 }), { output_tokens: 9, total_tokens: 9 });
+  assert.deepEqual(denormalizeUsageToAnthropic({ outputTokens: 9 }), {
+    output_tokens: 9, server_tool_use: null,
+  });
+  assert.deepEqual(denormalizeUsageToAnthropic({ inputTokens: 10, nonCacheInputTokens: 4, outputTokens: 9, cacheReadInputTokens: 6 }), {
+    input_tokens: 4, output_tokens: 9, cache_read_input_tokens: 6, server_tool_use: null,
+  });
+  assert.equal(normalizeUsage(null), undefined);
+  assert.deepEqual(normalizeUsage({ input_tokens: null, output_tokens: 9 }), normalizeUsage({ output_tokens: 9 }));
+  for (const convert of [denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, denormalizeUsageToAnthropic]) {
+    assert.equal(convert(undefined), undefined);
+    assert.equal(convert({}), undefined);
+  }
+});
+
+run("Chat metadata preserves provider values without copying or filtering", () => {
+  const metadata = { user: "kept", count: 2, nested: {}, empty: null };
+  assert.strictEqual(denormalizeToOpenAIChatRequest({
+    model: "test", messages: [], metadata,
+  }).metadata, metadata);
+  const result = anthropicMessageRequestToChatParams({
+    model: "test", max_tokens: 10, messages: [{ role: "user", content: "hi" }],
+    metadata: { user_id: "user" },
+  });
+  assert.deepEqual(result.metadata, { user_id: "user" });
+  assert.deepEqual(anthropicMessageRequestToChatParams({
+    model: "test", max_tokens: 10, messages: [], metadata: {},
+  }).metadata, { user_id: null });
 });
 
 run("service tiers map between OpenAI and Anthropic without failing", () => {
@@ -2850,7 +2947,7 @@ run("chat medium reasoning maps to anthropic adaptive thinking", () => {
   });
 
   assert.equal(anthropic.max_tokens, 128000);
-  assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
+  assert.deepEqual((anthropic as any).thinking, { type: "adaptive", display: "summarized" });
 });
 
 run("chat high reasoning maps to anthropic adaptive thinking with explicit max_tokens", () => {
@@ -2862,7 +2959,7 @@ run("chat high reasoning maps to anthropic adaptive thinking with explicit max_t
   });
 
   assert.equal(anthropic.max_tokens, 5000);
-  assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
+  assert.deepEqual((anthropic as any).thinking, { type: "adaptive", display: "summarized" });
 });
 
 
@@ -6050,7 +6147,7 @@ await runAsync("status page renders fallback group priority panel without top hi
       },
     ],
   };
-  const html = renderStatusPage({
+  const statusPayload: Parameters<typeof renderStatusPage>[0] = {
     availableWindows: [1, 3, 6],
     defaultWindowHours: 1,
     refreshedAt: Date.UTC(2026, 4, 15, 12, 10, 0),
@@ -6063,7 +6160,8 @@ await runAsync("status page renders fallback group priority panel without top hi
       { name: "group-a", members: ["beta", "alpha"] },
     ],
     usage: usagePayload,
-  });
+  };
+  const html = renderStatusPage(statusPayload);
 
   assert.match(html, /Usage in selected time range/);
   assert.match(html, /Persistent usage history requires --storage sqlite/);
@@ -6076,6 +6174,11 @@ await runAsync("status page renders fallback group priority panel without top hi
   assert.match(html, /\| Cache write /);
   assert.match(html, /未匹配部分按 DeepSeek V4.1 Flash 等效价格估算：\$0\.00/);
   assert.match(html, /\/status\?range=year&amp;year=2025&amp;model=alpha/);
+  const htmlEn = renderStatusPage(statusPayload, "en");
+  assert.deepEqual(cjkOutsideLangSwitch(htmlEn), []);
+  assert.match(htmlEn, /"avgTtfb":"Avg TTFB"/);
+  assert.match(htmlEn, /"unmatchedCost":"Models without a price/);
+  assert.match(htmlEn, /<i class="dot empty"><\/i>No data/);
   assert.match(html, /Fallback Groups/);
   assert.match(html, /id="groups"/);
   assert.match(html, /id="range-total"/);
@@ -6172,15 +6275,15 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /return "Codex"/);
   assert.match(html, /return "OpenCode"/);
   assert.match(html, /return "Other"/);
-  assert.match(html, /return "成功"/);
-  assert.match(html, /return "失败"/);
-  assert.match(html, /return "请求中\.\.\."/);
+  assert.match(html, /return T.statusSuccess/);
+  assert.match(html, /return T.statusFailure/);
+  assert.match(html, /return T.statusInProgress/);
   assert.match(html, /titleRow\.className = "recent-title-row"/);
   assert.match(html, /title\.className = "recent-title"/);
   assert.match(html, /sourceBadge\.className = "source-badge " \+ item\.source/);
   assert.match(html, /statusBadge\.className = getStatusBadgeClass\(item\)/);
   assert.match(html, /actualModel\.textContent = "-> " \+ \(item\.actualModel \|\| "-"\)/);
-  assert.match(html, /meta\.textContent = item\.path \+ " · " \+ new Date\(item\.createdAt\)\.toLocaleTimeString\("zh-CN"\)/);
+  assert.match(html, /meta\.textContent = item\.path \+ " · " \+ formatRecentTime\(item\.createdAt\)/);
   assert.match(html, /renderRecentList/);
   assert.match(html, /items\.slice\(start, start \+ 12\)/);
   assert.match(html, /model\.textContent = item\.model \|\| "-"/);
@@ -6230,7 +6333,7 @@ run("model test extracts reply text from client SSE bodies", () => {
 });
 
 run("admin page relies on server cookie auth instead of client-side token storage", () => {
-  const html = renderAdminConfigPage({
+  const adminPayload = {
     version: 1,
     configPath: "C:/tmp/config.yaml",
     effectiveConfig: { port: 3000, models: [], fallback: {}, record: { max_size: 10 } },
@@ -6257,7 +6360,8 @@ run("admin page relies on server cookie auth instead of client-side token storag
       ],
       fallbackGroups: [],
     },
-  } as any);
+  };
+  const html = renderAdminConfigPage(adminPayload);
   assert.match(html, /fetch\("\/admin\/config\/data"/);
   assert.match(html, /fetch\("\/admin\/config\/apply"/);
   assert.match(html, /href="\/status"/);
@@ -6285,6 +6389,20 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.match(html, /pelican/);
   assert.match(html, /删除供应商/);
   assert.match(html, /不能覆盖 name\/provider\/base_url\/api_key\/model/);
+
+  const htmlEn = renderAdminConfigPage(adminPayload, "en");
+  assert.deepEqual(cjkOutsideLangSwitch(htmlEn), []);
+  assert.match(htmlEn, /<html lang="en">/);
+  assert.match(htmlEn, /type="button">Save and apply<\/button>/);
+  assert.match(htmlEn, /<div class="page-corner scrolls"><div class="lang-switch"/);
+  assert.doesNotMatch(htmlEn, /class="back-admin"/);
+  // Both languages carry the same keys, and each template uses the same {placeholders}.
+  const messagesOf = (page: string) => JSON.parse(/const T = (\{.*?\});\r?\n/.exec(page)![1]) as Record<string, string>;
+  const zhMessages = messagesOf(html);
+  const enMessages = messagesOf(htmlEn);
+  assert.deepEqual(Object.keys(enMessages), Object.keys(zhMessages));
+  const placeholders = (text: string) => (text.match(/\{\w+\}/g) ?? []).filter((item) => item !== "{s}").sort();
+  for (const key of Object.keys(zhMessages)) assert.deepEqual(placeholders(enMessages[key]), placeholders(zhMessages[key]), key);
   assert.match(html, /function bindExpressionField/);
   assert.match(html, /bindExpressionField\(grid, model, "body_expression"/);
   assert.match(html, /bindExpressionField\(grid, model, "response_expression"/);
@@ -6359,6 +6477,10 @@ class FakeRecordPageElement {
 
   click() {
     if (!this.disabled) this.listeners.get("click")?.forEach((listener) => listener());
+  }
+
+  dispatch(type: string) {
+    this.listeners.get(type)?.forEach((listener) => listener());
   }
 
   focus() {
@@ -6443,7 +6565,7 @@ async function runRecordPageScript(recentKeys: RecentKey[], search: string, reco
     URLSearchParams,
   }));
   await waitForCondition(() => replacedUrls.length > 0);
-  return { doc, recent: elements.get("recent")!, pager: elements.get("recent-pager")!, fetchedUrls };
+  return { doc, elements, recent: elements.get("recent")!, pager: elements.get("recent-pager")!, fetchedUrls };
 }
 
 await runAsync("record page paginates recent requests and jumps to the page of a requestId from the URL", async () => {
@@ -6470,6 +6592,94 @@ await runAsync("record page paginates recent requests and jumps to the page of a
   pager.children.find((child) => child.textContent === "1")!.click();
   assert.deepEqual(recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId), recentKeys.slice(0, 12).map((item) => item.requestId));
   assert.equal(pager.children.find((child) => child.textContent === "‹")?.disabled, true);
+});
+
+await runAsync("record page filters recent requests by model and time range and shows MM-DD times", async () => {
+  const base = new Date(2026, 3, 20, 10, 0, 0).getTime();
+  const recentKeys = makeRecentKeys(30).map((item, index) => ({
+    ...item,
+    model: index % 3 === 0 ? "gpt-5" : "claude-sonnet-4-6",
+    createdAt: base - index * 60_000,
+  }));
+  const { elements, recent, pager } = await runRecordPageScript(recentKeys, "?requestId=" + recentKeys[0].requestId, makeRecordFor(recentKeys[0]));
+  const ids = () => recent.querySelectorAll(".recent-key").map((button) => button.dataset.requestId);
+  const modelFilter = elements.get("filter-model")! as FakeRecordPageElement & { value: string };
+  const fromFilter = elements.get("filter-from")! as FakeRecordPageElement & { value: string };
+  const toFilter = elements.get("filter-to")! as FakeRecordPageElement & { value: string };
+
+  assert.deepEqual(modelFilter.children.map((option) => option.textContent), ["全部模型", "claude-sonnet-4-6", "gpt-5"]);
+  assert.match(recent.querySelector(".recent-key")!.textContent, /\/v1\/messages · 04-20 10:00:00/);
+
+  pager.children.find((child) => child.textContent === "2")!.click();
+  modelFilter.value = "gpt-5";
+  modelFilter.dispatch("change");
+  assert.deepEqual(ids(), recentKeys.filter((_, index) => index % 3 === 0).map((item) => item.requestId));
+  assert.equal(pager.children.length, 0);
+
+  // 09:50 through 09:55 inclusive covers indexes 5..10; with gpt-5 that leaves 6 and 9.
+  fromFilter.value = "2026-04-20T09:50";
+  toFilter.value = "2026-04-20T09:55";
+  toFilter.dispatch("change");
+  assert.deepEqual(ids(), [recentKeys[6].requestId, recentKeys[9].requestId]);
+
+  modelFilter.value = "";
+  modelFilter.dispatch("change");
+  assert.deepEqual(ids(), recentKeys.slice(5, 11).map((item) => item.requestId));
+
+  fromFilter.value = "2027-01-01T00:00";
+  fromFilter.dispatch("change");
+  assert.deepEqual(ids(), []);
+  assert.equal(recent.querySelector(".recent-empty")?.textContent, "没有符合筛选条件的记录。");
+
+  elements.get("filter-clear")!.click();
+  assert.equal(fromFilter.value, "");
+  assert.equal(toFilter.value, "");
+  assert.deepEqual(ids(), recentKeys.slice(0, 12).map((item) => item.requestId));
+  assert.equal(pager.querySelector(".current")?.textContent, "1");
+});
+
+run("page language follows the switch cookie, then the browser's preferred language, defaulting to English", () => {
+  assert.equal(resolveLang(undefined, undefined), "en");
+  assert.equal(resolveLang(undefined, "zh-CN,zh;q=0.9,en;q=0.8"), "zh");
+  assert.equal(resolveLang(undefined, "zh-TW"), "zh");
+  assert.equal(resolveLang(undefined, "zh"), "zh");
+  assert.equal(resolveLang(undefined, "en-US,en;q=0.9,zh-CN;q=0.8"), "en");
+  assert.equal(resolveLang(undefined, "en;q=0.5, zh-CN;q=0.8"), "zh");
+  assert.equal(resolveLang(undefined, "fr-FR,fr;q=0.9"), "en");
+  assert.equal(resolveLang(undefined, "*"), "en");
+  assert.equal(resolveLang("a=1; nanollm_lang=en", "zh-CN"), "en");
+  assert.equal(resolveLang("nanollm_lang=zh", "en-US"), "zh");
+  assert.equal(resolveLang("nanollm_lang=fr", "zh-CN"), "zh");
+});
+
+// The language switch itself is the only CJK text an English page may contain.
+function cjkOutsideLangSwitch(html: string): string[] {
+  return html.replace(/<div class="lang-switch"[\s\S]*?<\/div>/, "").match(/[\u4e00-\u9fff]+/g) ?? [];
+}
+
+run("record and login pages render in English with a language switch", () => {
+  const summary = { enabled: true, capturedCount: 1, limit: 100, sessionStartedAt: Date.UTC(2026, 3, 20), recentKeys: makeRecentKeys(1) };
+  const recordEn = renderRecordPage(summary, "en");
+  assert.deepEqual(cjkOutsideLangSwitch(recordEn), []);
+  assert.match(recordEn, /<html lang="en">/);
+  assert.match(recordEn, /Clear filters/);
+  assert.match(recordEn, /"allModels":"All models"/);
+  assert.match(recordEn, /--label-expand: "Expand"/);
+  assert.match(recordEn, /<div class="page-corner"><a class="back-admin" href="\/admin">← Admin<\/a><div class="lang-switch"/);
+  assert.match(recordEn, /<button type="button" aria-pressed="true" disabled>EN<\/button>/);
+  assert.match(recordEn, /onclick="document\.cookie='nanollm_lang=zh; Path=\/;[^"]*location\.reload\(\)">中文<\/button>/);
+  assert.equal(recordEn.match(/<script>/g)?.length, 1);
+
+  const recordZh = renderRecordPage(summary, "zh");
+  assert.match(recordZh, /<html lang="zh-CN">/);
+  assert.match(recordZh, /清除筛选/);
+  assert.match(recordZh, /<button type="button" aria-pressed="true" disabled>中文<\/button>/);
+
+  const loginEn = renderLoginPage("/record", true, "en");
+  assert.deepEqual(cjkOutsideLangSwitch(loginEn), []);
+  assert.match(loginEn, /Wrong password/);
+  assert.doesNotMatch(loginEn, /class="back-admin"/);
+  assert.match(renderLoginPage("/record", true, "zh"), /密码错误/);
 });
 
 await runAsync("record page hides the pager when all recent requests fit on one page", async () => {
@@ -6593,9 +6803,10 @@ run("record page stream reconstructor handles Anthropic server_tool_use events",
   });
 });
 
-run("server.ts keeps @ts-nocheck as its first line so the build stays type-check free", () => {
-  // The directive is ignored unless it precedes every statement; an import above it broke the Railway build.
-  assert.equal(readFileSync(join(process.cwd(), "server.ts"), "utf8").split(/\r?\n/, 1)[0], "// @ts-nocheck");
+run("server and protocol converters keep TypeScript checking enabled", () => {
+  for (const path of ["server.ts", "src/proxy/proxy.ts", "src/converters/requests.ts", "src/converters/responses.ts", "src/converters/streams.ts"]) {
+    assert.doesNotMatch(readFileSync(join(process.cwd(), path), "utf8"), /^\s*\/\/\s*@ts-nocheck/m);
+  }
 });
 
 run("http log level only keeps /v1 lifecycle logs at info", () => {
@@ -6681,7 +6892,8 @@ await runAsync("WebUI login redirects pages, validates passwords, and preserves 
   const failure = await submit("wrong", "/record?requestId=abc");
   assert.equal(failure.status, 401);
   assert.equal(failure.headers.get("set-cookie"), null);
-  assert.match(await failure.text(), /密码错误/);
+  // No Accept-Language header, so the login page falls back to English.
+  assert.match(await failure.text(), /Wrong password/);
   const success = await submit("top-secret", "/record?requestId=abc&token=secret");
   assert.equal(success.status, 303);
   assert.equal(success.headers.get("location"), "/record?requestId=abc");
@@ -7310,12 +7522,12 @@ run("admin page disables testing unsaved models and groups custom provider model
   assert.match(html, /testButton\.disabled = true/);
   assert.match(html, /"\/admin\/upstream-models"/);
   assert.match(html, /function openFetchModelsDialog\(provider\)/);
-  assert.match(html, /createActionButton\("拉取模型"/);
+  assert.match(html, /createActionButton\(T\.fetchModels/);
   assert.match(html, /"全选"/);
   assert.match(html, /function buildModelGroupCard/);
   assert.match(html, /const expandedModelGroups = new Set\(\)/);
   assert.match(html, /加供应商名后缀/);
-  assert.match(html, /createActionButton\("删除全部模型"/);
+  assert.match(html, /createActionButton\(T\.deleteAllModels/);
   assert.match(html, /function isGroupSuffixed\(providerName\)/);
 });
 
@@ -7332,10 +7544,10 @@ run("admin page fetches subscription models from saved credentials and lists pro
     form: { server: { port: "3000", ttfb_timeout: "" }, record: { max_size: "10" }, providers: [], models: [], fallbackGroups: [] },
   });
   assert.match(html, /"\/admin\/providers\/" \+ encodeURIComponent\(providerName\) \+ "\/models"/);
-  assert.doesNotMatch(html, /if \(!SUBSCRIPTION_PROVIDERS\.includes\(provider\.provider\)\) \{\n\s+actions\.appendChild\(createActionButton\("拉取模型"/);
+  assert.doesNotMatch(html, /if \(!SUBSCRIPTION_PROVIDERS\.includes\(provider\.provider\)\) \{\n\s+actions\.appendChild\(createActionButton\(T\.fetchModels/);
   assert.match(html, /const showHeadings = groupKeys\.length > 0 && standalone\.length > 0/);
   assert.match(html, /\.card\.group-card \{/);
-  assert.match(html, /kindBadge\.textContent = "供应商"/);
+  assert.match(html, /kindBadge\.textContent = T\.providerBadge/);
 });
 
 run("admin page marks conflicting model and fallback names at provider, model and banner level", () => {
@@ -7347,11 +7559,11 @@ run("admin page marks conflicting model and fallback names at provider, model an
     form: { server: { port: "3000", ttfb_timeout: "" }, record: { max_size: "10" }, providers: [], models: [], fallbackGroups: [] },
   });
   assert.match(html, /function getNameConflicts\(\)/);
-  assert.match(html, /formState\.fallbackGroups\.forEach\(\(group\) => add\(normalizeModelRef\(group\.name\), \{ label: "fallback 分组"/);
+  assert.match(html, /formState\.fallbackGroups\.forEach\(\(group\) => add\(normalizeModelRef\(group\.name\), \{ label: T\.fallbackGroupLabel/);
   assert.match(html, /function buildConflictBanner\(conflicts\)/);
   assert.match(html, /function locateModel\(model\)/);
   assert.match(html, /个模型名冲突/);
-  assert.match(html, /badge\.textContent = "⚠ 名称冲突"/);
+  assert.match(html, /badge\.textContent = "⚠ " \+ T\.nameConflict/);
   assert.match(html, /invalid: Boolean\(nameConflict\)/);
   assert.match(html, /invalid: Boolean\(groupNameSources\)/);
   assert.match(html, /\.card\.group-card\.conflict \{/);
@@ -7367,10 +7579,10 @@ run("admin page links provider cards to their model groups and back", () => {
   });
   assert.match(html, /function locateModelGroup\(providerName\)/);
   assert.match(html, /function locateProvider\(provider\)/);
-  assert.match(html, /" 个模型" \+ \(conflictedCount > 0/);
+  assert.match(html, /tr\(T\.modelCount, \{ n: providerModels\.length \}\) \+ \(conflictedCount > 0/);
   assert.match(html, /modelsLink\.disabled = providerModels\.length === 0/);
   assert.match(html, /card\.setAttribute\("data-model-group", providerName\)/);
-  assert.match(html, /createActionButton\("编辑供应商"/);
+  assert.match(html, /createActionButton\(T\.editProvider/);
 });
 
 run("codex model catalog request carries the Codex CLI identity and a version at or above the upstream floor", () => {
@@ -7486,6 +7698,6 @@ run("admin page only blocks subscription model fetching on this provider's own u
     form: { server: { port: "3000", ttfb_timeout: "" }, record: { max_size: "10" }, providers: [], models: [], fallbackGroups: [] },
   });
   assert.doesNotMatch(html, /if \(!saved \|\| dirty\)/);
-  assert.match(html, /if \(!saved\) \{ window\.alert\("该订阅供应商还没有保存/);
+  assert.match(html, /if \(!saved\) \{ window\.alert\(T\.subscriptionNotSaved\)/);
   assert.match(html, /\(saved\.proxy \|\| ""\) !== \(provider\.proxy \|\| ""\)\.trim\(\)/);
 });

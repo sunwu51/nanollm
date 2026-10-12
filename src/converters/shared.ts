@@ -1,19 +1,38 @@
 import type { Message, MessageCreateParamsBase, MessageParam, ToolChoice, ToolUnion } from "@anthropic-ai/sdk/resources/messages/messages";
 import type {
   ChatCompletion,
+  ChatCompletionChunk,
   ChatCompletionCreateParamsBase,
   ChatCompletionMessageParam,
   ChatCompletionMessageToolCall,
 } from "openai/resources/chat/completions/completions";
 import type { Response, ResponseCreateParamsBase, ResponseInputItem, ResponseOutputItem } from "openai/resources/responses/responses";
 
-export type OpenAIChatRequest = ChatCompletionCreateParamsBase;
+export type OpenAIChatRequest = Omit<ChatCompletionCreateParamsBase, "metadata"> & {
+  metadata?: Record<string, unknown> | null;
+  reasoning?: { effort?: string | null };
+};
 export type OpenAIResponsesRequest = ResponseCreateParamsBase;
 export type AnthropicMessagesRequest = MessageCreateParamsBase;
 
-export type OpenAIChatResponse = ChatCompletion;
-export type OpenAIResponsesResponse = Response;
-export type AnthropicMessagesResponse = Message;
+export type OpenAIChatResponseContent = string | Array<
+  | { type: "text"; text: string }
+  | { type: "refusal"; refusal: string }
+> | null;
+
+/** Providers may omit usage fields or return null instead of the SDK's complete object. */
+type CompatibleUsage<T> = T | Record<string, unknown> | null;
+
+/** Compatible providers may use content blocks where OpenAI uses a string. */
+export type OpenAIChatResponse = Omit<ChatCompletion, "choices" | "usage"> & {
+  usage?: CompatibleUsage<ChatCompletion["usage"]>;
+  choices: Array<Omit<ChatCompletion["choices"][number], "message"> & {
+    message: Omit<ChatCompletion["choices"][number]["message"], "content"> & { content: OpenAIChatResponseContent };
+  }>;
+};
+export type OpenAIResponsesResponse = Omit<Response, "usage"> & { usage?: CompatibleUsage<Response["usage"]> };
+export type AnthropicMessagesResponse = Omit<Message, "usage"> & { usage: CompatibleUsage<Message["usage"]> };
+export type OpenAIChatStreamChunk = Omit<ChatCompletionChunk, "usage"> & { usage?: CompatibleUsage<ChatCompletionChunk["usage"]> };
 
 export type NormalizedRole = "system" | "developer" | "user" | "assistant" | "tool" | "function";
 
@@ -55,6 +74,7 @@ export interface NormalizedMessage {
   parts: NormalizedPart[];
   toolCalls?: NormalizedToolCall[];
   toolCallId?: string;
+  isError?: boolean;
   name?: string;
 }
 
@@ -74,7 +94,7 @@ export interface NormalizedRequest {
   stopSequences?: string[];
   parallelToolCalls?: boolean;
   promptCacheKey?: string;
-  promptCacheRetention?: "in-memory" | "24h" | null;
+  promptCacheRetention?: string | null;
   safetyIdentifier?: string;
   reasoningEffort?: string | null;
   thinkingBudgetTokens?: number | null;
@@ -83,7 +103,7 @@ export interface NormalizedRequest {
     | { type: "text" }
     | { type: "json_object" }
     | { type: "json_schema"; name: string; schema?: Record<string, unknown>; description?: string; strict?: boolean | null };
-  cacheControl?: { type: string } | null;
+  cacheControl?: { type: "ephemeral" } | null;
 }
 
 export interface NormalizedUsage {
@@ -146,11 +166,9 @@ export function collapseText(parts: NormalizedPart[]): string {
     .join("\n");
 }
 
-export function requireTextOnly(parts: NormalizedPart[], context: string): NormalizedPart[] {
-  for (const part of parts) {
-    if (part.type !== "text" && part.type !== "refusal") {
-      fail(`${context} only supports text content`);
-    }
+export function requireTextOnly(parts: NormalizedPart[], context: string): Extract<NormalizedPart, { type: "text" | "refusal" }>[] {
+  if (!parts.every((part) => part.type === "text" || part.type === "refusal")) {
+    fail(`${context} only supports text content`);
   }
   return parts;
 }
@@ -306,8 +324,9 @@ export function normalizeReasoningEffortFromBudget(thinkingBudgetTokens: number 
   return "high";
 }
 
-export function normalizeUsage(usage: Record<string, unknown> | null | undefined): NormalizedUsage | undefined {
-  if (!usage) return undefined;
+export function normalizeUsage(value: unknown): NormalizedUsage | undefined {
+  if (!value) return undefined;
+  const usage = value as Record<string, unknown>;
 
   const providerInputTokens = asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens);
   const outputTokens = asNumber(usage.output_tokens) ?? asNumber(usage.completion_tokens);

@@ -1,4 +1,3 @@
-// @ts-nocheck
 import "dotenv/config";
 import { JobModelCatalog } from "./src/jobs/job-model-catalog.js";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
@@ -6,11 +5,14 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { Hono } from "hono";
 import type { Context } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { Server as HttpServer } from "node:http";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { randomUUID } from "node:crypto";
 import type { ModelConfig, ServerConfig } from "./src/core/config.js";
 import { webAuth } from "./src/core/web-auth.js";
+import { localize, resolveLang, runWithLang } from "./src/core/i18n.js";
 import { withWebUIAuth } from "./src/pages/login-page.js";
 import { getPublicModelNames, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
 import { ConfigManager } from "./src/core/config-manager.js";
@@ -208,11 +210,23 @@ app.use("*", async (c, next) => {
 
 app.use("*", webAuth(() => configManager.getActiveSnapshot().effectiveConfig.auth?.token));
 
+// Errors from the admin and jobs APIs are shown in the web UI, so they follow the page language.
+app.use("*", async (c, next) => {
+  if (c.req.path.startsWith("/admin/") || c.req.path.startsWith("/jobs/")) {
+    return runWithLang(pageLang(c), next);
+  }
+  return next();
+});
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 type Normalizer = (body: unknown) => NormalizedRequest;
 type Denormalizer = (normalized: NormalizedResponse) => unknown;
 type UpstreamOptions = { userAgent?: string; attemptIndex?: number; modelName?: string; signal?: AbortSignal };
+
+function pageLang(c: Context) {
+  return resolveLang(c.req.header("cookie"), c.req.header("accept-language"));
+}
 const fallbackFailureTracker = new FallbackFailureTracker();
 const statusStore: StatusStoreLike = sqliteStorage ? new SqliteStatusStore(sqliteStorage.client) : new StatusStore();
 const usageStore: UsageStoreLike = sqliteStorage ? new SqliteUsageStore(sqliteStorage.client) : new UsageStore();
@@ -498,10 +512,10 @@ const MODEL_TEST_RAW_LIMIT = 20000;
 async function testConfiguredModel(name: string, message: string, config: ServerConfig) {
   const model = resolveModel(config, name);
   if (!model) {
-    return { ok: false as const, status: 404, error: `模型 '${name}' 不在当前生效的配置中，请先保存配置。` };
+    return { ok: false as const, status: 404, error: localize(`模型 '${name}' 不在当前生效的配置中，请先保存配置。`, `Model '${name}' is not in the active config. Save the config first.`) };
   }
   if (model.provider === "openai-image") {
-    return { ok: false as const, status: 400, error: "openai-image 模型不支持消息测试。" };
+    return { ok: false as const, status: 400, error: localize("openai-image 模型不支持消息测试。", "openai-image models can't be tested with a message.") };
   }
 
   const { path, body } = buildModelTestRequest(model.provider, model.name, message);
@@ -523,6 +537,9 @@ async function testConfiguredModel(name: string, message: string, config: Server
   const isStream = (response.headers.get("content-type") ?? "").includes("text/event-stream");
   const reply = response.ok && isStream ? extractModelTestReply(model.provider, raw) : "";
   const errorBody = response.ok ? undefined : (raw ? tryParseJSON(raw) : null);
+  const errorValue = errorBody && typeof errorBody === "object" && "error" in errorBody ? errorBody.error : undefined;
+  const errorMessage = typeof errorValue === "string" ? errorValue
+    : errorValue && typeof errorValue === "object" && "message" in errorValue && typeof errorValue.message === "string" ? errorValue.message : undefined;
 
   return {
     ok: response.ok,
@@ -532,7 +549,7 @@ async function testConfiguredModel(name: string, message: string, config: Server
     upstreamModel: model.model,
     durationMs,
     reply,
-    error: response.ok ? undefined : (errorBody?.error?.message ?? errorBody?.error ?? `HTTP ${response.status}`),
+    error: response.ok ? undefined : (errorMessage ?? `HTTP ${response.status}`),
     raw: raw.length > MODEL_TEST_RAW_LIMIT ? raw.slice(0, MODEL_TEST_RAW_LIMIT) + "\n...(truncated)" : raw,
   };
 }
@@ -977,7 +994,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
           ...(causes.length ? { causes } : {}),
           ...(lastError.upstream ? { upstream: lastError.upstream } : {}),
         };
-        const response = c.json(errorBody, status);
+        const response = c.json(errorBody, status as ContentfulStatusCode);
         setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
         setRecordedClientResponseBody({ body: errorBody });
         finalizeRecordedRequest({});
@@ -1229,9 +1246,9 @@ app.get("/", (c) => {
 
 app.get("/health", (c) => c.json({ ok: true }));
 
-app.get("/status", async (c) => c.html(withWebUIAuth(renderStatusPage(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c)))));
+app.get("/status", async (c) => c.html(withWebUIAuth(renderStatusPage(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c), pageLang(c)))));
 app.get("/status/data", async (c) => c.json(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c)));
-app.get("/record", async (c) => c.html(withWebUIAuth(renderRecordPage(await getRecordSummary()))));
+app.get("/record", async (c) => c.html(withWebUIAuth(renderRecordPage(await getRecordSummary(), pageLang(c)))));
 app.get("/record/summary", async (c) => c.json(await getRecordSummary()));
 app.get("/record/:requestId", async (c) => {
   const requestId = c.req.param("requestId");
@@ -1273,11 +1290,11 @@ app.post("/record/:requestId/replay", async (c) => {
     replayOf: record.requestId,
     summary: await getRecordSummary(),
     note: "Sensitive client headers are not replayed; provider auth uses current config.",
-  }, result.status);
+  }, result.status as ContentfulStatusCode);
 });
 
-app.get("/admin", (c) => c.html(withWebUIAuth(renderAdminConfigPage(buildConfigAdminPayload()))));
-app.get("/jobs", (c) => c.html(withWebUIAuth(renderJobsPage())));
+app.get("/admin", (c) => c.html(withWebUIAuth(renderAdminConfigPage(buildConfigAdminPayload(), pageLang(c)))));
+app.get("/jobs", (c) => c.html(withWebUIAuth(renderJobsPage(pageLang(c)))));
 app.route("/jobs/api", createJobRoutes(jobScheduler,
   () => configManager.getActiveSnapshot().effectiveConfig.models, storageMode, jobModelCatalog));
 app.post("/admin/providers/:name/device-login", async (c) => {
@@ -1350,7 +1367,7 @@ app.post("/admin/models/:name/test", async (c) => {
   const message = typeof body.message === "string" && body.message.trim() ? body.message : DEFAULT_MODEL_TEST_MESSAGE;
   try {
     const result = await testConfiguredModel(c.req.param("name"), message, configManager.getActiveSnapshot().effectiveConfig);
-    return c.json(result, result.ok ? 200 : result.status);
+    return c.json(result, (result.ok ? 200 : result.status) as ContentfulStatusCode);
   } catch (error) {
     return c.json({ ok: false, error: error instanceof Error ? error.message : String(error) }, 500);
   }
@@ -1365,7 +1382,7 @@ app.get("/admin/providers/:name/models", async (c) => {
       return c.json({ ok: true, models: await fetchClaudeSubscriptionModels(name, provider.proxy, identityHeaders) });
     }
     if (provider?.provider === "openai-subscription") return c.json({ ok: true, models: await fetchSubscriptionModels(name, provider.proxy) });
-    return c.json({ ok: false, error: "订阅供应商不在当前生效的配置中，请先保存配置。" }, 404);
+    return c.json({ ok: false, error: localize("订阅供应商不在当前生效的配置中，请先保存配置。", "The subscription provider is not in the active config. Save the config first.") }, 404);
   } catch (error) {
     return c.json({ ok: false, error: error instanceof Error ? error.message : String(error) }, 400);
   }
@@ -1487,7 +1504,7 @@ server.once("error", (error: Error & { code?: string }) => {
 });
 
 const shutdown = installGracefulShutdown({
-  server,
+  server: server as HttpServer,
   stopBackgroundWork: () => { configManager.dispose(); jobScheduler.stop(); },
   cleanup: async () => {
     await jobScheduler.flush();

@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import type { CustomProviderConfig } from "../core/config.js";
+import { localize } from "../core/i18n.js";
 import { oauthPost } from "./oauth-transport.js";
 import { CLAUDE_CODE_USER_AGENT, CLAUDE_OAUTH_BETA } from "./subscription-client-compat.js";
 import { extractUpstreamModelIds } from "../proxy/upstream-models.js";
@@ -197,7 +198,7 @@ export function startClaudeLogin(provider: CustomProviderConfig): ClaudeLoginSta
 /** Accepts the full callback URL, or the `code#state` text shown on Claude's callback page. */
 export function parseClaudeCallback(input: string): { code: string; state?: string } {
   const text = input.trim();
-  if (!text) throw new Error("请粘贴授权完成后浏览器地址栏中的完整 callback URL");
+  if (!text) throw new Error(localize("请粘贴授权完成后浏览器地址栏中的完整 callback URL", "Paste the full callback URL from the browser's address bar after authorizing"));
   let code: string | null = null;
   let state: string | null = null;
   if (/^https?:\/\//i.test(text)) {
@@ -215,16 +216,16 @@ export function parseClaudeCallback(input: string): { code: string; state?: stri
     code = codePart;
     state ||= statePart || null;
   }
-  if (!code) throw new Error("Callback URL 中没有找到授权 code");
+  if (!code) throw new Error(localize("Callback URL 中没有找到授权 code", "No authorization code found in the callback URL"));
   return { code, ...(state ? { state } : {}) };
 }
 
 export async function completeClaudeLogin(sessionId: string, callback: string): Promise<{ status: "authenticated"; email?: string; subscriptionType?: string | null }> {
   const session = loginSessions.get(sessionId);
-  if (!session || session.expiresAt <= Date.now()) { loginSessions.delete(sessionId); throw new Error("Claude 登录会话已过期，请重新点击登录"); }
+  if (!session || session.expiresAt <= Date.now()) { loginSessions.delete(sessionId); throw new Error(localize("Claude 登录会话已过期，请重新点击登录", "The Claude sign-in session expired. Click Sign in again")); }
   const { code, state } = parseClaudeCallback(callback);
-  if (!state) throw new Error("Callback URL 中缺少 state，请复制完整的 callback URL");
-  if (state !== session.state) throw new Error("OAuth state 不匹配，请使用本次登录打开的授权页面生成的 callback URL");
+  if (!state) throw new Error(localize("Callback URL 中缺少 state，请复制完整的 callback URL", "The callback URL has no state. Copy the full callback URL"));
+  if (state !== session.state) throw new Error(localize("OAuth state 不匹配，请使用本次登录打开的授权页面生成的 callback URL", "The OAuth state doesn't match. Use the callback URL from the authorization page opened for this sign-in"));
   const token = await tokenRequest({
     grant_type: "authorization_code",
     code,

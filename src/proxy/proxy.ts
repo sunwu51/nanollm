@@ -1,4 +1,3 @@
-// @ts-nocheck
 import type { ModelConfig } from "../core/config.js";
 import { SSEParser, type StreamFormat } from "../converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "../converters/shared.js";
@@ -21,7 +20,7 @@ import {
 } from "../storage/record.js";
 import { runInNewContext } from "node:vm";
 import { randomUUID } from "node:crypto";
-import { Agent, ProxyAgent, fetch as undiciFetch } from "undici";
+import { Agent, ProxyAgent, fetch as undiciFetch, type Dispatcher, type RequestInit as UndiciRequestInit } from "undici";
 import { extractErrorCauses } from "../core/error-details.js";
 import { getClientIp, getClientRequestHeaders } from "../core/request-context.js";
 import { getCachedSubscriptionCredential, ensureSubscriptionCredential, SUBSCRIPTION_URL } from "../subscriptions/openai-subscription.js";
@@ -666,7 +665,7 @@ async function upstreamFetchToUrl(
   let timeoutHandle: NodeJS.Timeout | undefined;
   const startedAt = Date.now();
 
-  const fetchOptions: RequestInit = {
+  const fetchOptions: RequestInit & { dispatcher?: Dispatcher } = {
     method: "POST",
     headers,
     body,
@@ -694,7 +693,9 @@ async function upstreamFetchToUrl(
 
   let res: Response;
   try {
-    res = await undiciFetch(url, fetchOptions);
+    // DOM and Undici Fetch declarations differ; bridge them only at this boundary.
+    // The assertions preserve the original request body and response objects.
+    res = await undiciFetch(url, fetchOptions as unknown as UndiciRequestInit) as unknown as Response;
   } catch (error) {
     if (abortController?.signal.aborted && error === abortController.signal.reason) {
       setRecordedAttemptError({

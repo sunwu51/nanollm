@@ -1,7 +1,8 @@
 import { renderToString } from "hono/jsx/dom/server";
 import { LOGO_DATA_URI } from "./logo.js";
 import type { StatusCell } from "../storage/status.js";
-import { USAGE_SCRIPT, USAGE_STYLE, UsageSection, type UsagePagePayload } from "./usage-page.js";
+import { USAGE_MESSAGES, USAGE_SCRIPT, USAGE_STYLE, UsageSection, type UsagePagePayload } from "./usage-page.js";
+import { htmlLang, withPageCorner, type Lang } from "../core/i18n.js";
 
 function serializeForScript(value: unknown): string {
   return JSON.stringify(value)
@@ -408,8 +409,40 @@ ${USAGE_STYLE}
       }
 `;
 
+const zh = {
+  locale: "zh-CN",
+  totalRequests: "总请求",
+  successRequests: "成功",
+  successRate: "成功率",
+  avgTtfb: "平均首包",
+  avgDuration: "平均总耗时",
+  cacheHitRate: "Cache 命中率",
+  avgSpeed: "平均速度",
+  noFallbackGroups: "未配置 fallback 分组",
+  rangeTotalLabel: "当前时间范围总用量",
+  noData: "无数据",
+};
+
+const MESSAGES: Record<Lang, typeof zh> = {
+  zh,
+  en: {
+    locale: "en-US",
+    totalRequests: "Requests",
+    successRequests: "Succeeded",
+    successRate: "Success rate",
+    avgTtfb: "Avg TTFB",
+    avgDuration: "Avg duration",
+    cacheHitRate: "Cache hit rate",
+    avgSpeed: "Avg speed",
+    noFallbackGroups: "No fallback groups configured",
+    rangeTotalLabel: "Total usage in the selected time range",
+    noData: "No data",
+  },
+};
+
 const SCRIPT = String.raw`
       const STATUS_DATA = __INITIAL_PAYLOAD__;
+      const T = __MESSAGES__;
       ${USAGE_SCRIPT.replace("const USAGE_DATA = __INITIAL_USAGE_PAYLOAD__;", "const USAGE_DATA = STATUS_DATA.usage;")}
       const TICKS_EL = document.getElementById("ticks");
       const ROWS_EL = document.getElementById("rows");
@@ -421,7 +454,7 @@ const SCRIPT = String.raw`
       const TOOLTIP_GRID_EL = document.getElementById("tooltip-grid");
       const BUCKETS_PER_HOUR = 12;
       const REFRESH_INTERVAL_MS = 5000;
-      const FORMATTER = new Intl.DateTimeFormat("zh-CN", {
+      const FORMATTER = new Intl.DateTimeFormat(T.locale, {
         month: "2-digit",
         day: "2-digit",
         hour: "2-digit",
@@ -490,17 +523,17 @@ const SCRIPT = String.raw`
         TOOLTIP_TITLE_EL.textContent = modelName + " @ " + formatBucket(cell.bucketStart);
         TOOLTIP_GRID_EL.textContent = "";
         const entries = [
-          ["总请求", String(cell.totalRequests)],
-          ["成功", String(cell.successRequests)],
-          ["成功率", formatRate(cell)],
-          ["平均首包", formatMetric(cell.avgTtfbMs)],
-          ["平均总耗时", formatMetric(cell.avgDurationMs)],
+          [T.totalRequests, String(cell.totalRequests)],
+          [T.successRequests, String(cell.successRequests)],
+          [T.successRate, formatRate(cell)],
+          [T.avgTtfb, formatMetric(cell.avgTtfbMs)],
+          [T.avgDuration, formatMetric(cell.avgDurationMs)],
           ["Input", formatToken(cell.nonCacheInputTokens)],
           ["Cache write", formatToken(cell.cacheWriteInputTokens)],
           ["Cache", formatToken(cell.cacheReadInputTokens)],
-          ["Cache 命中率", formatCacheHitRate(cell)],
+          [T.cacheHitRate, formatCacheHitRate(cell)],
           ["Output", formatToken(cell.outputTokens)],
-          ["平均速度", formatSpeed(cell.avgTokenSpeed)],
+          [T.avgSpeed, formatSpeed(cell.avgTokenSpeed)],
         ];
         for (const [label, value] of entries) {
           const dt = document.createElement("dt");
@@ -559,7 +592,7 @@ const SCRIPT = String.raw`
         if (!statusData.fallbackGroups || statusData.fallbackGroups.length === 0) {
           const empty = document.createElement("p");
           empty.className = "empty-groups";
-          empty.textContent = "未配置 fallback 分组";
+          empty.textContent = T.noFallbackGroups;
           GROUPS_EL.appendChild(empty);
           return;
         }
@@ -624,7 +657,7 @@ const SCRIPT = String.raw`
           ["Input", formatTokenM(summary.nonCacheInputTokens)],
           ["Cache write", formatTokenM(summary.cacheWriteInputTokens)],
           ["Cache", formatTokenM(summary.cacheReadInputTokens)],
-          ["Cache 命中率", formatCacheHitRate(summary)],
+          [T.cacheHitRate, formatCacheHitRate(summary)],
           ["Output", formatTokenM(summary.outputTokens)],
         ];
         for (const [label, value] of entries) {
@@ -742,9 +775,10 @@ const SCRIPT = String.raw`
       });
 `;
 
-function StatusPage({ payload }: { payload: StatusPagePayload }) {
+function StatusPage({ payload, lang }: { payload: StatusPagePayload; lang: Lang }) {
+  const m = MESSAGES[lang];
   return (
-    <html lang="zh-CN">
+    <html lang={htmlLang(lang)}>
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -753,7 +787,6 @@ function StatusPage({ payload }: { payload: StatusPagePayload }) {
         <style dangerouslySetInnerHTML={{ __html: STYLE }} />
       </head>
       <body>
-    <a class="back-admin" href="/admin">← Admin</a>
     <main class="page">
       <div class="usage-top">
         <UsageSection payload={{ ...payload.usage, basePath: "/status" }} />
@@ -763,14 +796,14 @@ function StatusPage({ payload }: { payload: StatusPagePayload }) {
           <h1>Model Health</h1>
           <div class="toolbar">
             <div class="range-buttons" id="range-buttons"></div>
-            <div class="range-total" id="range-total" aria-label="当前时间范围总用量"></div>
+            <div class="range-total" id="range-total" aria-label={m.rangeTotalLabel}></div>
           </div>
           <div class="health-legend">
             <span><i class="dot green"></i>100%</span>
             <span><i class="dot lightgreen"></i>80%+</span>
             <span><i class="dot orange"></i>50%+</span>
             <span><i class="dot red"></i>&lt;50%</span>
-            <span><i class="dot empty"></i>无数据</span>
+            <span><i class="dot empty"></i>{m.noData}</span>
           </div>
           <div class="header">
             <div class="header-label">Models</div>
@@ -790,7 +823,9 @@ function StatusPage({ payload }: { payload: StatusPagePayload }) {
     </aside>
         <script
           dangerouslySetInnerHTML={{
-            __html: SCRIPT.replace("__INITIAL_PAYLOAD__", serializeForScript(payload)),
+            __html: SCRIPT
+              .replace("__INITIAL_PAYLOAD__", serializeForScript(payload))
+              .replace("__MESSAGES__", serializeForScript({ ...USAGE_MESSAGES[lang], ...m })),
           }}
         />
       </body>
@@ -798,6 +833,6 @@ function StatusPage({ payload }: { payload: StatusPagePayload }) {
   );
 }
 
-export function renderStatusPage(payload: StatusPagePayload): string {
-  return "<!doctype html>" + renderToString(<StatusPage payload={payload} />);
+export function renderStatusPage(payload: StatusPagePayload, lang: Lang = "zh"): string {
+  return withPageCorner("<!doctype html>" + renderToString(<StatusPage payload={payload} lang={lang} />), lang, { backToAdmin: true });
 }

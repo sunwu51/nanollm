@@ -1,4 +1,3 @@
-// @ts-nocheck
 import type {
   AnthropicMessagesResponse,
   NormalizedMessage,
@@ -27,6 +26,8 @@ import { isResponsesCustomToolName } from "../core/request-context.js";
 export function normalizeOpenAIChatResponse(response: OpenAIChatResponse): NormalizedResponse {
   const choice = response.choices[0];
   const message = choice?.message;
+  // Some compatible gateways return content blocks instead of the standard string.
+  const content = message?.content;
 
   return {
     id: response.id,
@@ -37,9 +38,9 @@ export function normalizeOpenAIChatResponse(response: OpenAIChatResponse): Norma
     message: {
       role: "assistant",
       parts: [
-        ...(typeof message?.content === "string"
-          ? [text(message.content)]
-          : message?.content?.map((part) => (part.type === "text" ? text(part.text) : refusal(part.refusal))) ?? []),
+        ...(typeof content === "string" ? [text(content)] : Array.isArray(content)
+          ? content.flatMap((part) => part?.type === "text" && typeof part.text === "string" ? [text(part.text)]
+            : part?.type === "refusal" && typeof part.refusal === "string" ? [refusal(part.refusal)] : []) : []),
         ...normalizeOpenAIChatThinkingParts(message),
         ...(message?.refusal ? [refusal(message.refusal)] : []),
       ],
@@ -50,7 +51,7 @@ export function normalizeOpenAIChatResponse(response: OpenAIChatResponse): Norma
             : { kind: "custom" as const, id: toolCall.id, name: toolCall.custom.name, payload: toolCall.custom.input },
         ) ?? [],
     },
-    usage: normalizeUsage(response.usage as Record<string, unknown> | undefined),
+    usage: normalizeUsage(response.usage),
   };
 }
 
@@ -104,7 +105,7 @@ export function normalizeOpenAIResponsesResponse(response: OpenAIResponsesRespon
       parts,
       toolCalls,
     },
-    usage: normalizeUsage(response.usage as Record<string, unknown> | undefined),
+    usage: normalizeUsage(response.usage),
   };
 }
 
@@ -158,14 +159,14 @@ export function normalizeAnthropicResponse(response: AnthropicMessagesResponse):
       parts,
       toolCalls,
     },
-    usage: normalizeUsage(response.usage as Record<string, unknown> | undefined),
+    usage: normalizeUsage(response.usage),
   };
 }
 
 export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): OpenAIChatResponse {
   const visibleParts = response.message.parts.filter((part) => part.type === "text" || part.type === "refusal");
   const thinking = response.message.parts.filter((part) => part.type === "thinking").map((part) => part.thinking).join("\n");
-  const toolCalls = response.message.toolCalls?.map((toolCall) =>
+  const toolCalls = response.message.toolCalls?.map<import("./shared.js").ChatCompletionMessageToolCall>((toolCall) =>
     toolCall.kind === "function"
       ? { id: toolCall.id, type: "function", function: { name: toolCall.name, arguments: toolCall.payload } }
       : { id: toolCall.id, type: "custom", custom: { name: toolCall.name, input: toolCall.payload } },
@@ -189,7 +190,7 @@ export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): O
         },
       },
     ],
-    usage: denormalizeUsageToOpenAIChat(response.usage) as OpenAIChatResponse["usage"],
+    usage: denormalizeUsageToOpenAIChat(response.usage),
   };
 }
 
@@ -205,7 +206,7 @@ export function denormalizeToOpenAIResponsesResponse(response: NormalizedRespons
     error: null,
     incomplete_details: null,
     instructions: null,
-    // metadata: null,
+    metadata: null,
     output: [
       ...reasoningParts.map((part, index) => ({
         id: `rs_${index}`,
@@ -260,7 +261,7 @@ export function denormalizeToOpenAIResponsesResponse(response: NormalizedRespons
     top_p: null,
     status: "completed",
     text: { format: { type: "text" } },
-    usage: denormalizeUsageToOpenAIResponses(response.usage) as OpenAIResponsesResponse["usage"],
+    usage: denormalizeUsageToOpenAIResponses(response.usage),
   };
 }
 
@@ -271,10 +272,12 @@ export function denormalizeToAnthropicResponse(response: NormalizedResponse): An
     role: "assistant",
     model: response.model,
     container: null,
+    diagnostics: null,
+    stop_details: null,
     stop_reason: normalizeAnthropicStopReason(response.finishReason),
     stop_sequence: null,
     content: [
-      ...response.message.parts.flatMap((part) => {
+      ...response.message.parts.flatMap<AnthropicMessagesResponse["content"][number]>((part) => {
         if (part.type === "text" || part.type === "refusal") return [{ type: "text" as const, text: part.text, citations: null }];
         if (part.type === "thinking") return [{ type: "thinking" as const, thinking: part.thinking, signature: part.signature ?? "" }];
         if (part.type === "redacted_thinking") return [];
@@ -291,7 +294,7 @@ export function denormalizeToAnthropicResponse(response: NormalizedResponse): An
         };
       }) ?? []),
     ],
-    usage: (denormalizeUsageToAnthropic(response.usage) as AnthropicMessagesResponse["usage"]) ?? {
+    usage: denormalizeUsageToAnthropic(response.usage) ?? {
       input_tokens: 0,
       output_tokens: 0,
       cache_creation_input_tokens: null,

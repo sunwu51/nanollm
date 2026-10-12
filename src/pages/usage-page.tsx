@@ -1,4 +1,5 @@
 import type { UsageDayCell } from "../storage/usage.js";
+import type { Lang } from "../core/i18n.js";
 
 export type UsageRangeMode = "7d" | "30d" | "year";
 
@@ -259,6 +260,28 @@ export const USAGE_STYLE = /* css */ String.raw`
       }
 `;
 
+const usageZh = {
+  usageLocale: "zh-CN",
+  loadingPrices: "正在加载模型价格…",
+  matchedCost: "匹配到模型的估算花费：",
+  unmatchedCost: "未匹配模型（{models}）按 DeepSeek V4.1 Flash 等效价格估算：${cost}",
+  allMatched: "所有模型均已匹配价格；未匹配部分按 DeepSeek V4.1 Flash 等效价格估算：$0.00",
+  listSeparator: "、",
+};
+
+/** Strings for USAGE_SCRIPT; the host page serializes them into its `T` object. */
+export const USAGE_MESSAGES: Record<Lang, typeof usageZh> = {
+  zh: usageZh,
+  en: {
+    usageLocale: "en-US",
+    loadingPrices: "Loading model prices…",
+    matchedCost: "Estimated cost of priced models: ",
+    unmatchedCost: "Models without a price ({models}) estimated at DeepSeek V4.1 Flash rates: ${cost}",
+    allMatched: "Every model has a price; nothing estimated at DeepSeek V4.1 Flash rates: $0.00",
+    listSeparator: ", ",
+  },
+};
+
 export const USAGE_SCRIPT = String.raw`
       const USAGE_DATA = __INITIAL_USAGE_PAYLOAD__;
       const USAGE_HEATMAP_EL = document.getElementById("usage-heatmap");
@@ -273,7 +296,7 @@ export const USAGE_SCRIPT = String.raw`
       const USAGE_TOOLTIP_TITLE_EL = document.getElementById("usage-tooltip-title");
       const USAGE_TOOLTIP_GRID_EL = document.getElementById("usage-tooltip-grid");
       const USAGE_MONTH_FORMATTER = new Intl.DateTimeFormat("en-US", { month: "short" });
-      const USAGE_DAY_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
+      const USAGE_DAY_FORMATTER = new Intl.DateTimeFormat(T.usageLocale, {
         year: "numeric",
         month: "2-digit",
         day: "2-digit",
@@ -355,7 +378,7 @@ export const USAGE_SCRIPT = String.raw`
 
       function renderUsageCosts() {
         if (!modelPrices) {
-          USAGE_EQUIVALENT_COST_EL.textContent = "正在加载模型价格…";
+          USAGE_EQUIVALENT_COST_EL.textContent = T.loadingPrices;
           USAGE_UNMATCHED_COST_EL.textContent = "";
           return;
         }
@@ -372,10 +395,10 @@ export const USAGE_SCRIPT = String.raw`
             unmatchedModels.push(item.name);
           }
         }
-        USAGE_EQUIVALENT_COST_EL.innerHTML = "匹配到模型的估算花费：<strong>$" + formatEquivalentCost(matchedCost) + "</strong>";
+        USAGE_EQUIVALENT_COST_EL.innerHTML = T.matchedCost + "<strong>$" + formatEquivalentCost(matchedCost) + "</strong>";
         USAGE_UNMATCHED_COST_EL.textContent = unmatchedModels.length > 0
-          ? "未匹配模型（" + unmatchedModels.join("、") + "）按 DeepSeek V4.1 Flash 等效价格估算：$" + formatEquivalentCost(unmatchedCost)
-          : "所有模型均已匹配价格；未匹配部分按 DeepSeek V4.1 Flash 等效价格估算：$0.00";
+          ? T.unmatchedCost.replace("{models}", unmatchedModels.join(T.listSeparator)).replace("{cost}", formatEquivalentCost(unmatchedCost))
+          : T.allMatched;
       }
 
       function renderUsageSummary() {
