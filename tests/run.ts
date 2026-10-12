@@ -4928,6 +4928,44 @@ await runAsync("status store aggregates success rate and averages by five-minute
   assert.equal(getHealthTone(cell.successRate, cell.totalRequests), "orange");
 });
 
+await runAsync("status stores calculate speed for non-streaming and mixed responses", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-status-speed-"));
+  const db = createTestSqliteClient(join(dir, "status.sqlite3"));
+  try {
+    const now = Date.now();
+    for (const store of [new StatusStore(), new SqliteStatusStore(db)]) {
+      const usage = { outputTokens: 100 };
+      store.recordAttempt("non-stream", now);
+      store.recordSuccess("non-stream", 2000, 300, usage, now);
+      const nonStream = (await store.getModelSeries("non-stream", now)).at(-1)!;
+      assert.equal(nonStream.avgTokenSpeed, 50);
+      assert.equal(nonStream.avgDurationMs, 2000);
+      assert.equal(nonStream.avgTtfbMs, 300);
+
+      store.recordAttempt("non-stream", now);
+      store.recordSuccess("non-stream", 4000, 1000, usage, now, 3000);
+      store.recordAttempt("non-stream", now);
+      store.recordFailure("non-stream", 10000, now);
+      const mixed = (await store.getModelSeries("non-stream", now)).at(-1)!;
+      assert.equal(mixed.avgTokenSpeed, 40);
+      assert.equal(mixed.totalStreamMs, 5000);
+      assert.equal(mixed.streamSamples, 2);
+
+      for (const duration of [0, -1, NaN, Infinity]) {
+        store.recordSuccess("invalid", duration, undefined, usage, now);
+      }
+      assert.equal((await store.getModelSeries("invalid", now)).at(-1)!.avgTokenSpeed, null);
+      store.recordSuccess("empty", 2000, undefined, { outputTokens: 0 }, now);
+      assert.equal((await store.getModelSeries("empty", now)).at(-1)!.avgTokenSpeed, null);
+      store.recordSuccess("zero-stream", 2000, 2000, usage, now, 0);
+      assert.equal((await store.getModelSeries("zero-stream", now)).at(-1)!.avgTokenSpeed, null);
+    }
+  } finally {
+    db.close();
+    removeTestDir(dir);
+  }
+});
+
 await runAsync("status store keeps only the last 6 hours of buckets", async () => {
   const store = new StatusStore();
   const now = Date.UTC(2026, 3, 19, 23, 55, 0);

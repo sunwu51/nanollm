@@ -71,6 +71,12 @@ function floorToFiveMinutes(timestamp: number): number {
   return Math.floor(timestamp / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
 }
 
+function getTokenSpeedDuration(durationMs: number, streamDurationMs?: number): number | undefined {
+  // Non-streaming responses have no separate generation timing; use end-to-end latency.
+  const speedDurationMs = streamDurationMs ?? durationMs;
+  return Number.isFinite(speedDurationMs) && speedDurationMs > 0 ? speedDurationMs : undefined;
+}
+
 function pruneBuckets(buckets: BucketMap, now: number) {
   const minBucketStart = floorToFiveMinutes(now - RETENTION_MS);
   for (const bucketStart of buckets.keys()) {
@@ -133,8 +139,9 @@ export class StatusStore {
       metrics.totalTtfbMs += ttfbMs;
       metrics.ttfbSamples += 1;
     }
-    if (typeof streamDurationMs === "number" && Number.isFinite(streamDurationMs) && streamDurationMs > 0) {
-      metrics.totalStreamMs += streamDurationMs;
+    const speedDurationMs = getTokenSpeedDuration(durationMs, streamDurationMs);
+    if (speedDurationMs !== undefined) {
+      metrics.totalStreamMs += speedDurationMs;
       metrics.streamSamples += 1;
     }
   }
@@ -362,6 +369,7 @@ export class SqliteStatusStore implements StatusStoreLike {
     timestamp = Date.now(),
     streamDurationMs?: number,
   ) {
+    const speedDurationMs = getTokenSpeedDuration(durationMs, streamDurationMs);
     this.addMetrics(modelName, timestamp, {
       successRequests: 1,
       totalDurationMs: durationMs,
@@ -371,8 +379,8 @@ export class SqliteStatusStore implements StatusStoreLike {
       cacheReadInputTokens: usage?.cacheReadInputTokens ?? 0,
       outputTokens: usage?.outputTokens ?? 0,
       ...(typeof ttfbMs === "number" && Number.isFinite(ttfbMs) ? { totalTtfbMs: ttfbMs, ttfbSamples: 1 } : {}),
-      ...(typeof streamDurationMs === "number" && Number.isFinite(streamDurationMs) && streamDurationMs > 0
-        ? { totalStreamMs: streamDurationMs, streamSamples: 1 }
+      ...(speedDurationMs !== undefined
+        ? { totalStreamMs: speedDurationMs, streamSamples: 1 }
         : {}),
     });
   }
