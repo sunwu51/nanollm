@@ -1,4 +1,3 @@
-// @ts-nocheck
 import "dotenv/config";
 import { JobModelCatalog } from "./src/jobs/job-model-catalog.js";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
@@ -6,6 +5,8 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { Hono } from "hono";
 import type { Context } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import type { Server as HttpServer } from "node:http";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { randomUUID } from "node:crypto";
@@ -536,6 +537,9 @@ async function testConfiguredModel(name: string, message: string, config: Server
   const isStream = (response.headers.get("content-type") ?? "").includes("text/event-stream");
   const reply = response.ok && isStream ? extractModelTestReply(model.provider, raw) : "";
   const errorBody = response.ok ? undefined : (raw ? tryParseJSON(raw) : null);
+  const errorValue = errorBody && typeof errorBody === "object" && "error" in errorBody ? errorBody.error : undefined;
+  const errorMessage = typeof errorValue === "string" ? errorValue
+    : errorValue && typeof errorValue === "object" && "message" in errorValue && typeof errorValue.message === "string" ? errorValue.message : undefined;
 
   return {
     ok: response.ok,
@@ -545,7 +549,7 @@ async function testConfiguredModel(name: string, message: string, config: Server
     upstreamModel: model.model,
     durationMs,
     reply,
-    error: response.ok ? undefined : (errorBody?.error?.message ?? errorBody?.error ?? `HTTP ${response.status}`),
+    error: response.ok ? undefined : (errorMessage ?? `HTTP ${response.status}`),
     raw: raw.length > MODEL_TEST_RAW_LIMIT ? raw.slice(0, MODEL_TEST_RAW_LIMIT) + "\n...(truncated)" : raw,
   };
 }
@@ -990,7 +994,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
           ...(causes.length ? { causes } : {}),
           ...(lastError.upstream ? { upstream: lastError.upstream } : {}),
         };
-        const response = c.json(errorBody, status);
+        const response = c.json(errorBody, status as ContentfulStatusCode);
         setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
         setRecordedClientResponseBody({ body: errorBody });
         finalizeRecordedRequest({});
@@ -1286,7 +1290,7 @@ app.post("/record/:requestId/replay", async (c) => {
     replayOf: record.requestId,
     summary: await getRecordSummary(),
     note: "Sensitive client headers are not replayed; provider auth uses current config.",
-  }, result.status);
+  }, result.status as ContentfulStatusCode);
 });
 
 app.get("/admin", (c) => c.html(withWebUIAuth(renderAdminConfigPage(buildConfigAdminPayload(), pageLang(c)))));
@@ -1363,7 +1367,7 @@ app.post("/admin/models/:name/test", async (c) => {
   const message = typeof body.message === "string" && body.message.trim() ? body.message : DEFAULT_MODEL_TEST_MESSAGE;
   try {
     const result = await testConfiguredModel(c.req.param("name"), message, configManager.getActiveSnapshot().effectiveConfig);
-    return c.json(result, result.ok ? 200 : result.status);
+    return c.json(result, (result.ok ? 200 : result.status) as ContentfulStatusCode);
   } catch (error) {
     return c.json({ ok: false, error: error instanceof Error ? error.message : String(error) }, 500);
   }
@@ -1500,7 +1504,7 @@ server.once("error", (error: Error & { code?: string }) => {
 });
 
 const shutdown = installGracefulShutdown({
-  server,
+  server: server as HttpServer,
   stopBackgroundWork: () => { configManager.dispose(); jobScheduler.stop(); },
   cleanup: async () => {
     await jobScheduler.flush();

@@ -1,8 +1,7 @@
-// @ts-nocheck
-import type { ChatCompletionChunk } from "openai/resources/chat/completions/completions";
+import type { OpenAIChatStreamChunk as ChatCompletionChunk } from "./shared.js";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
 import type { RawMessageStreamEvent } from "@anthropic-ai/sdk/resources/messages/messages";
-import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, qualifyOpenAIResponsesToolName, sanitizeAnthropicToolId, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput } from "./shared.js";
+import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, qualifyOpenAIResponsesToolName, sanitizeAnthropicToolId, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput, type NormalizedUsage } from "./shared.js";
 import { isResponsesCustomToolName, } from "../core/request-context.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -21,6 +20,13 @@ export type NormalizedStreamEvent =
   | { type: "end"; finishReason: string | null; usage?: import("./shared.js").NormalizedUsage };
 
 type ParsedSSE = { event?: string; data: string };
+
+type ChatDelta = ChatCompletionChunk["choices"][number]["delta"] & {
+  thinking?: string;
+  reasoning?: string;
+  reasoning_content?: string;
+};
+type ChatFinishReason = ChatCompletionChunk["choices"][number]["finish_reason"];
 
 // ─── SSE Utilities ───────────────────────────────────────────────────────────
 
@@ -141,7 +147,7 @@ export class OpenAIChatStreamParser implements StreamParser {
     }
   }
 
-  private emitEnd(out: NormalizedStreamEvent[], usage?: Record<string, unknown> | undefined) {
+  private emitEnd(out: NormalizedStreamEvent[], usage?: ChatCompletionChunk["usage"]) {
     if (this.ended) return;
     out.push({
       type: "end",
@@ -167,7 +173,7 @@ export class OpenAIChatStreamParser implements StreamParser {
     if (!choice) {
       if (chunk.usage && !this.ended) {
         this.closeOpenBlocks(out);
-        this.emitEnd(out, chunk.usage as Record<string, unknown>);
+        this.emitEnd(out, chunk.usage);
       }
       return out;
     }
@@ -234,7 +240,7 @@ export class OpenAIChatStreamParser implements StreamParser {
       this.pendingFinishReason = finish_reason;
       this.closeOpenBlocks(out);
       if (chunk.usage) {
-        this.emitEnd(out, chunk.usage as Record<string, unknown>);
+        this.emitEnd(out, chunk.usage);
       }
     }
 
@@ -392,7 +398,7 @@ export class ResponsesStreamParser implements StreamParser {
         // Fall back to seenToolCall to avoid incorrectly emitting finishReason "stop".
         const hasToolCalls = this.seenToolCall || r.output?.some((item: any) => item.type === "function_call" || item.type === "custom_tool_call");
         const finishReason = r.status === "incomplete" ? "length" : hasToolCalls ? "tool_calls" : "stop";
-        out.push({ type: "end", finishReason, usage: normalizeUsage(r.usage as Record<string, unknown> | undefined) });
+        out.push({ type: "end", finishReason, usage: normalizeUsage(r.usage) });
         break;
       }
 
@@ -481,7 +487,7 @@ export class AnthropicStreamParser implements StreamParser {
         out.push({
           type: "end",
           finishReason: event.delta?.stop_reason ?? null,
-          usage: normalizeUsage(event.usage as Record<string, unknown> | undefined),
+          usage: normalizeUsage(event.usage),
         });
         break;
       }
@@ -510,15 +516,15 @@ export class OpenAIChatStreamEmitter implements StreamEmitter {
     return JSON.stringify(delta).slice(1, -1);
   }
 
-  private chunk(delta: Record<string, unknown>, finishReason: string | null = null, usage?: import("./shared.js").NormalizedUsage): ChatCompletionChunk {
+  private chunk(delta: ChatDelta, finishReason: ChatFinishReason = null, usage?: NormalizedUsage): ChatCompletionChunk {
     return {
       id: this.id,
       object: "chat.completion.chunk" as const,
       created: this.created,
       model: this.model,
-      choices: [{ index: 0, delta, finish_reason: finishReason as any, logprobs: null }],
+      choices: [{ index: 0, delta, finish_reason: finishReason, logprobs: null }],
       ...(usage ? { usage: denormalizeUsageToOpenAIChat(usage) } : {}),
-    } as ChatCompletionChunk;
+    };
   }
 
   emit(event: NormalizedStreamEvent): ChatCompletionChunk[] {

@@ -1,6 +1,6 @@
 {
   "name": "nanollm",
-  "version": "0.0.34",
+  "version": "0.0.35",
   "description": "Hono server that proxies llm request",
   "main": "./dist/server.js",
   "bin": {
@@ -44,7 +44,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.80.0",
+    "@anthropic-ai/sdk": "^0.133.0",
     "@hono/node-server": "^1.19.13",
     "@libsql/client": "^0.17.4",
     "cron-parser": "^5.10.1",

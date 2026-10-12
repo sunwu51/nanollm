@@ -1,4 +1,3 @@
-// @ts-nocheck
 import type {
   AnthropicMessagesRequest,
   MessageCreateParamsBase,
@@ -12,6 +11,7 @@ import type {
   ToolChoice,
   ToolUnion,
 } from "./shared.js";
+import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages/messages";
 import {
   collapseText,
   createResponsesCustomToolSchema,
@@ -75,7 +75,7 @@ export function normalizeOpenAIChatRequest(request: OpenAIChatRequest): Normaliz
     stopSequences: request.stop === undefined || request.stop === null ? undefined : Array.isArray(request.stop) ? request.stop : [request.stop],
     parallelToolCalls: request.parallel_tool_calls,
     promptCacheKey: request.prompt_cache_key ?? (request as any).promptCacheKey,
-    promptCacheRetention: request.prompt_cache_retention ?? (request as any).promptCacheRetention ?? null,
+    promptCacheRetention: normalizePromptCacheRetention(request.prompt_cache_retention ?? (request as any).promptCacheRetention),
     safetyIdentifier: request.safety_identifier,
     reasoningEffort: normalizeReasoningEffort(request.reasoning_effort ?? request.reasoning?.effort),
     thinkingBudgetTokens: null,
@@ -112,7 +112,7 @@ export function normalizeOpenAIResponsesRequest(request: OpenAIResponsesRequest)
     topP: request.top_p ?? null,
     parallelToolCalls: request.parallel_tool_calls,
     promptCacheKey: request.prompt_cache_key ?? (request as any).promptCacheKey,
-    promptCacheRetention: request.prompt_cache_retention ?? (request as any).promptCacheRetention ?? null,
+    promptCacheRetention: normalizePromptCacheRetention(request.prompt_cache_retention ?? (request as any).promptCacheRetention),
     safetyIdentifier: request.safety_identifier,
     reasoningEffort: normalizeReasoningEffort(request.reasoning?.effort),
     thinkingBudgetTokens: null,
@@ -178,7 +178,7 @@ export function denormalizeToOpenAIChatRequest(request: NormalizedRequest): Open
     stop: request.stopSequences,
     parallel_tool_calls: request.parallelToolCalls,
     prompt_cache_key: request.promptCacheKey,
-    prompt_cache_retention: request.promptCacheRetention ?? undefined,
+    prompt_cache_retention: (normalizePromptCacheRetention(request.promptCacheRetention) ?? undefined) as OpenAIChatRequest["prompt_cache_retention"],
     safety_identifier: request.safetyIdentifier,
     reasoning_effort: (reasoningEffort ?? undefined) as OpenAIChatRequest["reasoning_effort"],
     reasoning: reasoningEffort ? { effort: reasoningEffort as never } : undefined,
@@ -328,7 +328,7 @@ export function denormalizeToOpenAIResponsesRequest(request: NormalizedRequest):
     top_p: request.topP ?? undefined,
     parallel_tool_calls: request.parallelToolCalls,
     prompt_cache_key: request.promptCacheKey,
-    prompt_cache_retention: request.promptCacheRetention ?? undefined,
+    prompt_cache_retention: (normalizePromptCacheRetention(request.promptCacheRetention) ?? undefined) as OpenAIResponsesRequest["prompt_cache_retention"],
     safety_identifier: request.safetyIdentifier,
     reasoning: reasoningEffort ? { effort: reasoningEffort as never } : undefined,
     text: request.responseFormat || request.textVerbosity ? { format: request.responseFormat ? denormalizeOpenAIResponsesFormat(request.responseFormat) : undefined, verbosity: request.textVerbosity ?? undefined } : undefined,
@@ -444,7 +444,10 @@ function normalizeOpenAIChatTool(tool: any): NormalizedTool | undefined {
 }
 
 function normalizeOpenAIChatToolChoice(choice: any): NormalizedToolChoice | undefined {
-  if (typeof choice === "string") return choice === "required" ? { type: "required" } : { type: choice };
+  if (typeof choice === "string") {
+    // Preserve provider extensions; the SDK only declares standard choice strings.
+    return { type: choice } as NormalizedToolChoice;
+  }
   if (choice.type === "function") return { type: "tool", kind: "function", name: choice.function.name };
   if (choice.type === "custom") return { type: "tool", kind: "custom", name: choice.custom.name };
   if (choice.allowed_tools) return { type: choice.allowed_tools.mode === "required" ? "required" : "auto" };
@@ -580,7 +583,10 @@ function normalizeOpenAIResponsesTool(tool: any, namespace?: string): Normalized
 }
 
 function normalizeOpenAIResponsesToolChoice(choice: any): NormalizedToolChoice | undefined {
-  if (typeof choice === "string") return choice === "required" ? { type: "required" } : { type: choice };
+  if (typeof choice === "string") {
+    // Preserve provider extensions; the SDK only declares standard choice strings.
+    return { type: choice } as NormalizedToolChoice;
+  }
   if (choice.type === "function") return { type: "tool", kind: "function", name: choice.name };
   if (choice.type === "custom") {
     markResponsesCustomToolName(choice.name);
@@ -700,7 +706,8 @@ function normalizeAnthropicToolResultParts(content: any): NormalizedMessage["par
 
 function normalizeAnthropicTool(tool: ToolUnion): NormalizedTool | undefined {
   if (!("input_schema" in tool)) return undefined;
-  if ("type" in tool && tool.type !== undefined && tool.type !== "function") return undefined;
+  const toolType: unknown = "type" in tool ? tool.type : undefined;
+  if (toolType != null && toolType !== "custom" && toolType !== "function") return undefined;
   return {
     kind: "function",
     name: tool.name,
@@ -806,7 +813,7 @@ function denormalizeOpenAIChatToolResultMessage(message: NormalizedMessage, iden
       legacyFunctionName
         ? { role: "function", name: legacyFunctionName, content: toolContent }
         : { role: "tool", tool_call_id: message.toolCallId ?? "", content: toolContent },
-      ...(imageContent.length > 0 ? [{ role: "user", content: imageContent, __toolResultMedia: true }] : []),
+      ...(imageContent.length > 0 ? [Object.assign({ role: "user" as const, content: imageContent }, { __toolResultMedia: true })] : []),
     ];
   }
   // image=false fallback: keep tool/function role, drop multimedia content to avoid
@@ -837,7 +844,7 @@ function stringifyOpenAIChatPart(part: NormalizedMessage["parts"][number], conte
   if (part.type === "image_url") return part.detail ? `Attached image: ${part.url} (detail: ${part.detail})` : `Attached image: ${part.url}`;
   if (part.type === "input_audio") return `Attached audio (${part.format})`;
   if (part.type === "thinking" || part.type === "redacted_thinking") return "";
-  fail(`${context} cannot stringify part "${part.type}"`);
+  fail(`${context} cannot stringify unsupported content`);
 }
 
 function denormalizeOpenAIResponsesToolOutput(parts: NormalizedMessage["parts"], context: string): any {
@@ -939,8 +946,8 @@ function denormalizeAnthropicUserParts(parts: NormalizedMessage["parts"]): any {
   });
 }
 
-function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserveThinking: boolean, ignoreInvalidHistory: boolean): any[] {
-  const blocks: any[] = message.parts.flatMap((part) => {
+function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserveThinking: boolean, ignoreInvalidHistory: boolean): ContentBlockParam[] {
+  const blocks = message.parts.flatMap<ContentBlockParam>((part) => {
     if (part.type === "text" || part.type === "refusal") return { type: "text", text: part.text, citations: null };
     if (part.type === "thinking") {
       if (ignoreInvalidHistory && (part.signature === undefined || part.signature === null || part.signature === "")) return [];
@@ -974,7 +981,7 @@ function denormalizeAnthropicTool(tool: NormalizedTool): ToolUnion {
 }
 
 function denormalizeAnthropicToolChoice(choice: NormalizedToolChoice | undefined, parallelToolCalls: boolean | undefined, hasTools: boolean): MessageCreateParamsBase["tool_choice"] {
-  const disableParallel = parallelToolCalls === undefined ? choice?.disableParallel : !parallelToolCalls;
+  const disableParallel = parallelToolCalls === undefined ? (choice && "disableParallel" in choice ? choice.disableParallel : undefined) : !parallelToolCalls;
   if (!choice) {
     if (disableParallel === undefined || !hasTools) return undefined;
     return { type: "auto", disable_parallel_tool_use: disableParallel };
@@ -1062,7 +1069,7 @@ export const ANTHROPIC_JSON_OBJECT_INSTRUCTION = "Reply with a single valid JSON
  * Clients never resend that block, so the block before it gets a cache breakpoint: with only the automatic breakpoint on the
  * instruction, the next turn's prompt would never match this turn's cache entry.
  */
-function appendAnthropicJsonObjectInstruction(messages: MessageParam[], cacheControl: { type: string }): MessageParam[] {
+function appendAnthropicJsonObjectInstruction(messages: MessageParam[], cacheControl: { type: "ephemeral" }): MessageParam[] {
   const index = messages.findLastIndex((message) => message.role === "user");
   if (index === -1) return messages;
   const { content } = messages[index];
@@ -1138,22 +1145,29 @@ function getAnthropicToolResultId(message: NormalizedMessage): string | undefine
   return undefined;
 }
 
-/** Anthropic metadata only accepts a string `user_id`; other OpenAI metadata tags are dropped. */
+function normalizePromptCacheRetention(value: string | null | undefined): NormalizedRequest["promptCacheRetention"] {
+  if (value == null) return null;
+  if (value === "in-memory" || value === "in_memory") return "in_memory";
+  return value;
+}
+
 function denormalizeAnthropicMetadata(metadata: NormalizedRequest["metadata"]) {
   return typeof metadata?.user_id === "string" && metadata.user_id ? { user_id: metadata.user_id } : undefined;
 }
 
 /** Map an OpenAI-style effort onto Anthropic: "none" means thinking off, "minimal" is below Anthropic's lowest level. */
-function toAnthropicEffort(reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined): string | null {
+function toAnthropicEffort(reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined): NonNullable<MessageCreateParamsBase["output_config"]>["effort"] {
   const effort = reasoningEffort ?? normalizeReasoningEffortFromBudget(thinkingBudgetTokens);
   if (effort === "none") return null;
   if (effort === "minimal") return "low";
-  return effort;
+  if (effort == null) return null;
+  if (effort === "low" || effort === "medium" || effort === "high" || effort === "xhigh" || effort === "max") return effort;
+  fail(`Unsupported Anthropic reasoning effort "${effort}"`);
 }
 
 function denormalizeAnthropicOutputConfig(responseFormat: NormalizedRequest["responseFormat"], reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined) {
   const effort = toAnthropicEffort(reasoningEffort, thinkingBudgetTokens);
-  const format = responseFormat?.type === "json_schema" ? { type: "json_schema", schema: responseFormat.schema ?? {} } : undefined;
+  const format = responseFormat?.type === "json_schema" ? { type: "json_schema" as const, schema: responseFormat.schema ?? {} } : undefined;
   if (!format && !effort) return undefined;
   return { ...(format ? { format } : {}), ...(effort ? { effort } : {}) };
 }
@@ -1161,7 +1175,7 @@ function denormalizeAnthropicOutputConfig(responseFormat: NormalizedRequest["res
 function denormalizeAnthropicThinking(reasoningEffort: string | null | undefined, thinkingBudgetTokens: number | null | undefined) {
   if (reasoningEffort === "none") return { type: "disabled" as const };
   if (!reasoningEffort && thinkingBudgetTokens == null) return undefined;
-  return { type: "adaptive" as const };
+  return { type: "adaptive" as const, display: "summarized" as const };
 }
 
 // OpenAI Chat/Responses accept auto | default | flex | scale | priority; Anthropic accepts auto | standard_only.

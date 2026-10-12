@@ -24,7 +24,7 @@ import {
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { UnsupportedContentError } from "../src/converters/shared.js";
-import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
 import { webAuth } from "../src/core/web-auth.js";
@@ -74,7 +74,7 @@ import { SqliteStatusStore, StatusStore, getHealthTone } from "../src/storage/st
 import { shouldIgnoreStreamReadError } from "../src/core/stream-errors.js";
 import { extractErrorCauses, formatErrorWithCauses } from "../src/core/error-details.js";
 import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/storage/usage.js";
-import { normalizeUsage } from "../src/converters/shared.js";
+import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, requireTextOnly, type NormalizedPart, type OpenAIChatResponse } from "../src/converters/shared.js";
 import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch, waitForClientWrites } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
 
@@ -321,7 +321,7 @@ run("anthropic tool_result becomes chat tool message", () => {
   assert.equal((result.messages[2] as { tool_call_id: string }).tool_call_id, "call_1");
 });
 
-run("anthropic messages request only keeps function tools and drops typed server/custom tools", () => {
+run("anthropic messages request keeps schema tools including explicit custom type and drops server tools", () => {
   const chat = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -346,9 +346,11 @@ run("anthropic messages request only keeps function tools and drops typed server
     tool_choice: { type: "tool", name: "get_weather" },
   } as any);
 
-  assert.equal(chat.tools?.length ?? 0, 1);
+  assert.equal(chat.tools?.length ?? 0, 2);
   assert.equal((chat.tools?.[0] as any).type, "function");
   assert.equal((chat.tools?.[0] as any).function.name, "get_weather");
+  assert.equal((chat.tools?.[1] as any).type, "function");
+  assert.equal((chat.tools?.[1] as any).function.name, "apply_patch");
   assert.deepEqual((chat as any).tool_choice, { type: "function", function: { name: "get_weather" } });
 });
 
@@ -2599,7 +2601,7 @@ run("responses effort preserves existing levels and maps ultra to max across pro
     assert.equal(chat.reasoning_effort, expected);
     assert.deepEqual(chat.reasoning, { effort: expected });
     const anthropic = responsesRequestToAnthropicMessageRequest(request as any);
-    assert.deepEqual(anthropic.thinking, { type: "adaptive" });
+    assert.deepEqual(anthropic.thinking, { type: "adaptive", display: "summarized" });
     assert.equal(anthropic.output_config?.effort, expected);
     assert.deepEqual(request, snapshot);
   }
@@ -2615,7 +2617,7 @@ run("chat effort preserves five common levels and maps ultra to max from either 
       assert.equal(normalizeOpenAIChatRequest(request as any).reasoningEffort, expected);
       assert.deepEqual(chatParamsToResponsesRequest(request as any).reasoning, { effort: expected });
       const anthropic = chatParamsToAnthropicMessageRequest(request as any);
-      assert.deepEqual(anthropic.thinking, { type: "adaptive" });
+      assert.deepEqual(anthropic.thinking, { type: "adaptive", display: "summarized" });
       assert.equal(anthropic.output_config?.effort, expected);
       assert.deepEqual(request, snapshot);
     }
@@ -2655,7 +2657,7 @@ run("chat none effort disables anthropic thinking and minimal maps to low", () =
   assert.deepEqual(none.thinking, { type: "disabled" });
   assert.equal(none.output_config, undefined);
   const minimal = convert("minimal");
-  assert.deepEqual(minimal.thinking, { type: "adaptive" });
+  assert.deepEqual(minimal.thinking, { type: "adaptive", display: "summarized" });
   assert.deepEqual(minimal.output_config, { effort: "low" });
 });
 
@@ -2667,6 +2669,100 @@ run("anthropic disabled thinking maps to none effort in both OpenAI protocols", 
   assert.deepEqual(anthropicMessageRequestToResponsesRequest(request as any).reasoning, { effort: "none" });
   const noThinking = anthropicMessageRequestToChatParams({ ...request, thinking: undefined } as any) as any;
   assert.equal(noThinking.reasoning_effort, undefined);
+});
+
+run("cache retention uses the canonical spelling across both OpenAI protocols", () => {
+  for (const retention of ["in_memory", "in-memory", "24h", "1h", "provider-extension"]) {
+    const expected = retention === "in-memory" ? "in_memory" : retention;
+    const chat = { model: "test", messages: [{ role: "user", content: "hi" }], prompt_cache_retention: retention };
+    const responses = { model: "test", input: "hi", prompt_cache_retention: retention };
+    assert.equal(chatParamsToResponsesRequest(chat as any).prompt_cache_retention, expected);
+    assert.equal(responsesRequestToChatParams(responses as any).prompt_cache_retention, expected);
+    assert.equal(normalizeOpenAIChatRequest({ ...chat, prompt_cache_retention: undefined, promptCacheRetention: retention } as any).promptCacheRetention, expected);
+    assert.equal(normalizeOpenAIResponsesRequest({ ...responses, prompt_cache_retention: undefined, promptCacheRetention: retention } as any).promptCacheRetention, expected);
+  }
+  assert.equal(chatParamsToResponsesRequest({ model: "test", messages: [] }).prompt_cache_retention, undefined);
+});
+
+run("provider tool choice strings retain their original normalization", () => {
+  for (const choice of ["auto", "required", "none", "provider-extension"]) {
+    assert.deepEqual(normalizeOpenAIChatRequest({ model: "test", messages: [], tool_choice: choice } as any).toolChoice, { type: choice });
+    assert.deepEqual(normalizeOpenAIResponsesRequest({ model: "test", input: "hi", tool_choice: choice } as any).toolChoice, { type: choice });
+  }
+});
+
+run("text-only validation preserves the input array and rejects multimedia", () => {
+  const parts: NormalizedPart[] = [{ type: "text", text: "hello" }, { type: "refusal", text: "refused" }];
+  assert.strictEqual(requireTextOnly(parts, "test"), parts);
+  assert.throws(() => requireTextOnly([{ type: "image_url", url: "https://example.com/image.png" }], "test"), /test only supports text content/);
+});
+
+run("Chat responses accept provider content arrays and standard strings", () => {
+  const base: OpenAIChatResponse = {
+    id: "chat_content", object: "chat.completion", created: 1, model: "test",
+    choices: [{ index: 0, finish_reason: "stop", logprobs: null, message: {
+      role: "assistant", refusal: null, content: [{ type: "text", text: "hello" }, { type: "refusal", refusal: "refused" }],
+    } }],
+  };
+  const blocks = chatCompletionToResponsesResponse(base);
+  assert.deepEqual((blocks.output[0] as any).content, [
+    { type: "output_text", text: "hello", annotations: [] }, { type: "refusal", refusal: "refused" },
+  ]);
+  base.choices[0].message.content = "hello";
+  assert.equal((chatCompletionToResponsesResponse(base).output[0] as any).content[0].text, "hello");
+});
+
+run("Chat responses preserve content blocks and refusals for compatible providers", () => {
+  const result = responsesResponseToChatCompletion({
+    id: "resp_content", model: "test", created_at: 1, status: "completed",
+    output: [{ type: "message", role: "assistant", content: [
+      { type: "output_text", text: "first", annotations: [] },
+      { type: "output_text", text: "second", annotations: [] },
+      { type: "refusal", refusal: "refused" },
+    ] }],
+  } as any);
+  assert.deepEqual(result.choices[0].message.content, [
+    { type: "text", text: "first" }, { type: "text", text: "second" }, { type: "refusal", refusal: "refused" },
+  ]);
+  assert.equal(result.choices[0].message.refusal, "refused");
+  const refusalOnly = responsesResponseToChatCompletion({
+    id: "resp_refusal", model: "test", created_at: 1, status: "completed",
+    output: [{ type: "message", role: "assistant", content: [{ type: "refusal", refusal: "refused" }] }],
+  } as any);
+  assert.deepEqual(refusalOnly.choices[0].message.content, [{ type: "refusal", refusal: "refused" }]);
+  assert.equal(refusalOnly.choices[0].message.refusal, "refused");
+});
+
+run("usage conversion preserves missing fields and null input", () => {
+  assert.deepEqual(denormalizeUsageToOpenAIChat({ outputTokens: 9 }), { completion_tokens: 9, total_tokens: 9 });
+  assert.deepEqual(denormalizeUsageToOpenAIResponses({ outputTokens: 9 }), { output_tokens: 9, total_tokens: 9 });
+  assert.deepEqual(denormalizeUsageToAnthropic({ outputTokens: 9 }), {
+    output_tokens: 9, server_tool_use: null,
+  });
+  assert.deepEqual(denormalizeUsageToAnthropic({ inputTokens: 10, nonCacheInputTokens: 4, outputTokens: 9, cacheReadInputTokens: 6 }), {
+    input_tokens: 4, output_tokens: 9, cache_read_input_tokens: 6, server_tool_use: null,
+  });
+  assert.equal(normalizeUsage(null), undefined);
+  assert.deepEqual(normalizeUsage({ input_tokens: null, output_tokens: 9 }), normalizeUsage({ output_tokens: 9 }));
+  for (const convert of [denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, denormalizeUsageToAnthropic]) {
+    assert.equal(convert(undefined), undefined);
+    assert.equal(convert({}), undefined);
+  }
+});
+
+run("Chat metadata preserves provider values without copying or filtering", () => {
+  const metadata = { user: "kept", count: 2, nested: {}, empty: null };
+  assert.strictEqual(denormalizeToOpenAIChatRequest({
+    model: "test", messages: [], metadata,
+  }).metadata, metadata);
+  const result = anthropicMessageRequestToChatParams({
+    model: "test", max_tokens: 10, messages: [{ role: "user", content: "hi" }],
+    metadata: { user_id: "user" },
+  });
+  assert.deepEqual(result.metadata, { user_id: "user" });
+  assert.deepEqual(anthropicMessageRequestToChatParams({
+    model: "test", max_tokens: 10, messages: [], metadata: {},
+  }).metadata, { user_id: null });
 });
 
 run("service tiers map between OpenAI and Anthropic without failing", () => {
@@ -2851,7 +2947,7 @@ run("chat medium reasoning maps to anthropic adaptive thinking", () => {
   });
 
   assert.equal(anthropic.max_tokens, 128000);
-  assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
+  assert.deepEqual((anthropic as any).thinking, { type: "adaptive", display: "summarized" });
 });
 
 run("chat high reasoning maps to anthropic adaptive thinking with explicit max_tokens", () => {
@@ -2863,7 +2959,7 @@ run("chat high reasoning maps to anthropic adaptive thinking with explicit max_t
   });
 
   assert.equal(anthropic.max_tokens, 5000);
-  assert.deepEqual((anthropic as any).thinking, { type: "adaptive" });
+  assert.deepEqual((anthropic as any).thinking, { type: "adaptive", display: "summarized" });
 });
 
 
@@ -6707,9 +6803,10 @@ run("record page stream reconstructor handles Anthropic server_tool_use events",
   });
 });
 
-run("server.ts keeps @ts-nocheck as its first line so the build stays type-check free", () => {
-  // The directive is ignored unless it precedes every statement; an import above it broke the Railway build.
-  assert.equal(readFileSync(join(process.cwd(), "server.ts"), "utf8").split(/\r?\n/, 1)[0], "// @ts-nocheck");
+run("server and protocol converters keep TypeScript checking enabled", () => {
+  for (const path of ["server.ts", "src/proxy/proxy.ts", "src/converters/requests.ts", "src/converters/responses.ts", "src/converters/streams.ts"]) {
+    assert.doesNotMatch(readFileSync(join(process.cwd(), path), "utf8"), /^\s*\/\/\s*@ts-nocheck/m);
+  }
 });
 
 run("http log level only keeps /v1 lifecycle logs at info", () => {
