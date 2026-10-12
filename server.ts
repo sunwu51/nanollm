@@ -11,6 +11,7 @@ import { cors } from "hono/cors";
 import { randomUUID } from "node:crypto";
 import type { ModelConfig, ServerConfig } from "./src/core/config.js";
 import { webAuth } from "./src/core/web-auth.js";
+import { localize, resolveLang, runWithLang } from "./src/core/i18n.js";
 import { withWebUIAuth } from "./src/pages/login-page.js";
 import { getPublicModelNames, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
 import { ConfigManager } from "./src/core/config-manager.js";
@@ -208,11 +209,23 @@ app.use("*", async (c, next) => {
 
 app.use("*", webAuth(() => configManager.getActiveSnapshot().effectiveConfig.auth?.token));
 
+// Errors from the admin and jobs APIs are shown in the web UI, so they follow the page language.
+app.use("*", async (c, next) => {
+  if (c.req.path.startsWith("/admin/") || c.req.path.startsWith("/jobs/")) {
+    return runWithLang(pageLang(c), next);
+  }
+  return next();
+});
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 type Normalizer = (body: unknown) => NormalizedRequest;
 type Denormalizer = (normalized: NormalizedResponse) => unknown;
 type UpstreamOptions = { userAgent?: string; attemptIndex?: number; modelName?: string; signal?: AbortSignal };
+
+function pageLang(c: Context) {
+  return resolveLang(c.req.header("cookie"), c.req.header("accept-language"));
+}
 const fallbackFailureTracker = new FallbackFailureTracker();
 const statusStore: StatusStoreLike = sqliteStorage ? new SqliteStatusStore(sqliteStorage.client) : new StatusStore();
 const usageStore: UsageStoreLike = sqliteStorage ? new SqliteUsageStore(sqliteStorage.client) : new UsageStore();
@@ -498,10 +511,10 @@ const MODEL_TEST_RAW_LIMIT = 20000;
 async function testConfiguredModel(name: string, message: string, config: ServerConfig) {
   const model = resolveModel(config, name);
   if (!model) {
-    return { ok: false as const, status: 404, error: `模型 '${name}' 不在当前生效的配置中，请先保存配置。` };
+    return { ok: false as const, status: 404, error: localize(`模型 '${name}' 不在当前生效的配置中，请先保存配置。`, `Model '${name}' is not in the active config. Save the config first.`) };
   }
   if (model.provider === "openai-image") {
-    return { ok: false as const, status: 400, error: "openai-image 模型不支持消息测试。" };
+    return { ok: false as const, status: 400, error: localize("openai-image 模型不支持消息测试。", "openai-image models can't be tested with a message.") };
   }
 
   const { path, body } = buildModelTestRequest(model.provider, model.name, message);
@@ -1229,9 +1242,9 @@ app.get("/", (c) => {
 
 app.get("/health", (c) => c.json({ ok: true }));
 
-app.get("/status", async (c) => c.html(withWebUIAuth(renderStatusPage(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c)))));
+app.get("/status", async (c) => c.html(withWebUIAuth(renderStatusPage(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c), pageLang(c)))));
 app.get("/status/data", async (c) => c.json(await buildStatusPayload(configManager.getActiveSnapshot().effectiveConfig, c)));
-app.get("/record", async (c) => c.html(withWebUIAuth(renderRecordPage(await getRecordSummary()))));
+app.get("/record", async (c) => c.html(withWebUIAuth(renderRecordPage(await getRecordSummary(), pageLang(c)))));
 app.get("/record/summary", async (c) => c.json(await getRecordSummary()));
 app.get("/record/:requestId", async (c) => {
   const requestId = c.req.param("requestId");
@@ -1276,8 +1289,8 @@ app.post("/record/:requestId/replay", async (c) => {
   }, result.status);
 });
 
-app.get("/admin", (c) => c.html(withWebUIAuth(renderAdminConfigPage(buildConfigAdminPayload()))));
-app.get("/jobs", (c) => c.html(withWebUIAuth(renderJobsPage())));
+app.get("/admin", (c) => c.html(withWebUIAuth(renderAdminConfigPage(buildConfigAdminPayload(), pageLang(c)))));
+app.get("/jobs", (c) => c.html(withWebUIAuth(renderJobsPage(pageLang(c)))));
 app.route("/jobs/api", createJobRoutes(jobScheduler,
   () => configManager.getActiveSnapshot().effectiveConfig.models, storageMode, jobModelCatalog));
 app.post("/admin/providers/:name/device-login", async (c) => {
@@ -1365,7 +1378,7 @@ app.get("/admin/providers/:name/models", async (c) => {
       return c.json({ ok: true, models: await fetchClaudeSubscriptionModels(name, provider.proxy, identityHeaders) });
     }
     if (provider?.provider === "openai-subscription") return c.json({ ok: true, models: await fetchSubscriptionModels(name, provider.proxy) });
-    return c.json({ ok: false, error: "订阅供应商不在当前生效的配置中，请先保存配置。" }, 404);
+    return c.json({ ok: false, error: localize("订阅供应商不在当前生效的配置中，请先保存配置。", "The subscription provider is not in the active config. Save the config first.") }, 404);
   } catch (error) {
     return c.json({ ok: false, error: error instanceof Error ? error.message : String(error) }, 400);
   }

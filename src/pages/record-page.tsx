@@ -1,5 +1,6 @@
 import { renderToString } from "hono/jsx/dom/server";
 import { LOGO_DATA_URI } from "./logo.js";
+import { htmlLang, withPageCorner, type Lang } from "../core/i18n.js";
 
 function serializeForScript(value: unknown): string {
   return JSON.stringify(value)
@@ -12,6 +13,89 @@ const REQUEST_ID_DATALIST_ID = "request-id-options";
 const STRING_PREVIEW_LENGTH = 100;
 const SUMMARY_POLL_INTERVAL_MS = 3000;
 const RECENT_PAGE_SIZE = 12;
+
+const zh = {
+  locale: "zh-CN",
+  expand: "展开",
+  collapse: "收起",
+  intro: "输入完整 requestId，页面会调用查询接口并展示本轮采样缓存里的请求详情。",
+  requestIdPlaceholder: "例如 6dfae2ab-1234-5678-9abc-def012345678",
+  query: "查询",
+  model: "模型",
+  allModels: "全部模型",
+  from: "开始时间",
+  to: "结束时间",
+  clearFilters: "清除筛选",
+  noRecordLoaded: "还没有加载记录。",
+  noFilterMatch: "没有符合筛选条件的记录。",
+  statusSuccess: "成功",
+  statusFailure: "失败",
+  statusInProgress: "请求中...",
+  queryFailed: "查询失败",
+  requestIdRequired: "请先输入 requestId。",
+  prevPage: "上一页",
+  nextPage: "下一页",
+  captured: "已采样",
+  limit: "上限",
+  startedAt: "启动于",
+  pillSeparator: "：",
+  openImage: "打开图片",
+  fullResponse: "完整响应",
+  streamEvents: "流事件",
+  copied: "已复制",
+  copyFailed: "失败",
+  copy: "复制",
+  copyMergedJson: "复制合并 JSON",
+  noContent: "无内容",
+  showAllStreamEvents: "显示全部 {count} 个流事件",
+  basicInfo: "基本信息",
+  noUpstreamRequests: "没有记录到上游请求。",
+  proxyDirect: "直连（未使用代理）",
+  proxyNotRecorded: "未记录（历史记录）",
+};
+
+const MESSAGES: Record<Lang, typeof zh> = {
+  zh,
+  en: {
+    locale: "en-US",
+    expand: "Expand",
+    collapse: "Collapse",
+    intro: "Enter a full requestId to load the request details from the records captured in this session.",
+    requestIdPlaceholder: "e.g. 6dfae2ab-1234-5678-9abc-def012345678",
+    query: "Search",
+    model: "Model",
+    allModels: "All models",
+    from: "From",
+    to: "To",
+    clearFilters: "Clear filters",
+    noRecordLoaded: "No record loaded yet.",
+    noFilterMatch: "No records match the filters.",
+    statusSuccess: "Success",
+    statusFailure: "Failed",
+    statusInProgress: "In progress...",
+    queryFailed: "Query failed",
+    requestIdRequired: "Enter a requestId first.",
+    prevPage: "Previous page",
+    nextPage: "Next page",
+    captured: "Captured",
+    limit: "Limit",
+    startedAt: "Started",
+    pillSeparator: ": ",
+    openImage: "Open image",
+    fullResponse: "Full response",
+    streamEvents: "Stream events",
+    copied: "Copied",
+    copyFailed: "Failed",
+    copy: "Copy",
+    copyMergedJson: "Copy merged JSON",
+    noContent: "Empty",
+    showAllStreamEvents: "Show all {count} stream events",
+    basicInfo: "Basic info",
+    noUpstreamRequests: "No upstream requests were recorded.",
+    proxyDirect: "Direct (no proxy)",
+    proxyNotRecorded: "Not recorded (older record)",
+  },
+};
 
 export interface RecordSummary {
   enabled: boolean;
@@ -391,13 +475,13 @@ const STYLE = /* css */ String.raw`
         display: none;
       }
       details.section > summary::after {
-        content: "展开";
+        content: var(--label-expand);
         color: var(--accent);
         font-size: 12px;
         font-weight: 700;
       }
       details.section[open] > summary::after {
-        content: "收起";
+        content: var(--label-collapse);
       }
       .section-body {
         padding: 0 16px 16px;
@@ -485,11 +569,11 @@ const STYLE = /* css */ String.raw`
         font-weight: 700;
       }
       .fold > summary::after {
-        content: "展开";
+        content: var(--label-expand);
         font-size: 12px;
       }
       .fold[open] > summary::after {
-        content: "收起";
+        content: var(--label-collapse);
       }
       .fold-body {
         padding: 0 12px 12px;
@@ -536,12 +620,12 @@ const STYLE = /* css */ String.raw`
         list-style: none;
       }
       .inline-fold > summary::after {
-        content: "展开";
+        content: var(--label-expand);
         color: var(--accent);
         font-size: 12px;
       }
       .inline-fold[open] > summary::after {
-        content: "收起";
+        content: var(--label-collapse);
       }
       .inline-meta {
         color: var(--muted);
@@ -598,6 +682,7 @@ const STYLE = /* css */ String.raw`
 
 const SCRIPT = String.raw`
       const INITIAL_SUMMARY = __INITIAL_SUMMARY__;
+      const T = __MESSAGES__;
       const summaryEl = document.getElementById("summary");
       const recentEl = document.getElementById("recent");
       const recentPagerEl = document.getElementById("recent-pager");
@@ -647,7 +732,7 @@ const SCRIPT = String.raw`
         modelFilterEl.textContent = "";
         const all = document.createElement("option");
         all.value = "";
-        all.textContent = "全部模型";
+        all.textContent = T.allModels;
         modelFilterEl.appendChild(all);
         models.forEach((model) => {
           const option = document.createElement("option");
@@ -702,9 +787,9 @@ const SCRIPT = String.raw`
       }
 
       function getStatusLabel(status) {
-        if (status === "success") return "成功";
-        if (status === "failure") return "失败";
-        return "请求中...";
+        if (status === "success") return T.statusSuccess;
+        if (status === "failure") return T.statusFailure;
+        return T.statusInProgress;
       }
 
       function getStatusBadgeClass(item) {
@@ -759,7 +844,7 @@ const SCRIPT = String.raw`
 
         button.addEventListener("click", () => {
           requestIdInput.value = item.requestId;
-          queryRecord().catch((error) => renderError(error instanceof Error ? error.message : "查询失败"));
+          queryRecord().catch((error) => renderError(error instanceof Error ? error.message : T.queryFailed));
         });
         return button;
       }
@@ -770,7 +855,7 @@ const SCRIPT = String.raw`
         if (items.length === 0 && (summary.recentKeys || []).length > 0) {
           const empty = document.createElement("div");
           empty.className = "recent-empty";
-          empty.textContent = "没有符合筛选条件的记录。";
+          empty.textContent = T.noFilterMatch;
           recentEl.appendChild(empty);
         }
         const pageCount = Math.max(1, Math.ceil(items.length / ${RECENT_PAGE_SIZE}));
@@ -808,7 +893,7 @@ const SCRIPT = String.raw`
       function renderRecentPager(total, pageCount, start) {
         recentPagerEl.textContent = "";
         if (pageCount <= 1) return;
-        recentPagerEl.appendChild(createPagerButton("‹", recentPage > 0 ? recentPage - 1 : -1, "上一页"));
+        recentPagerEl.appendChild(createPagerButton("‹", recentPage > 0 ? recentPage - 1 : -1, T.prevPage));
         getPagerSlots(pageCount).forEach((page) => {
           if (page === null) {
             const gap = document.createElement("span");
@@ -821,7 +906,7 @@ const SCRIPT = String.raw`
           if (page === recentPage) button.className = "current";
           recentPagerEl.appendChild(button);
         });
-        recentPagerEl.appendChild(createPagerButton("›", recentPage < pageCount - 1 ? recentPage + 1 : -1, "下一页"));
+        recentPagerEl.appendChild(createPagerButton("›", recentPage < pageCount - 1 ? recentPage + 1 : -1, T.nextPage));
         const range = document.createElement("span");
         range.className = "pager-range";
         range.textContent = (start + 1) + "–" + Math.min(start + ${RECENT_PAGE_SIZE}, total) + " / " + total;
@@ -854,14 +939,14 @@ const SCRIPT = String.raw`
         recordPanelEl.classList.toggle("recording", true);
         summaryEl.textContent = "";
         const items = [
-          ["已采样", String(summary.capturedCount)],
-          ["上限", String(summary.limit)],
-          ["启动于", new Date(summary.sessionStartedAt ?? Date.now()).toLocaleString("zh-CN")],
+          [T.captured, String(summary.capturedCount)],
+          [T.limit, String(summary.limit)],
+          [T.startedAt, new Date(summary.sessionStartedAt ?? Date.now()).toLocaleString(T.locale)],
         ];
         for (const [label, value] of items) {
           const pill = document.createElement("div");
           pill.className = "pill";
-          pill.textContent = label + "：" + value;
+          pill.textContent = label + T.pillSeparator + value;
           summaryEl.appendChild(pill);
         }
 
@@ -1019,7 +1104,7 @@ const SCRIPT = String.raw`
         link.href = "/record/images/" + encodeURIComponent(hash);
         link.target = "_blank";
         link.rel = "noopener";
-        link.title = "打开图片";
+        link.title = T.openImage;
         link.textContent = JSON.stringify(hash);
         return link;
       }
@@ -1601,12 +1686,12 @@ const SCRIPT = String.raw`
 
         const reconstructed = reconstructStreamResponse(events);
         if (reconstructed) {
-          const fold = createFold("完整响应");
+          const fold = createFold(T.fullResponse);
           fold.body.appendChild(renderStreamValue(reconstructed, { expandedDepth: 1 }));
           parent.appendChild(fold.fold);
         }
 
-        const listFold = createFold("流事件");
+        const listFold = createFold(T.streamEvents);
         const list = document.createElement("div");
         list.className = "stream-list";
         events.forEach((item, index) => {
@@ -1640,9 +1725,9 @@ const SCRIPT = String.raw`
         button.addEventListener("click", () => {
           const text = getText();
           navigator.clipboard.writeText(text).then(() => {
-            setCopyButtonState(button, "已复制", label);
+            setCopyButtonState(button, T.copied, label);
           }).catch(() => {
-            setCopyButtonState(button, "失败", label);
+            setCopyButtonState(button, T.copyFailed, label);
           });
         });
         return button;
@@ -1662,11 +1747,11 @@ const SCRIPT = String.raw`
         if (value != null && value !== "") {
           const actions = document.createElement("div");
           actions.className = "box-actions";
-          actions.appendChild(createCopyButton("复制", () => (
+          actions.appendChild(createCopyButton(T.copy, () => (
             typeof value === "string" ? value : JSON.stringify(value, null, 2)
           )));
           if (streamState?.reconstructed != null) {
-            actions.appendChild(createCopyButton("复制合并 JSON", () => (
+            actions.appendChild(createCopyButton(T.copyMergedJson, () => (
               JSON.stringify(streamState.reconstructed, null, 2)
             )));
           }
@@ -1675,17 +1760,17 @@ const SCRIPT = String.raw`
         if (value == null || value === "") {
          const empty = document.createElement("div");
          empty.className = "empty";
-         empty.textContent = "无内容";
+         empty.textContent = T.noContent;
          box.appendChild(empty);
        } else if (isStreamText) {
           if (streamState?.events?.length) {
             if (streamState.reconstructed) {
-              const fold = createFold("完整响应");
+              const fold = createFold(T.fullResponse);
               fold.body.appendChild(renderStreamValue(streamState.reconstructed, { expandedDepth: 1 }));
               box.appendChild(fold.fold);
             }
 
-            const listFold = createFold("流事件");
+            const listFold = createFold(T.streamEvents);
             const list = document.createElement("div");
             list.className = "stream-list";
             function renderEventItem(item, index) {
@@ -1713,7 +1798,7 @@ const SCRIPT = String.raw`
             if (totalEvents > STREAM_EVENT_LIMIT) {
               const showAllBtn = document.createElement("button");
               showAllBtn.className = "secondary";
-              showAllBtn.textContent = "显示全部 " + totalEvents + " 个流事件";
+              showAllBtn.textContent = T.showAllStreamEvents.replace("{count}", String(totalEvents));
               showAllBtn.style.marginTop = "8px";
               showAllBtn.addEventListener("click", function onShowAll() {
                 showAllBtn.remove();
@@ -1760,13 +1845,13 @@ const SCRIPT = String.raw`
       function renderRecord(record) {
         contentEl.textContent = "";
 
-        const baseSection = createSection("基本信息");
+        const baseSection = createSection(T.basicInfo);
         appendKV(baseSection, [
           ["requestId", record.requestId],
           ["key", record.key],
           ["path", record.clientRequest?.path],
           ["stream", record.stream],
-          ["createdAt", record.createdAt ? new Date(record.createdAt).toLocaleString("zh-CN") : "-"],
+          ["createdAt", record.createdAt ? new Date(record.createdAt).toLocaleString(T.locale) : "-"],
           ["ttfb", formatElapsed(record.createdAt, record.firstByteAt)],
           ["duration", formatElapsed(record.createdAt, record.completedAt)],
           ["error", formatRecordedError(record.error)],
@@ -1788,7 +1873,7 @@ const SCRIPT = String.raw`
         if (!record.attempts?.length) {
           const empty = document.createElement("div");
           empty.className = "empty";
-          empty.textContent = "没有记录到上游请求。";
+          empty.textContent = T.noUpstreamRequests;
           attemptsStack.appendChild(empty);
         } else {
           record.attempts.forEach((attempt) => {
@@ -1802,7 +1887,7 @@ const SCRIPT = String.raw`
             card.appendChild(head);
             appendKV(card, [
               ["url", attempt.url],
-              ["proxy", attempt.proxy === null ? "直连（未使用代理）" : attempt.proxy ?? "未记录（历史记录）"],
+              ["proxy", attempt.proxy === null ? T.proxyDirect : attempt.proxy ?? T.proxyNotRecorded],
               ["status", attempt.response?.status],
               ["error", formatRecordedError(attempt.error)],
             ]);
@@ -1865,7 +1950,7 @@ const SCRIPT = String.raw`
       async function queryRecord() {
         const requestId = normalizeRequestIdInput(requestIdInput.value);
         if (!requestId) {
-          renderError("请先输入 requestId。");
+          renderError(T.requestIdRequired);
           return;
         }
         requestIdInput.value = requestId;
@@ -1877,7 +1962,7 @@ const SCRIPT = String.raw`
           if (payload.summary) {
             setSummary(payload.summary);
           }
-          renderError(payload.error || "查询失败");
+          renderError(payload.error || T.queryFailed);
           return;
         }
         selectedRequestId = payload.record.requestId;
@@ -1890,7 +1975,7 @@ const SCRIPT = String.raw`
       }
 
       document.getElementById("query-button").addEventListener("click", () => {
-        queryRecord().catch((error) => renderError(error instanceof Error ? error.message : "查询失败"));
+        queryRecord().catch((error) => renderError(error instanceof Error ? error.message : T.queryFailed));
       });
 
       function applyRecentFilters() {
@@ -1920,65 +2005,68 @@ const SCRIPT = String.raw`
       const preset = params.get("requestId");
       if (preset) {
         requestIdInput.value = preset;
-        queryRecord().catch((error) => renderError(error instanceof Error ? error.message : "查询失败"));
+        queryRecord().catch((error) => renderError(error instanceof Error ? error.message : T.queryFailed));
       }
 `;
 
-function RecordPage({ summary }: { summary: RecordSummary }) {
+function RecordPage({ summary, lang }: { summary: RecordSummary; lang: Lang }) {
   const panelClass = "panel recording";
+  const m = MESSAGES[lang];
+  const labelStyle = `:root { --label-expand: ${JSON.stringify(m.expand)}; --label-collapse: ${JSON.stringify(m.collapse)}; }`;
   return (
-    <html lang="zh-CN">
+    <html lang={htmlLang(lang)}>
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>nanollm record</title>
         <link rel="icon" type="image/svg+xml" href={LOGO_DATA_URI} />
-        <style dangerouslySetInnerHTML={{ __html: STYLE }} />
+        <style dangerouslySetInnerHTML={{ __html: STYLE + labelStyle }} />
       </head>
       <body>
-    <a class="back-admin" href="/admin">← Admin</a>
     <main class="page">
       <section class={panelClass} id="record-panel">
         <h1>Request Record</h1>
-        <p class="meta">输入完整 requestId 或前 6 位，页面会调用查询接口并展示本轮采样缓存里的请求详情。</p>
+        <p class="meta">{m.intro}</p>
         <div class="toolbar">
           <div>
             <label for="request-id">requestId</label>
-            <input id="request-id" name="requestId" list={REQUEST_ID_DATALIST_ID} placeholder="例如 6dfae2ab-1234-5678-9abc-def012345678" />
+            <input id="request-id" name="requestId" list={REQUEST_ID_DATALIST_ID} placeholder={m.requestIdPlaceholder} />
             <datalist id={REQUEST_ID_DATALIST_ID}></datalist>
           </div>
           <div class="actions">
-            <button id="query-button" type="button">查询</button>
+            <button id="query-button" type="button">{m.query}</button>
           </div>
         </div>
         <div class="filters">
           <div>
-            <label for="filter-model">模型</label>
+            <label for="filter-model">{m.model}</label>
             <select id="filter-model"></select>
           </div>
           <div>
-            <label for="filter-from">开始时间</label>
+            <label for="filter-from">{m.from}</label>
             <input id="filter-from" type="datetime-local" />
           </div>
           <div>
-            <label for="filter-to">结束时间</label>
+            <label for="filter-to">{m.to}</label>
             <input id="filter-to" type="datetime-local" />
           </div>
           <div class="actions">
-            <button id="filter-clear" type="button" class="secondary">清除筛选</button>
+            <button id="filter-clear" type="button" class="secondary">{m.clearFilters}</button>
           </div>
         </div>
         <div class="summary" id="summary"></div>
         <div class="recent" id="recent"></div>
         <div class="recent-pager" id="recent-pager"></div>
         <div class="content" id="content">
-          <section class="section empty">还没有加载记录。</section>
+          <section class="section empty">{m.noRecordLoaded}</section>
         </div>
       </section>
     </main>
         <script
           dangerouslySetInnerHTML={{
-            __html: SCRIPT.replace("__INITIAL_SUMMARY__", serializeForScript(summary)),
+            __html: SCRIPT
+              .replace("__INITIAL_SUMMARY__", serializeForScript(summary))
+              .replace("__MESSAGES__", serializeForScript(m)),
           }}
         />
       </body>
@@ -1986,6 +2074,6 @@ function RecordPage({ summary }: { summary: RecordSummary }) {
   );
 }
 
-export function renderRecordPage(summary: RecordSummary): string {
-  return "<!doctype html>" + renderToString(<RecordPage summary={summary} />);
+export function renderRecordPage(summary: RecordSummary, lang: Lang = "zh"): string {
+  return withPageCorner("<!doctype html>" + renderToString(<RecordPage summary={summary} lang={lang} />), lang, { backToAdmin: true });
 }

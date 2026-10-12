@@ -1,11 +1,421 @@
 import { renderToString } from "hono/jsx/dom/server";
 import { LOGO_DATA_URI } from "./logo.js";
+import { htmlLang, withPageCorner, type Lang } from "../core/i18n.js";
 function serializeForScript(value: unknown): string {
   return JSON.stringify(value)
     .replaceAll("<", "\\u003c")
     .replaceAll(">", "\\u003e")
     .replaceAll("&", "\\u0026");
 }
+
+const zh = {
+  locale: "zh-CN",
+  listSeparator: "、",
+  period: "。",
+  colon: "：",
+  inParens: "（{text}）",
+  unknown: "未知",
+  close: "关闭",
+  cancel: "取消",
+  modelN: "模型 {n}",
+  advancedInvalidJson: "{model} 的高级字段不是有效 JSON：{error}",
+  advancedNotObject: "{model} 的高级字段必须是 JSON 对象。",
+  advancedReserved: "{model} 的高级字段不能覆盖基础字段：{keys}",
+  customProviderMissing: "{model} 尚未选择 custom_provider。",
+  runningPort: "当前运行 port",
+  portRestart: "port 修改需重启",
+  lastLoadFailed: "最近一次加载失败",
+  dragToReorder: "拖拽排序",
+  advancedFields: "高级字段",
+  hideAdvanced: "收起高级字段",
+  showAdvanced: "展开高级字段",
+  advancedCount: "当前有 {n} 个高级字段，保存时会展开到模型 YAML 中。",
+  noAdvanced: "当前没有高级字段。",
+  advancedHelper: "输入 JSON 对象。保存时会展开到该模型 YAML 中，不能覆盖 name/provider/base_url/api_key/model/proxy 以及 body_expression/response_expression（请使用上方独立输入框）。",
+  timeoutHelper: "正整数，单位毫秒。保存后新请求立即生效。",
+  recordMaxHelper: "正整数。保存后会在线调整采样记录上限。",
+  noProviders: "还没有自定义供应商，点击“添加供应商”集中配置连接信息。",
+  unnamedProvider: "未命名供应商",
+  noProtocol: "未选协议",
+  noBaseUrl: "未填 base_url",
+  signedIn: "已登录",
+  notSignedIn: "未登录",
+  signIn: "登录",
+  signInAgain: "重新登录",
+  checkingSignIn: "检查登录状态…",
+  checkUsage: "查询用量",
+  checking: "查询中…",
+  usageQueryFailed: "用量查询失败",
+  codexUsage: "Codex 订阅用量",
+  unitDays: "天",
+  unitHours: "小时",
+  unitMinutes: "分钟",
+  shortWindow: "短期窗口",
+  longWindow: "长期窗口",
+  used: "已用",
+  resets: "重置",
+  resetCount: "5 小时窗口可用重置次数：",
+  resetCountUnavailable: "5 小时窗口可用重置次数：未能查询",
+  resetWindowButton: "重置当前 5 小时窗口（剩余 {n} 次）",
+  resetWindowConfirm: "确定要重置当前 5 小时窗口吗？这会消耗 1 次重置次数。",
+  resetting: "重置中…",
+  resetFailed: "窗口重置失败",
+  resetRequested: "5 小时窗口已请求重置，请重新查询用量确认结果。",
+  statusUnknown: "状态未知",
+  savingWaitToSignIn: "正在保存配置，请保存完成后再登录。",
+  unsavedBeforeSignIn: "页面有未保存的修改，请先保存配置，再登录。登录将使用已保存的供应商代理。",
+  providerNameAndSave: "请先填写供应商名称并保存配置。",
+  deviceLoginStartFailed: "无法发起设备登录",
+  openaiSignInTitle: "OpenAI subscription 登录",
+  enterCodeInBrowser: "请在浏览器打开的页面中输入以下验证码：",
+  continueChecking: "完成后继续检查",
+  deviceLoginFailed: "设备登录失败",
+  openaiSignInSuccess: "OpenAI subscription 登录成功。",
+  deviceLoginTimeout: "设备登录超时，请重新尝试。",
+  modelCount: "{n} 个模型",
+  conflictCountSuffix: "（{n} 个冲突）",
+  jumpToProviderModels: "跳转到下方 Models 中该供应商的模型",
+  providerHasNoModels: "该供应商下还没有模型，可点击“拉取模型”添加",
+  fetchModels: "拉取模型",
+  providerNameFirst: "请先填写供应商名称。",
+  subscriptionNotSaved: "该订阅供应商还没有保存，请先保存配置并完成登录。",
+  proxyUnsaved: "该供应商的代理有未保存的修改，拉取模型使用服务端已保存的代理，请先保存配置。",
+  baseUrlFirst: "请先填写 base_url。",
+  deleteProvider: "删除供应商",
+  subscriptionNote: "Base URL 和 API key 由订阅登录自动管理。请先保存供应商及代理配置，再点击登录。",
+  apiKeyPlaceholderEnv: "支持直接填 key 或环境变量占位符",
+  apiKeyPlaceholder: "支持直接填 key 或 ${ENV_VAR}",
+  providerProxyHelper: "可选。引用该供应商的模型调用上游时使用的 HTTP proxy；优先级：模型 proxy > 供应商 proxy > HTTPS_PROXY/HTTP_PROXY。订阅（OpenAI / Claude）登录、凭证刷新和用量查询也使用此代理；修改后请先保存配置。",
+  claudeUsage: "Claude 订阅用量",
+  windowFiveHour: "5 小时窗口",
+  windowSevenDay: "7 天窗口",
+  oauthApps: "OAuth 应用",
+  noUsageWindows: "未返回用量窗口数据。",
+  extraUsageOn: "额外用量：已开启 · 已用 ",
+  extraUsageOff: "额外用量：未开启",
+  unlimited: "不限",
+  claudeSignInStartFailed: "无法发起 Claude 登录",
+  claudeSignInTitle: "Claude subscription 登录",
+  claudeSignInSteps: "1. 在新打开的页面中登录 Claude 并点击授权。2. 授权后浏览器会跳转到 callback 页面（{redirectUri}?code=...），复制地址栏中的完整 URL（或页面上显示的 code#state 授权码）粘贴到下方。",
+  openAuthorizePage: "未自动打开？点此打开授权页面",
+  finishSignIn: "完成登录",
+  pasteCallbackUrl: "请粘贴完整的 callback URL。",
+  signingIn: "登录中…",
+  claudeSignInFailed: "Claude 登录失败",
+  claudeSignInSuccess: "Claude subscription 登录成功{detail}。",
+  noUpstreamModel: "未填上游模型名",
+  noProviderSelected: "未选供应商",
+  testModelTitle: "测试模型：",
+  unnamedModel: "未命名模型",
+  unnamedModelN: "未命名模型 {n}",
+  testNote: "使用服务端当前已保存的配置发送一次流式请求",
+  testNoteDirty: "；页面上还有未保存的修改，不会参与本次测试。",
+  viewSource: "查看源码",
+  rawResponse: "原始响应",
+  send: "发送",
+  modelNameAndSave: "请先填写模型名称并保存配置。",
+  requesting: "请求中...",
+  upstreamModelLabel: "上游模型",
+  success: "成功",
+  failedPrefix: "失败：",
+  viewRecord: "查看记录",
+  replyPreview: "模型回复预览",
+  noTextReply: "(未解析到文本回复，请查看原始响应)",
+  deleteGroupModelsConfirm: "确定删除供应商 {provider} 下的全部 {n} 个模型配置吗？供应商本身会保留，fallback 分组中对应的成员也会被移除。",
+  providerModelSource: "供应商 {provider} / {model}",
+  standaloneModelSource: "独立模型 {model}",
+  fallbackGroupLabel: "fallback 分组",
+  otherFallbackGroups: "其他 fallback 分组",
+  conflictsFound: "发现 {n} 个名称冲突，保存前需要调整（点击下方条目可定位到对应模型）：",
+  fetchModelsTitle: "拉取模型列表：",
+  fetchViaClaude: "使用已保存的 Claude 登录凭证请求 api.anthropic.com/v1/models。",
+  fetchViaOpenAI: "使用已保存的 OpenAI 登录凭证请求 Codex 模型目录（chatgpt.com/backend-api/codex/models）。",
+  fetchViaForm: "使用当前表单中填写的 base_url / api_key / proxy 请求上游 /models（无需先保存）。",
+  fetchNote: "已添加过的模型不可重复选择；不同供应商的同名模型请在添加后自行调整名称，或为供应商勾选“加供应商名后缀”。",
+  filterModelIds: "过滤模型 ID",
+  selectAll: "全选",
+  deselectAll: "取消全选",
+  refetch: "重新拉取",
+  addModels: "添加模型",
+  addModelsCount: "添加模型（{n}）",
+  modelsAdded: "已添加 {n} 个模型，保存后生效。",
+  modelsAddedConflicts: "其中 {n} 个与已有模型重名（{names}），保存前请调整名称。",
+  noModelsYet: "暂无模型。",
+  noMatchingModels: "没有匹配的模型。",
+  addedSuffix: "（已添加）",
+  fetching: "拉取中...",
+  fetchModelsFailed: "拉取模型列表失败",
+  fetchedCount: "共获取 {n} 个模型。",
+  providerBadge: "供应商",
+  modelNameConflicts: "{n} 个模型名冲突",
+  conflictedModels: "冲突的模型：",
+  expandToSeeMarks: "。展开后可看到具体标记。",
+  providerNotFound: "未找到该供应商，请检查供应商配置",
+  suffixTitle: "勾选后，该供应商下所有模型的名称变为“模型ID-供应商名”，取消勾选则恢复为模型ID。",
+  addProviderSuffix: "加供应商名后缀",
+  editProvider: "编辑供应商",
+  deleteAllModels: "删除全部模型",
+  noModels: "还没有模型，点击“添加模型”开始配置。",
+  providerModelsHeading: "供应商模型（{n}）",
+  standaloneModelsHeading: "独立配置的模型（{n}）",
+  nameClash: "与 {others} 重名，请修改名称",
+  nameConflict: "名称冲突",
+  keepsAdvanced: "保留高级字段",
+  test: "测试",
+  saveBeforeTest: "模型尚未保存，请先点击“保存并应用”后再测试",
+  duplicate: "复刻",
+  deleteModel: "删除模型",
+  customProviderLabel: "custom_provider（引用上方供应商连接配置）",
+  addProviderFirst: "请先添加供应商。",
+  upstreamModelPlaceholder: "上游真实模型名",
+  modelProxyHelper: "可选。该模型调用上游时使用的 HTTP proxy，优先级最高；留空则依次回退到供应商 proxy、HTTPS_PROXY/HTTP_PROXY。",
+  bodyExpressionHelper: "可选。JS 表达式，变量 body 为最终上游请求体，需同步返回新的 body；留空表示不改写。",
+  responseExpressionHelper: "可选。JS 表达式，变量 response 为上游 JSON/SSE 响应、headers 为只读的上游响应头，需返回新的 response；留空表示不改写。",
+  noFallbackGroups: "还没有 fallback 分组，点击“添加分组”后可以为分组选择模型列表。",
+  unnamedGroupN: "未命名分组 {n}",
+  deleteGroup: "删除分组",
+  groupNameClash: "与 {others} 重名，请修改分组名",
+  groupNamePlaceholder: "例如 gpt-5.4",
+  duplicateMembers: "当前分组存在重复模型名：{names}。保存时会被拦截。",
+  noMembers: "当前分组还没有成员。",
+  addModelsFirst: "请先添加模型",
+  chooseModel: "选择模型",
+  moveUp: "上移",
+  moveDown: "下移",
+  remove: "删除",
+  addModelToGroup: "添加模型到分组",
+  refreshConfigFailed: "刷新配置失败",
+  refreshFailed: "刷新失败",
+  saving: "正在保存并应用配置...",
+  advancedJsonInvalid: "高级字段 JSON 校验失败",
+  saveConflict: "保存失败：配置已被外部更新，请先刷新页面上的内容。",
+  saveFailed: "保存失败",
+  savedNeedsRestart: "保存成功。除 port 外的配置已立即生效；port 变更需要重启服务。",
+  saved: "保存成功，配置已立即生效。",
+  refreshed: "已从服务端刷新到最新配置。",
+  reverted: "已恢复到当前服务端配置。",
+  introBefore: "通过表单编辑服务配置、模型和 fallback 分组。保存后会自动校验并写回 ",
+  introAfter: "。",
+  saveAndApply: "保存并应用",
+  refreshFromServer: "从服务端刷新",
+  discardChanges: "撤销未保存修改",
+  noteBox: "当前页面只展开常用字段。已有模型上的未展开高级字段会在保存时自动保留；API Key 输入框也支持 ${ENV_VAR} 这种占位写法；当前运行端口只展示、不提供页面编辑。",
+  statusDesc: "查看当前各个模型调用状况。",
+  recordDesc: "查看采样记录。",
+  jobsDesc: "设置 cron、定时测试模型并对比历史作品。",
+  providersIntro: "集中配置可供多个模型引用的协议、上游地址和 API Key；供应商名称必须唯一。",
+  addProvider: "添加供应商",
+  modelsIntro: "模型可以直接配置连接信息，也可以通过 custom_provider 引用上方供应商。",
+  addModel: "添加模型",
+  fallbackIntro: "为分组命名后，从上面已经配置过的模型里选择成员。",
+  addGroup: "添加分组",
+};
+
+const MESSAGES: Record<Lang, typeof zh> = {
+  zh,
+  en: {
+    locale: "en-US",
+    listSeparator: ", ",
+    period: ".",
+    colon: ": ",
+    inParens: " ({text})",
+    unknown: "unknown",
+    close: "Close",
+    cancel: "Cancel",
+    modelN: "Model {n}",
+    advancedInvalidJson: "Advanced fields of {model} are not valid JSON: {error}",
+    advancedNotObject: "Advanced fields of {model} must be a JSON object.",
+    advancedReserved: "Advanced fields of {model} cannot override base fields: {keys}",
+    customProviderMissing: "{model} has no custom_provider selected.",
+    runningPort: "running port",
+    portRestart: "Port changes need a restart",
+    lastLoadFailed: "Last load failed",
+    dragToReorder: "Drag to reorder",
+    advancedFields: "Advanced fields",
+    hideAdvanced: "Hide advanced fields",
+    showAdvanced: "Show advanced fields",
+    advancedCount: "{n} advanced field{s}; they are written into the model's YAML on save.",
+    noAdvanced: "No advanced fields.",
+    advancedHelper: "Enter a JSON object. It is written into this model's YAML on save and cannot override name/provider/base_url/api_key/model/proxy or body_expression/response_expression (use the dedicated inputs above).",
+    timeoutHelper: "A positive integer in milliseconds. Applies to new requests as soon as you save.",
+    recordMaxHelper: "A positive integer. Saving adjusts the record limit live.",
+    noProviders: "No custom providers yet. Click “Add provider” to set up shared connection settings.",
+    unnamedProvider: "Unnamed provider",
+    noProtocol: "No protocol selected",
+    noBaseUrl: "No base_url",
+    signedIn: "Signed in",
+    notSignedIn: "Not signed in",
+    signIn: "Sign in",
+    signInAgain: "Sign in again",
+    checkingSignIn: "Checking sign-in status…",
+    checkUsage: "Check usage",
+    checking: "Checking…",
+    usageQueryFailed: "Usage query failed",
+    codexUsage: "Codex subscription usage",
+    unitDays: "days",
+    unitHours: "hours",
+    unitMinutes: "min",
+    shortWindow: "Short window",
+    longWindow: "Long window",
+    used: "used",
+    resets: "resets",
+    resetCount: "5-hour window resets available: ",
+    resetCountUnavailable: "5-hour window resets available: could not check",
+    resetWindowButton: "Reset the current 5-hour window ({n} left)",
+    resetWindowConfirm: "Reset the current 5-hour window? This uses 1 reset.",
+    resetting: "Resetting…",
+    resetFailed: "Window reset failed",
+    resetRequested: "Requested a reset of the 5-hour window. Check usage again to confirm.",
+    statusUnknown: "Status unknown",
+    savingWaitToSignIn: "Saving the config. Sign in after it finishes.",
+    unsavedBeforeSignIn: "The page has unsaved changes. Save the config before signing in; sign-in uses the saved provider proxy.",
+    providerNameAndSave: "Enter a provider name and save the config first.",
+    deviceLoginStartFailed: "Could not start device sign-in",
+    openaiSignInTitle: "OpenAI subscription sign-in",
+    enterCodeInBrowser: "Enter this code on the page that opened in your browser:",
+    continueChecking: "Continue when done",
+    deviceLoginFailed: "Device sign-in failed",
+    openaiSignInSuccess: "OpenAI subscription signed in.",
+    deviceLoginTimeout: "Device sign-in timed out. Please try again.",
+    modelCount: "{n} model{s}",
+    conflictCountSuffix: " ({n} conflict{s})",
+    jumpToProviderModels: "Jump to this provider's models below",
+    providerHasNoModels: "This provider has no models yet. Click “Fetch models” to add some.",
+    fetchModels: "Fetch models",
+    providerNameFirst: "Enter a provider name first.",
+    subscriptionNotSaved: "This subscription provider isn't saved yet. Save the config and sign in first.",
+    proxyUnsaved: "This provider's proxy has unsaved changes. Fetching models uses the proxy saved on the server, so save the config first.",
+    baseUrlFirst: "Enter base_url first.",
+    deleteProvider: "Delete provider",
+    subscriptionNote: "Base URL and API key are managed by the subscription sign-in. Save the provider and its proxy first, then click Sign in.",
+    apiKeyPlaceholderEnv: "A key or an environment variable placeholder",
+    apiKeyPlaceholder: "A key or ${ENV_VAR}",
+    providerProxyHelper: "Optional. HTTP proxy used when models that reference this provider call the upstream. Priority: model proxy > provider proxy > HTTPS_PROXY/HTTP_PROXY. Subscription (OpenAI / Claude) sign-in, credential refresh and usage checks also use this proxy; save the config after changing it.",
+    claudeUsage: "Claude subscription usage",
+    windowFiveHour: "5-hour window",
+    windowSevenDay: "7-day window",
+    oauthApps: "OAuth apps",
+    noUsageWindows: "No usage window data returned.",
+    extraUsageOn: "Extra usage: on · used ",
+    extraUsageOff: "Extra usage: off",
+    unlimited: "no limit",
+    claudeSignInStartFailed: "Could not start Claude sign-in",
+    claudeSignInTitle: "Claude subscription sign-in",
+    claudeSignInSteps: "1. Sign in to Claude on the page that just opened and click Authorize. 2. The browser then goes to the callback page ({redirectUri}?code=...). Copy the full URL from the address bar (or the code#state shown on the page) and paste it below.",
+    openAuthorizePage: "Didn't open? Click here to open the authorization page",
+    finishSignIn: "Finish sign-in",
+    pasteCallbackUrl: "Paste the full callback URL.",
+    signingIn: "Signing in…",
+    claudeSignInFailed: "Claude sign-in failed",
+    claudeSignInSuccess: "Claude subscription signed in{detail}.",
+    noUpstreamModel: "No upstream model",
+    noProviderSelected: "No provider selected",
+    testModelTitle: "Test model: ",
+    unnamedModel: "Unnamed model",
+    unnamedModelN: "Unnamed model {n}",
+    testNote: "Sends one streaming request using the config currently saved on the server",
+    testNoteDirty: "; unsaved changes on this page are not included.",
+    viewSource: "View source",
+    rawResponse: "Raw response",
+    send: "Send",
+    modelNameAndSave: "Enter a model name and save the config first.",
+    requesting: "Requesting...",
+    upstreamModelLabel: "upstream model",
+    success: "Success",
+    failedPrefix: "Failed: ",
+    viewRecord: "View record",
+    replyPreview: "Model reply preview",
+    noTextReply: "(No text reply parsed; see the raw response)",
+    deleteGroupModelsConfirm: "Delete {n} model config{s} under provider {provider}? The provider itself is kept; matching members are also removed from fallback groups.",
+    providerModelSource: "provider {provider} / {model}",
+    standaloneModelSource: "standalone model {model}",
+    fallbackGroupLabel: "fallback group",
+    otherFallbackGroups: "other fallback groups",
+    conflictsFound: "Found {n} name conflict{s}. Fix them before saving (click an entry below to jump to the model):",
+    fetchModelsTitle: "Fetch models: ",
+    fetchViaClaude: "Uses the saved Claude sign-in credentials to request api.anthropic.com/v1/models.",
+    fetchViaOpenAI: "Uses the saved OpenAI sign-in credentials to request the Codex model catalog (chatgpt.com/backend-api/codex/models).",
+    fetchViaForm: "Uses the base_url / api_key / proxy in the form to request the upstream /models (no need to save first).",
+    fetchNote: " Models already added can't be selected again. For same-named models from different providers, rename them after adding, or tick “Add provider suffix” on the provider.",
+    filterModelIds: "Filter model IDs",
+    selectAll: "Select all",
+    deselectAll: "Deselect all",
+    refetch: "Fetch again",
+    addModels: "Add models",
+    addModelsCount: "Add models ({n})",
+    modelsAdded: "Added {n} model{s}; they take effect after saving.",
+    modelsAddedConflicts: " {n} of them clash with existing model names ({names}); rename them before saving.",
+    noModelsYet: "No models.",
+    noMatchingModels: "No matching models.",
+    addedSuffix: " (added)",
+    fetching: "Fetching...",
+    fetchModelsFailed: "Failed to fetch models",
+    fetchedCount: "Fetched {n} model{s}.",
+    providerBadge: "Provider",
+    modelNameConflicts: "{n} model name conflict{s}",
+    conflictedModels: "Conflicting models: ",
+    expandToSeeMarks: ". Expand to see the markers.",
+    providerNotFound: "Provider not found. Check the provider settings.",
+    suffixTitle: "When ticked, every model under this provider is named “modelID-providerName”; untick to go back to the model ID.",
+    addProviderSuffix: "Add provider suffix",
+    editProvider: "Edit provider",
+    deleteAllModels: "Delete all models",
+    noModels: "No models yet. Click “Add model” to get started.",
+    providerModelsHeading: "Provider models ({n})",
+    standaloneModelsHeading: "Standalone models ({n})",
+    nameClash: "Same name as {others}; rename it",
+    nameConflict: "Name conflict",
+    keepsAdvanced: "Keeps advanced fields",
+    test: "Test",
+    saveBeforeTest: "This model isn't saved yet. Click “Save and apply” before testing.",
+    duplicate: "Duplicate",
+    deleteModel: "Delete model",
+    customProviderLabel: "custom_provider (uses a provider above)",
+    addProviderFirst: "Add a provider first.",
+    upstreamModelPlaceholder: "Upstream model name",
+    modelProxyHelper: "Optional. HTTP proxy for this model's upstream calls, with the highest priority; if empty, falls back to the provider proxy, then HTTPS_PROXY/HTTP_PROXY.",
+    bodyExpressionHelper: "Optional. A JS expression: body is the final upstream request body, and it must synchronously return the new body. Leave empty to keep it unchanged.",
+    responseExpressionHelper: "Optional. A JS expression: response is the upstream JSON/SSE response and headers the read-only upstream response headers. It must return the new response. Leave empty to keep it unchanged.",
+    noFallbackGroups: "No fallback groups yet. Click “Add group”, then choose its models.",
+    unnamedGroupN: "Unnamed group {n}",
+    deleteGroup: "Delete group",
+    groupNameClash: "Same name as {others}; rename the group",
+    groupNamePlaceholder: "e.g. gpt-5.4",
+    duplicateMembers: "This group lists the same model more than once: {names}. Saving will be blocked.",
+    noMembers: "This group has no members yet.",
+    addModelsFirst: "Add models first",
+    chooseModel: "Choose a model",
+    moveUp: "Move up",
+    moveDown: "Move down",
+    remove: "Remove",
+    addModelToGroup: "Add model to group",
+    refreshConfigFailed: "Failed to refresh the config",
+    refreshFailed: "Refresh failed",
+    saving: "Saving and applying the config...",
+    advancedJsonInvalid: "Advanced field JSON is invalid",
+    saveConflict: "Save failed: the config was changed elsewhere. Refresh the page content first.",
+    saveFailed: "Save failed",
+    savedNeedsRestart: "Saved. Everything except port applies now; changing port needs a restart.",
+    saved: "Saved. The config applies now.",
+    refreshed: "Loaded the latest config from the server.",
+    reverted: "Reverted to the config on the server.",
+    introBefore: "Edit the service config, models and fallback groups in a form. Saving validates the changes and writes them back to ",
+    introAfter: ".",
+    saveAndApply: "Save and apply",
+    refreshFromServer: "Refresh from server",
+    discardChanges: "Discard unsaved changes",
+    noteBox: "Only common fields are shown. Hidden advanced fields on existing models are kept on save; the API Key input also accepts placeholders like ${ENV_VAR}; the running port is shown but can't be edited here.",
+    statusDesc: "See how each model is doing.",
+    recordDesc: "Browse captured request records.",
+    jobsDesc: "Set up cron jobs that test models on a schedule and compare past outputs.",
+    providersIntro: "Shared protocol, upstream URL and API key settings that models can reference. Provider names must be unique.",
+    addProvider: "Add provider",
+    modelsIntro: "Models can set their own connection, or reference a provider above through custom_provider.",
+    addModel: "Add model",
+    fallbackIntro: "Name a group, then pick its members from the models configured above.",
+    addGroup: "Add group",
+  },
+};
 
 const STYLE = /* css */ String.raw`
       :root {
@@ -595,6 +1005,14 @@ const STYLE = /* css */ String.raw`
 
 const SCRIPT = /* js */ String.raw`
       const INITIAL_PAYLOAD = __INITIAL_PAYLOAD__;
+      const T = __MESSAGES__;
+      // Fills {name} placeholders in a message template; {s} is the English plural suffix for {n}.
+      function tr(template, values) {
+        return template.replace(/\{(\w+)\}/g, (match, key) => {
+          if (key === "s") return values.n === 1 ? "" : "s";
+          return key in values ? String(values[key]) : match;
+        });
+      }
       const MODEL_PROVIDERS = ["openai-chat", "openai-responses", "anthropic", "openai-image"];
       const SUBSCRIPTION_PROVIDERS = ["openai-subscription", "claude-subscription"];
       const PROVIDERS = [...MODEL_PROVIDERS, ...SUBSCRIPTION_PROVIDERS];
@@ -715,7 +1133,7 @@ const SCRIPT = /* js */ String.raw`
       }
 
       function getModelLabel(model, index) {
-        return (model.name || "").trim() || "模型 " + (index + 1);
+        return (model.name || "").trim() || tr(T.modelN, { n: index + 1 });
       }
 
       function normalizeModelRef(value) {
@@ -733,14 +1151,14 @@ const SCRIPT = /* js */ String.raw`
         try {
           parsed = trimmed ? JSON.parse(trimmed) : {};
         } catch (error) {
-          throw new Error(modelLabel + " 的高级字段不是有效 JSON：" + (error instanceof Error ? error.message : String(error)));
+          throw new Error(tr(T.advancedInvalidJson, { model: modelLabel, error: error instanceof Error ? error.message : String(error) }));
         }
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-          throw new Error(modelLabel + " 的高级字段必须是 JSON 对象。");
+          throw new Error(tr(T.advancedNotObject, { model: modelLabel }));
         }
         const reservedKeys = Object.keys(parsed).filter((key) => RESERVED_MODEL_EXTRA_KEYS.has(key));
         if (reservedKeys.length > 0) {
-          throw new Error(modelLabel + " 的高级字段不能覆盖基础字段：" + reservedKeys.join(", "));
+          throw new Error(tr(T.advancedReserved, { model: modelLabel, keys: reservedKeys.join(", ") }));
         }
         return parsed;
       }
@@ -748,7 +1166,7 @@ const SCRIPT = /* js */ String.raw`
       function validateAdvancedFields() {
         formState.models.forEach((model, index) => {
           if (model.connection_mode === "custom" && !(model.custom_provider || "").trim()) {
-            throw new Error(getModelLabel(model, index) + " 尚未选择 custom_provider。");
+            throw new Error(tr(T.customProviderMissing, { model: getModelLabel(model, index) }));
           }
           const text = model._advancedJsonText ?? formatAdvancedJson(model.extras);
           model.extras = parseAdvancedJson(text, getModelLabel(model, index));
@@ -799,17 +1217,17 @@ const SCRIPT = /* js */ String.raw`
         snapshotMetaEl.textContent =
           "version " + currentSnapshot.version +
           " · config " + currentSnapshot.configPath +
-          " · 当前运行 port " + currentSnapshot.effectiveConfig.port;
+          " · " + T.runningPort + " " + currentSnapshot.effectiveConfig.port;
 
         pillsEl.textContent = "";
         const pills = [
           { label: "providers " + formState.providers.length, kind: "neutral" },
           { label: "models " + formState.models.length, kind: "success" },
           { label: "fallback groups " + formState.fallbackGroups.length, kind: "neutral" },
-          { label: "port 修改需重启", kind: "warning" },
+          { label: T.portRestart, kind: "warning" },
         ];
         if (currentSnapshot.lastError) {
-          pills.push({ label: "最近一次加载失败", kind: "error" });
+          pills.push({ label: T.lastLoadFailed, kind: "error" });
         }
         for (const pill of pills) {
           const el = document.createElement("div");
@@ -912,9 +1330,9 @@ const SCRIPT = /* js */ String.raw`
         const handle = document.createElement("span");
         handle.className = "drag-handle";
         handle.textContent = "⋮⋮";
-        handle.title = "拖拽排序";
+        handle.title = T.dragToReorder;
         handle.setAttribute("role", "button");
-        handle.setAttribute("aria-label", "拖拽排序");
+        handle.setAttribute("aria-label", T.dragToReorder);
         handle.draggable = true;
         handle.addEventListener("dragstart", (event) => {
           draggedCard = { kind, id: item._id };
@@ -960,19 +1378,19 @@ const SCRIPT = /* js */ String.raw`
         const field = document.createElement("div");
         field.className = "field span-2";
         const label = document.createElement("label");
-        label.textContent = "高级字段";
+        label.textContent = T.advancedFields;
 
         const wrap = document.createElement("div");
         wrap.className = "advanced-wrap";
 
-        const toggle = createActionButton(model._advancedExpanded ? "收起高级字段" : "展开高级字段", "secondary advanced-toggle", () => {
+        const toggle = createActionButton(model._advancedExpanded ? T.hideAdvanced : T.showAdvanced, "secondary advanced-toggle", () => {
           model._advancedExpanded = !model._advancedExpanded;
           renderAll({ preserveScroll: true, scrollToFocus: false });
         });
         const count = Object.keys(model.extras || {}).length;
         const summary = document.createElement("div");
         summary.className = "helper";
-        summary.textContent = count > 0 ? "当前有 " + count + " 个高级字段，保存时会展开到模型 YAML 中。" : "当前没有高级字段。";
+        summary.textContent = count > 0 ? tr(T.advancedCount, { n: count }) : T.noAdvanced;
 
         const textarea = document.createElement("textarea");
         textarea.className = "advanced-json";
@@ -983,7 +1401,7 @@ const SCRIPT = /* js */ String.raw`
 
         const helper = document.createElement("div");
         helper.className = "helper";
-        helper.textContent = "输入 JSON 对象。保存时会展开到该模型 YAML 中，不能覆盖 name/provider/base_url/api_key/model/proxy 以及 body_expression/response_expression（请使用上方独立输入框）。";
+        helper.textContent = T.advancedHelper;
         helper.hidden = !model._advancedExpanded;
 
         textarea.addEventListener("input", (event) => {
@@ -993,7 +1411,7 @@ const SCRIPT = /* js */ String.raw`
             model.extras = parseAdvancedJson(value, getModelLabel(model, index));
             model._extrasError = "";
             helper.className = "helper";
-            helper.textContent = "输入 JSON 对象。保存时会展开到该模型 YAML 中，不能覆盖 name/provider/base_url/api_key/model/proxy 以及 body_expression/response_expression（请使用上方独立输入框）。";
+            helper.textContent = T.advancedHelper;
           } catch (error) {
             model._extrasError = error instanceof Error ? error.message : String(error);
             helper.className = "helper error";
@@ -1018,7 +1436,7 @@ const SCRIPT = /* js */ String.raw`
           min: "1",
           step: "1",
           value: formState.server.ttfb_timeout,
-          helper: "正整数，单位毫秒。保存后新请求立即生效。",
+          helper: T.timeoutHelper,
           onInput(value) {
             formState.server.ttfb_timeout = value;
             markDirty(true);
@@ -1029,7 +1447,7 @@ const SCRIPT = /* js */ String.raw`
           min: "1",
           step: "1",
           value: formState.record.max_size,
-          helper: "正整数。保存后会在线调整采样记录上限。",
+          helper: T.recordMaxHelper,
           onInput(value) {
             formState.record.max_size = value;
             markDirty(true);
@@ -1042,7 +1460,7 @@ const SCRIPT = /* js */ String.raw`
         if (formState.providers.length === 0) {
           const empty = document.createElement("div");
           empty.className = "note-box";
-          empty.textContent = "还没有自定义供应商，点击“添加供应商”集中配置连接信息。";
+          empty.textContent = T.noProviders;
           providersContainer.appendChild(empty);
           return;
         }
@@ -1068,7 +1486,7 @@ const SCRIPT = /* js */ String.raw`
           const title = document.createElement("div");
           title.className = "card-title";
           const h3 = document.createElement("h3");
-          h3.textContent = (provider.name || "").trim() || "未命名供应商";
+          h3.textContent = (provider.name || "").trim() || T.unnamedProvider;
           title.appendChild(h3);
           toggleTop.appendChild(chevron);
           toggleTop.appendChild(title);
@@ -1077,7 +1495,7 @@ const SCRIPT = /* js */ String.raw`
           summary.className = "card-summary";
           summary.textContent = SUBSCRIPTION_PROVIDERS.includes(provider.provider)
             ? provider.provider
-            : (provider.provider || "未选协议") + " · " + (provider.base_url || "未填 base_url");
+            : (provider.provider || T.noProtocol) + " · " + (provider.base_url || T.noBaseUrl);
           toggle.appendChild(summary);
           head.appendChild(toggle);
 
@@ -1085,40 +1503,40 @@ const SCRIPT = /* js */ String.raw`
           actions.className = "card-actions";
           if (SUBSCRIPTION_PROVIDERS.includes(provider.provider)) {
             const isClaude = provider.provider === "claude-subscription";
-            const markAuthenticated = () => { status.textContent = "已登录"; status.className = "success"; loginButton.textContent = "重新登录"; usageButton.hidden = false; };
+            const markAuthenticated = () => { status.textContent = T.signedIn; status.className = "success"; loginButton.textContent = T.signInAgain; usageButton.hidden = false; };
             const status = document.createElement("span");
             status.className = "meta";
-            status.textContent = "检查登录状态…";
+            status.textContent = T.checkingSignIn;
             actions.appendChild(status);
-            const usageButton = createActionButton("查询用量", "secondary", async () => {
+            const usageButton = createActionButton(T.checkUsage, "secondary", async () => {
               usageButton.disabled = true;
-              usageButton.textContent = "查询中…";
+              usageButton.textContent = T.checking;
               try {
                 const response = await fetch("/admin/providers/" + encodeURIComponent(provider.name) + "/usage", { cache: "no-store" });
                 const text = await response.text();
                 let payload; try { payload = JSON.parse(text); } catch { payload = { error: text.slice(0, 240) }; }
-                if (!response.ok) throw new Error(payload.error || "用量查询失败");
+                if (!response.ok) throw new Error(payload.error || T.usageQueryFailed);
                 if (isClaude) { showClaudeUsageDialog(payload); return; }
                 const dialog = document.createElement("dialog");
                 const panel = document.createElement("div");
                 panel.style.minWidth = "420px";
-                const heading = document.createElement("h3"); heading.textContent = "Codex 订阅用量";
+                const heading = document.createElement("h3"); heading.textContent = T.codexUsage;
                 const plan = document.createElement("p"); plan.className = "meta"; plan.textContent = "Plan: " + (payload.plan_type || "unknown");
                 panel.append(heading, plan);
-                const formatDuration = (seconds) => seconds >= 86400 ? Math.round(seconds / 86400) + " 天" : seconds >= 3600 ? Math.round(seconds / 3600) + " 小时" : Math.round(seconds / 60) + " 分钟";
+                const formatDuration = (seconds) => seconds >= 86400 ? Math.round(seconds / 86400) + " " + T.unitDays : seconds >= 3600 ? Math.round(seconds / 3600) + " " + T.unitHours : Math.round(seconds / 60) + " " + T.unitMinutes;
                 const formatReset = (windowData) => {
                   const timestamp = Number(windowData?.reset_at) * 1000 || Date.now() + Number(windowData?.reset_after_seconds || 0) * 1000;
-                  return timestamp ? new Date(timestamp).toLocaleString() : "未知";
+                  return timestamp ? new Date(timestamp).toLocaleString(T.locale) : T.unknown;
                 };
                 const limits = [{ name: "Codex", value: payload.rate_limit }].concat((payload.additional_rate_limits || []).map((item) => ({ name: item.limit_name || item.metered_feature, value: item.rate_limit })));
                 limits.forEach((limit) => {
                   const title = document.createElement("h4"); title.textContent = limit.name;
                   panel.appendChild(title);
-                  [["短期窗口", limit.value?.primary_window], ["长期窗口", limit.value?.secondary_window]].forEach(([label, value]) => {
+                  [[T.shortWindow, limit.value?.primary_window], [T.longWindow, limit.value?.secondary_window]].forEach(([label, value]) => {
                     if (!value) return;
                     const row = document.createElement("p");
                     const duration = Number(value.limit_window_seconds) > 0 ? " · " + formatDuration(Number(value.limit_window_seconds)) : "";
-                    row.textContent = label + duration + " · 已用 " + (Number.isFinite(Number(value.used_percent)) ? Number(value.used_percent) + "%" : "未知") + " · 重置 " + formatReset(value);
+                    row.textContent = label + duration + " · " + T.used + " " + (Number.isFinite(Number(value.used_percent)) ? Number(value.used_percent) + "%" : T.unknown) + " · " + T.resets + " " + formatReset(value);
                     panel.appendChild(row);
                   });
                 });
@@ -1128,64 +1546,64 @@ const SCRIPT = /* js */ String.raw`
                 const resetCountRow = document.createElement("p");
                 resetCountRow.className = "meta";
                 resetCountRow.textContent = Number.isFinite(resetCount)
-                  ? "5 小时窗口可用重置次数：" + resetCount
-                  : "5 小时窗口可用重置次数：未能查询";
+                  ? T.resetCount + resetCount
+                  : T.resetCountUnavailable;
                 panel.appendChild(resetCountRow);
                 if (resetCount > 0) {
                   const resetButton = document.createElement("button");
                   resetButton.type = "button";
                   resetButton.className = "danger";
-                  resetButton.textContent = "重置当前 5 小时窗口（剩余 " + resetCount + " 次）";
+                  resetButton.textContent = tr(T.resetWindowButton, { n: resetCount });
                   resetButton.addEventListener("click", async () => {
-                    if (!window.confirm("确定要重置当前 5 小时窗口吗？这会消耗 1 次重置次数。")) return;
+                    if (!window.confirm(T.resetWindowConfirm)) return;
                     resetButton.disabled = true;
-                    resetButton.textContent = "重置中…";
+                    resetButton.textContent = T.resetting;
                     try {
                       const resetResponse = await fetch("/admin/providers/" + encodeURIComponent(provider.name) + "/usage/reset", { method: "POST" });
                       const resetText = await resetResponse.text();
                       let resetPayload; try { resetPayload = JSON.parse(resetText); } catch { resetPayload = { error: resetText.slice(0, 240) }; }
-                      if (!resetResponse.ok) throw new Error(resetPayload.error || "窗口重置失败");
+                      if (!resetResponse.ok) throw new Error(resetPayload.error || T.resetFailed);
                       dialog.close();
-                      window.alert("5 小时窗口已请求重置，请重新查询用量确认结果。");
+                      window.alert(T.resetRequested);
                       usageButton.click();
                     } catch (error) {
                       resetButton.disabled = false;
-                      resetButton.textContent = "重置当前 5 小时窗口（剩余 " + resetCount + " 次）";
+                      resetButton.textContent = tr(T.resetWindowButton, { n: resetCount });
                       window.alert(error instanceof Error ? error.message : String(error));
                     }
                   });
                   panel.appendChild(resetButton);
                 }
-                const close = document.createElement("button"); close.type = "button"; close.textContent = "关闭"; close.addEventListener("click", () => dialog.close());
+                const close = document.createElement("button"); close.type = "button"; close.textContent = T.close; close.addEventListener("click", () => dialog.close());
                 panel.appendChild(close); dialog.appendChild(panel); document.body.appendChild(dialog); dialog.addEventListener("close", () => dialog.remove(), { once: true }); dialog.showModal();
               } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
-              finally { usageButton.disabled = false; usageButton.textContent = "查询用量"; }
+              finally { usageButton.disabled = false; usageButton.textContent = T.checkUsage; }
             });
             usageButton.hidden = true;
             fetch("/admin/providers/" + encodeURIComponent(provider.name) + "/device-login/status")
               .then((response) => response.json())
               .then((value) => {
-                status.textContent = value.authenticated ? "已登录" : "未登录";
+                status.textContent = value.authenticated ? T.signedIn : T.notSignedIn;
                 status.className = value.authenticated ? "success" : "meta";
-                loginButton.textContent = value.authenticated ? "重新登录" : "登录";
+                loginButton.textContent = value.authenticated ? T.signInAgain : T.signIn;
                 usageButton.hidden = !value.authenticated;
               })
-              .catch(() => { status.textContent = "状态未知"; });
-            const loginButton = createActionButton("登录", "secondary", async () => {
-              if (saving) { window.alert("正在保存配置，请保存完成后再登录。"); return; }
-              if (dirty) { window.alert("页面有未保存的修改，请先保存配置，再登录。登录将使用已保存的供应商代理。"); return; }
+              .catch(() => { status.textContent = T.statusUnknown; });
+            const loginButton = createActionButton(T.signIn, "secondary", async () => {
+              if (saving) { window.alert(T.savingWaitToSignIn); return; }
+              if (dirty) { window.alert(T.unsavedBeforeSignIn); return; }
               const name = (provider.name || "").trim();
-              if (!name) { window.alert("请先填写供应商名称并保存配置。"); return; }
+              if (!name) { window.alert(T.providerNameAndSave); return; }
               if (isClaude) { await runClaudeLogin(name, markAuthenticated); return; }
               try {
                 const start = await fetch("/admin/providers/" + encodeURIComponent(name) + "/device-login", { method: "POST" });
                 const startText = await start.text();
                 let payload; try { payload = JSON.parse(startText); } catch { payload = { error: startText.slice(0, 240) }; }
-                if (!start.ok) throw new Error(payload.error || "无法发起设备登录");
+                if (!start.ok) throw new Error(payload.error || T.deviceLoginStartFailed);
                 const link = payload.verificationUriComplete || payload.verificationUri;
                 window.open(link, "_blank", "noopener");
                 const dialog = document.createElement("dialog");
-                dialog.innerHTML = "<form method=dialog style='min-width:360px'><h3>OpenAI subscription 登录</h3><p>请在浏览器打开的页面中输入以下验证码：</p><input readonly value='" + String(payload.userCode).replace(/'/g, "&#39;") + "' style='width:100%;font-size:22px;letter-spacing:2px;text-align:center'><p><button value='ok' type='submit'>完成后继续检查</button></p></form>";
+                dialog.innerHTML = "<form method=dialog style='min-width:360px'><h3>" + T.openaiSignInTitle + "</h3><p>" + T.enterCodeInBrowser + "</p><input readonly value='" + String(payload.userCode).replace(/'/g, "&#39;") + "' style='width:100%;font-size:22px;letter-spacing:2px;text-align:center'><p><button value='ok' type='submit'>" + T.continueChecking + "</button></p></form>";
                 document.body.appendChild(dialog); dialog.showModal();
                 await new Promise((resolve) => dialog.addEventListener("close", resolve, { once: true }));
                 dialog.remove();
@@ -1193,11 +1611,11 @@ const SCRIPT = /* js */ String.raw`
                   const poll = await fetch("/admin/providers/" + encodeURIComponent(name) + "/device-login/" + encodeURIComponent(payload.sessionId) + "/poll", { method: "POST" });
                   const pollText = await poll.text();
                   let result; try { result = JSON.parse(pollText); } catch { result = { error: pollText.slice(0, 240) }; }
-                  if (!poll.ok) throw new Error(result.error || "设备登录失败");
-                  if (result.status === "authenticated") { markAuthenticated(); window.alert("OpenAI subscription 登录成功。"); return; }
+                  if (!poll.ok) throw new Error(result.error || T.deviceLoginFailed);
+                  if (result.status === "authenticated") { markAuthenticated(); window.alert(T.openaiSignInSuccess); return; }
                   await new Promise((resolve) => setTimeout(resolve, Math.max(2000, Number(result.retryAfter || payload.interval || 5) * 1000)));
                 }
-                throw new Error("设备登录超时，请重新尝试。");
+                throw new Error(T.deviceLoginTimeout);
               } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
             });
             actions.appendChild(loginButton);
@@ -1206,24 +1624,24 @@ const SCRIPT = /* js */ String.raw`
           const providerModels = getGroupModels((provider.name || "").trim());
           const conflictedCount = providerModels.filter((model) => nameConflicts.has(normalizeModelRef(model.name))).length;
           const modelsLink = createActionButton(
-            (conflictedCount > 0 ? "⚠ " : "") + providerModels.length + " 个模型" + (conflictedCount > 0 ? "（" + conflictedCount + " 个冲突）" : ""),
+            (conflictedCount > 0 ? "⚠ " : "") + tr(T.modelCount, { n: providerModels.length }) + (conflictedCount > 0 ? tr(T.conflictCountSuffix, { n: conflictedCount }) : ""),
             "ghost models-link" + (conflictedCount > 0 ? " conflict" : ""),
             () => locateModelGroup((provider.name || "").trim()),
           );
-          modelsLink.title = providerModels.length > 0 ? "跳转到下方 Models 中该供应商的模型" : "该供应商下还没有模型，可点击“拉取模型”添加";
+          modelsLink.title = providerModels.length > 0 ? T.jumpToProviderModels : T.providerHasNoModels;
           modelsLink.disabled = providerModels.length === 0;
           actions.appendChild(modelsLink);
-          actions.appendChild(createActionButton("拉取模型", "secondary", () => {
-            if (!(provider.name || "").trim()) { window.alert("请先填写供应商名称。"); return; }
+          actions.appendChild(createActionButton(T.fetchModels, "secondary", () => {
+            if (!(provider.name || "").trim()) { window.alert(T.providerNameFirst); return; }
             if (SUBSCRIPTION_PROVIDERS.includes(provider.provider)) {
               // Only this provider's saved entry matters (credentials and proxy come from the server); other unsaved edits do not.
               const saved = (currentSnapshot.effectiveConfig?.providers || []).find((item) => item.name === provider.name && item.provider === provider.provider);
-              if (!saved) { window.alert("该订阅供应商还没有保存，请先保存配置并完成登录。"); return; }
-              if ((saved.proxy || "") !== (provider.proxy || "").trim()) { window.alert("该供应商的代理有未保存的修改，拉取模型使用服务端已保存的代理，请先保存配置。"); return; }
-            } else if (!(provider.base_url || "").trim()) { window.alert("请先填写 base_url。"); return; }
+              if (!saved) { window.alert(T.subscriptionNotSaved); return; }
+              if ((saved.proxy || "") !== (provider.proxy || "").trim()) { window.alert(T.proxyUnsaved); return; }
+            } else if (!(provider.base_url || "").trim()) { window.alert(T.baseUrlFirst); return; }
             openFetchModelsDialog(provider);
           }));
-          actions.appendChild(createActionButton("删除供应商", "danger", () => {
+          actions.appendChild(createActionButton(T.deleteProvider, "danger", () => {
             formState.providers = formState.providers.filter((item) => item._id !== provider._id);
             markDirty(true);
             renderAll();
@@ -1262,16 +1680,16 @@ const SCRIPT = /* js */ String.raw`
           } });
           bindField(grid, "provider", { type: "select", options: PROVIDERS, value: provider.provider || PROVIDERS[0], onInput(value) { provider.provider = value; if (SUBSCRIPTION_PROVIDERS.includes(value)) { provider.base_url = ""; provider.api_key = ""; } markDirty(true); renderAll(); } });
           if (SUBSCRIPTION_PROVIDERS.includes(provider.provider)) {
-            const note = document.createElement("div"); note.className = "helper"; note.textContent = "Base URL 和 API key 由订阅登录自动管理。请先保存供应商及代理配置，再点击登录。"; grid.appendChild(note);
+            const note = document.createElement("div"); note.className = "helper"; note.textContent = T.subscriptionNote; grid.appendChild(note);
           } else {
             bindField(grid, "base_url", { value: provider.base_url, placeholder: "https://example.com/v1", onInput(value) { provider.base_url = value; markDirty(true); } });
-            bindField(grid, "api_key", { value: provider.api_key, placeholder: "支持直接填 key 或环境变量占位符", onInput(value) { provider.api_key = value; markDirty(true); } });
+            bindField(grid, "api_key", { value: provider.api_key, placeholder: T.apiKeyPlaceholderEnv, onInput(value) { provider.api_key = value; markDirty(true); } });
           }
           bindField(grid, "proxy", {
             spanClass: "span-2",
             value: provider.proxy || "",
             placeholder: "http://127.0.0.1:7890",
-            helper: "可选。引用该供应商的模型调用上游时使用的 HTTP proxy；优先级：模型 proxy > 供应商 proxy > HTTPS_PROXY/HTTP_PROXY。订阅（OpenAI / Claude）登录、凭证刷新和用量查询也使用此代理；修改后请先保存配置。",
+            helper: T.providerProxyHelper,
             onInput(value) { provider.proxy = value; markDirty(true); },
           });
           body.appendChild(grid);
@@ -1288,11 +1706,11 @@ const SCRIPT = /* js */ String.raw`
         const dialog = document.createElement("dialog");
         const panel = document.createElement("div");
         panel.style.minWidth = "420px";
-        const heading = document.createElement("h3"); heading.textContent = "Claude 订阅用量";
+        const heading = document.createElement("h3"); heading.textContent = T.claudeUsage;
         const plan = document.createElement("p"); plan.className = "meta";
         plan.textContent = "Plan: " + (payload.subscription_type || "unknown") + (payload.rate_limit_tier ? " · " + payload.rate_limit_tier : "") + (payload.email ? " · " + payload.email : "");
         panel.append(heading, plan);
-        const labels = { five_hour: "5 小时窗口", seven_day: "7 天窗口", seven_day_opus: "7 天窗口 · Opus", seven_day_sonnet: "7 天窗口 · Sonnet", seven_day_oauth_apps: "7 天窗口 · OAuth 应用" };
+        const labels = { five_hour: T.windowFiveHour, seven_day: T.windowSevenDay, seven_day_opus: T.windowSevenDay + " · Opus", seven_day_sonnet: T.windowSevenDay + " · Sonnet", seven_day_oauth_apps: T.windowSevenDay + " · " + T.oauthApps };
         const order = Object.keys(labels);
         const rank = (key) => order.indexOf(key) < 0 ? order.length : order.indexOf(key);
         const entries = Object.entries(payload)
@@ -1302,25 +1720,25 @@ const SCRIPT = /* js */ String.raw`
           const row = document.createElement("p");
           const used = Number(value.utilization);
           const resetAt = value.resets_at ? new Date(value.resets_at) : null;
-          const usedText = value.utilization !== null && Number.isFinite(used) ? Math.round(used * 10) / 10 + "%" : "未知";
-          const resetText = resetAt && !Number.isNaN(resetAt.getTime()) ? resetAt.toLocaleString() : "未知";
-          row.textContent = (labels[key] || key.replace(/_/g, " ")) + " · 已用 " + usedText + " · 重置 " + resetText;
+          const usedText = value.utilization !== null && Number.isFinite(used) ? Math.round(used * 10) / 10 + "%" : T.unknown;
+          const resetText = resetAt && !Number.isNaN(resetAt.getTime()) ? resetAt.toLocaleString(T.locale) : T.unknown;
+          row.textContent = (labels[key] || key.replace(/_/g, " ")) + " · " + T.used + " " + usedText + " · " + T.resets + " " + resetText;
           panel.appendChild(row);
         });
         if (entries.length === 0) {
-          const empty = document.createElement("p"); empty.className = "meta"; empty.textContent = "未返回用量窗口数据。";
+          const empty = document.createElement("p"); empty.className = "meta"; empty.textContent = T.noUsageWindows;
           panel.appendChild(empty);
         }
         const extra = payload.extra_usage;
         if (extra && typeof extra === "object") {
           const row = document.createElement("p"); row.className = "meta";
-          const extraPercent = extra.utilization !== null && Number.isFinite(Number(extra.utilization)) ? "（" + Number(extra.utilization) + "%）" : "";
+          const extraPercent = extra.utilization !== null && Number.isFinite(Number(extra.utilization)) ? tr(T.inParens, { text: Number(extra.utilization) + "%" }) : "";
           row.textContent = extra.is_enabled
-            ? "额外用量：已开启 · 已用 " + (extra.used_credits ?? "未知") + " / " + (extra.monthly_limit ?? "不限") + extraPercent
-            : "额外用量：未开启";
+            ? T.extraUsageOn + (extra.used_credits ?? T.unknown) + " / " + (extra.monthly_limit ?? T.unlimited) + extraPercent
+            : T.extraUsageOff;
           panel.appendChild(row);
         }
-        const close = document.createElement("button"); close.type = "button"; close.textContent = "关闭"; close.addEventListener("click", () => dialog.close());
+        const close = document.createElement("button"); close.type = "button"; close.textContent = T.close; close.addEventListener("click", () => dialog.close());
         panel.appendChild(close); dialog.appendChild(panel); document.body.appendChild(dialog);
         dialog.addEventListener("close", () => dialog.remove(), { once: true });
         dialog.showModal();
@@ -1331,22 +1749,22 @@ const SCRIPT = /* js */ String.raw`
         try {
           const start = await fetch("/admin/providers/" + encodeURIComponent(name) + "/claude-login", { method: "POST" });
           payload = readJsonResponse(await start.text());
-          if (!start.ok) throw new Error(payload.error || "无法发起 Claude 登录");
+          if (!start.ok) throw new Error(payload.error || T.claudeSignInStartFailed);
         } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); return; }
         window.open(payload.authorizeUrl, "_blank", "noopener");
         const dialog = document.createElement("dialog");
         const panel = document.createElement("div");
         panel.style.minWidth = "480px";
         panel.style.maxWidth = "640px";
-        const heading = document.createElement("h3"); heading.textContent = "Claude subscription 登录";
+        const heading = document.createElement("h3"); heading.textContent = T.claudeSignInTitle;
         const steps = document.createElement("p");
-        steps.textContent = "1. 在新打开的页面中登录 Claude 并点击授权。2. 授权后浏览器会跳转到 callback 页面（" + payload.redirectUri + "?code=...），复制地址栏中的完整 URL（或页面上显示的 code#state 授权码）粘贴到下方。";
-        const link = document.createElement("a"); link.href = payload.authorizeUrl; link.target = "_blank"; link.rel = "noopener"; link.textContent = "未自动打开？点此打开授权页面";
+        steps.textContent = tr(T.claudeSignInSteps, { redirectUri: payload.redirectUri });
+        const link = document.createElement("a"); link.href = payload.authorizeUrl; link.target = "_blank"; link.rel = "noopener"; link.textContent = T.openAuthorizePage;
         const input = document.createElement("textarea"); input.rows = 4; input.style.width = "100%"; input.placeholder = payload.redirectUri + "?code=...&state=...";
         const error = document.createElement("p"); error.className = "error"; error.style.color = "#b42318"; error.hidden = true;
         const actions = document.createElement("p");
-        const submit = document.createElement("button"); submit.type = "button"; submit.textContent = "完成登录";
-        const cancel = document.createElement("button"); cancel.type = "button"; cancel.className = "secondary"; cancel.textContent = "取消";
+        const submit = document.createElement("button"); submit.type = "button"; submit.textContent = T.finishSignIn;
+        const cancel = document.createElement("button"); cancel.type = "button"; cancel.className = "secondary"; cancel.textContent = T.cancel;
         actions.append(submit, " ", cancel);
         panel.append(heading, steps, link, input, error, actions);
         dialog.appendChild(panel); document.body.appendChild(dialog);
@@ -1354,8 +1772,8 @@ const SCRIPT = /* js */ String.raw`
         cancel.addEventListener("click", () => dialog.close());
         submit.addEventListener("click", async () => {
           const callback = input.value.trim();
-          if (!callback) { error.textContent = "请粘贴完整的 callback URL。"; error.hidden = false; return; }
-          submit.disabled = true; submit.textContent = "登录中…"; error.hidden = true;
+          if (!callback) { error.textContent = T.pasteCallbackUrl; error.hidden = false; return; }
+          submit.disabled = true; submit.textContent = T.signingIn; error.hidden = true;
           try {
             const response = await fetch("/admin/providers/" + encodeURIComponent(name) + "/claude-login/" + encodeURIComponent(payload.sessionId) + "/complete", {
               method: "POST",
@@ -1363,14 +1781,14 @@ const SCRIPT = /* js */ String.raw`
               body: JSON.stringify({ callback }),
             });
             const result = readJsonResponse(await response.text());
-            if (!response.ok) throw new Error(result.error || "Claude 登录失败");
+            if (!response.ok) throw new Error(result.error || T.claudeSignInFailed);
             dialog.close();
             onAuthenticated();
-            window.alert("Claude subscription 登录成功" + (result.email ? "：" + result.email : "") + (result.subscriptionType ? "（" + result.subscriptionType + "）" : "") + "。");
+            window.alert(tr(T.claudeSignInSuccess, { detail: (result.email ? T.colon + result.email : "") + (result.subscriptionType ? tr(T.inParens, { text: result.subscriptionType }) : "") }));
           } catch (err) {
             error.textContent = err instanceof Error ? err.message : String(err);
             error.hidden = false;
-            submit.disabled = false; submit.textContent = "完成登录";
+            submit.disabled = false; submit.textContent = T.finishSignIn;
           }
         });
         dialog.showModal();
@@ -1396,11 +1814,11 @@ const SCRIPT = /* js */ String.raw`
 
       function buildModelSummary(model) {
         if (model.connection_mode === "custom" && model.custom_provider) {
-          return "custom provider · " + model.custom_provider + " · " + (model.model || "未填上游模型名");
+          return "custom provider · " + model.custom_provider + " · " + (model.model || T.noUpstreamModel);
         }
-        const provider = model.provider || "未选供应商";
-        const upstreamModel = model.model || "未填上游模型名";
-        const baseUrl = model.base_url || "未填 base_url";
+        const provider = model.provider || T.noProviderSelected;
+        const upstreamModel = model.model || T.noUpstreamModel;
+        const baseUrl = model.base_url || T.noBaseUrl;
         return provider + " · " + upstreamModel + " · " + baseUrl;
       }
 
@@ -1429,12 +1847,12 @@ const SCRIPT = /* js */ String.raw`
         body.className = "model-test-body";
 
         const heading = document.createElement("h3");
-        heading.textContent = "测试模型：" + (name || "未命名模型");
+        heading.textContent = T.testModelTitle + (name || T.unnamedModel);
         body.appendChild(heading);
 
         const note = document.createElement("div");
         note.className = "helper";
-        note.textContent = "使用服务端当前已保存的配置发送一次流式请求" + (dirty ? "；页面上还有未保存的修改，不会参与本次测试。" : "。");
+        note.textContent = T.testNote + (dirty ? T.testNoteDirty : T.period);
         body.appendChild(note);
 
         const input = document.createElement("textarea");
@@ -1470,7 +1888,7 @@ const SCRIPT = /* js */ String.raw`
         const sourceWrap = document.createElement("details");
         sourceWrap.hidden = true;
         const sourceSummary = document.createElement("summary");
-        sourceSummary.textContent = "查看源码";
+        sourceSummary.textContent = T.viewSource;
         const source = document.createElement("pre");
         source.className = "model-test-raw";
         sourceWrap.append(sourceSummary, source);
@@ -1479,7 +1897,7 @@ const SCRIPT = /* js */ String.raw`
         const rawWrap = document.createElement("details");
         rawWrap.hidden = true;
         const rawSummary = document.createElement("summary");
-        rawSummary.textContent = "原始响应";
+        rawSummary.textContent = T.rawResponse;
         const raw = document.createElement("pre");
         raw.className = "model-test-raw";
         rawWrap.append(rawSummary, raw);
@@ -1487,12 +1905,12 @@ const SCRIPT = /* js */ String.raw`
 
         const actions = document.createElement("div");
         actions.className = "model-test-actions";
-        const closeButton = createActionButton("关闭", "ghost", () => dialog.close());
-        const sendButton = createActionButton("发送", "", async () => {
-          if (!name) { status.className = "status error"; status.textContent = "请先填写模型名称并保存配置。"; return; }
+        const closeButton = createActionButton(T.close, "ghost", () => dialog.close());
+        const sendButton = createActionButton(T.send, "", async () => {
+          if (!name) { status.className = "status error"; status.textContent = T.modelNameAndSave; return; }
           sendButton.disabled = true;
           status.className = "status warn";
-          status.textContent = "请求中...";
+          status.textContent = T.requesting;
           reply.hidden = true;
           preview.hidden = true;
           preview.replaceChildren();
@@ -1511,25 +1929,25 @@ const SCRIPT = /* js */ String.raw`
             const meta = [
               payload.status ? "HTTP " + payload.status : "",
               typeof payload.durationMs === "number" ? payload.durationMs + "ms" : "",
-              payload.upstreamModel ? "上游模型 " + payload.upstreamModel : "",
+              payload.upstreamModel ? T.upstreamModelLabel + " " + payload.upstreamModel : "",
             ].filter(Boolean).join(" · ");
             status.textContent = "";
             status.className = "status " + (payload.ok ? "success" : "error");
-            status.appendChild(document.createTextNode((payload.ok ? "成功" : "失败：" + (typeof payload.error === "string" ? payload.error : JSON.stringify(payload.error))) + (meta ? " · " + meta : "")));
+            status.appendChild(document.createTextNode((payload.ok ? T.success : T.failedPrefix + (typeof payload.error === "string" ? payload.error : JSON.stringify(payload.error))) + (meta ? " · " + meta : "")));
             if (payload.requestId) {
               status.appendChild(document.createTextNode(" · "));
               const link = document.createElement("a");
               link.href = "/record?requestId=" + encodeURIComponent(payload.requestId);
               link.target = "_blank";
               link.rel = "noopener";
-              link.textContent = "查看记录";
+              link.textContent = T.viewRecord;
               status.appendChild(link);
             }
             if (payload.ok) {
               const markup = getModelTestPreview(payload.reply);
               if (markup !== null) {
                 const frame = document.createElement("iframe");
-                frame.title = "模型回复预览";
+                frame.title = T.replyPreview;
                 // Allow local interactive demos without access to the admin origin or network.
                 frame.setAttribute("sandbox", "allow-scripts");
                 frame.referrerPolicy = "no-referrer";
@@ -1540,7 +1958,7 @@ const SCRIPT = /* js */ String.raw`
                 sourceWrap.hidden = false;
               } else {
                 reply.hidden = false;
-                reply.textContent = payload.reply || "(未解析到文本回复，请查看原始响应)";
+                reply.textContent = payload.reply || T.noTextReply;
               }
             }
             if (payload.raw) {
@@ -1618,7 +2036,7 @@ const SCRIPT = /* js */ String.raw`
       function deleteGroupModels(providerName) {
         const members = getGroupModels(providerName);
         if (members.length === 0) return;
-        if (!window.confirm("确定删除供应商 " + providerName + " 下的全部 " + members.length + " 个模型配置吗？供应商本身会保留，fallback 分组中对应的成员也会被移除。")) return;
+        if (!window.confirm(tr(T.deleteGroupModelsConfirm, { provider: providerName, n: members.length }))) return;
         const removedIds = new Set(members.map((model) => model._id));
         formState.models = formState.models.filter((model) => !removedIds.has(model._id));
         const remainingNames = new Set(formState.models.map((model) => normalizeModelRef(model.name)));
@@ -1633,8 +2051,8 @@ const SCRIPT = /* js */ String.raw`
 
       function describeModelSource(model) {
         const groupKey = getModelGroupKey(model);
-        const upstream = (model.model || "").trim() || "未填上游模型名";
-        return groupKey ? "供应商 " + groupKey + " / " + upstream : "独立模型 " + upstream;
+        const upstream = (model.model || "").trim() || T.noUpstreamModel;
+        return groupKey ? tr(T.providerModelSource, { provider: groupKey, model: upstream }) : tr(T.standaloneModelSource, { model: upstream });
       }
 
       // Public names must be unique across models and fallback groups. Returns name -> [{ label, model }] for clashing names.
@@ -1646,18 +2064,18 @@ const SCRIPT = /* js */ String.raw`
           byName.get(name).push(source);
         };
         formState.models.forEach((model) => add(normalizeModelRef(model.name), { label: describeModelSource(model), model }));
-        formState.fallbackGroups.forEach((group) => add(normalizeModelRef(group.name), { label: "fallback 分组", model: null }));
+        formState.fallbackGroups.forEach((group) => add(normalizeModelRef(group.name), { label: T.fallbackGroupLabel, model: null }));
         return new Map(Array.from(byName.entries()).filter(([, sources]) => sources.length > 1));
       }
 
       function describeOtherSources(sources, self) {
-        return sources.filter((source) => source.model !== self).map((source) => source.label).join("、");
+        return sources.filter((source) => source.model !== self).map((source) => source.label).join(T.listSeparator);
       }
 
       function describeOtherSourcesForGroup(sources) {
         const labels = sources.filter((source) => source.model).map((source) => source.label);
-        if (sources.filter((source) => !source.model).length > 1) labels.push("其他 fallback 分组");
-        return labels.join("、");
+        if (sources.filter((source) => !source.model).length > 1) labels.push(T.otherFallbackGroups);
+        return labels.join(T.listSeparator);
       }
 
       function scrollToElement(selector) {
@@ -1692,7 +2110,7 @@ const SCRIPT = /* js */ String.raw`
         const box = document.createElement("div");
         box.className = "error-box conflict-banner";
         const title = document.createElement("div");
-        title.textContent = "⚠ 发现 " + conflicts.size + " 个名称冲突，保存前需要调整（点击下方条目可定位到对应模型）：";
+        title.textContent = "⚠ " + tr(T.conflictsFound, { n: conflicts.size });
         box.appendChild(title);
         conflicts.forEach((sources, name) => {
           const row = document.createElement("div");
@@ -1723,7 +2141,7 @@ const SCRIPT = /* js */ String.raw`
         body.className = "model-test-body";
 
         const heading = document.createElement("h3");
-        heading.textContent = "拉取模型列表：" + providerName;
+        heading.textContent = T.fetchModelsTitle + providerName;
         body.appendChild(heading);
 
         const note = document.createElement("div");
@@ -1731,10 +2149,10 @@ const SCRIPT = /* js */ String.raw`
         const isSubscription = SUBSCRIPTION_PROVIDERS.includes(provider.provider);
         note.textContent = (isSubscription
           ? (provider.provider === "claude-subscription"
-              ? "使用已保存的 Claude 登录凭证请求 api.anthropic.com/v1/models。"
-              : "使用已保存的 OpenAI 登录凭证请求 Codex 模型目录（chatgpt.com/backend-api/codex/models）。")
-          : "使用当前表单中填写的 base_url / api_key / proxy 请求上游 /models（无需先保存）。") +
-          "已添加过的模型不可重复选择；不同供应商的同名模型请在添加后自行调整名称，或为供应商勾选“加供应商名后缀”。";
+              ? T.fetchViaClaude
+              : T.fetchViaOpenAI)
+          : T.fetchViaForm) +
+          T.fetchNote;
         body.appendChild(note);
 
         const status = document.createElement("div");
@@ -1745,8 +2163,8 @@ const SCRIPT = /* js */ String.raw`
         toolbar.className = "fetch-model-toolbar";
         const filter = document.createElement("input");
         filter.type = "search";
-        filter.placeholder = "过滤模型 ID";
-        const selectAllButton = createActionButton("全选", "secondary", () => {
+        filter.placeholder = T.filterModelIds;
+        const selectAllButton = createActionButton(T.selectAll, "secondary", () => {
           const targets = selectableVisibleIds();
           const allSelected = targets.length > 0 && targets.every((id) => selected.has(id));
           targets.forEach((id) => (allSelected ? selected.delete(id) : selected.add(id)));
@@ -1761,9 +2179,9 @@ const SCRIPT = /* js */ String.raw`
 
         const actions = document.createElement("div");
         actions.className = "model-test-actions";
-        const closeButton = createActionButton("关闭", "ghost", () => dialog.close());
-        const reloadButton = createActionButton("重新拉取", "secondary", () => load());
-        const addButton = createActionButton("添加模型", "", () => {
+        const closeButton = createActionButton(T.close, "ghost", () => dialog.close());
+        const reloadButton = createActionButton(T.refetch, "secondary", () => load());
+        const addButton = createActionButton(T.addModels, "", () => {
           const addedModels = getAddedModelIds();
           const ids = allIds.filter((id) => selected.has(id) && !addedModels.has(id));
           if (ids.length === 0) return;
@@ -1798,8 +2216,8 @@ const SCRIPT = /* js */ String.raw`
           renderAll({ preserveScroll: true, scrollToFocus: false });
           setStatus(
             conflicts.length > 0 ? "warn" : "success",
-            "已添加 " + ids.length + " 个模型，保存后生效。" +
-              (conflicts.length > 0 ? "其中 " + conflicts.length + " 个与已有模型重名（" + conflicts.slice(0, 5).join(", ") + (conflicts.length > 5 ? " …" : "") + "），保存前请调整名称。" : ""),
+            tr(T.modelsAdded, { n: ids.length }) +
+              (conflicts.length > 0 ? tr(T.modelsAddedConflicts, { n: conflicts.length, names: conflicts.slice(0, 5).join(", ") + (conflicts.length > 5 ? " …" : "") }) : ""),
           );
         });
         actions.append(closeButton, reloadButton, addButton);
@@ -1829,7 +2247,7 @@ const SCRIPT = /* js */ String.raw`
           if (ids.length === 0) {
             const empty = document.createElement("div");
             empty.className = "helper";
-            empty.textContent = allIds.length === 0 ? "暂无模型。" : "没有匹配的模型。";
+            empty.textContent = allIds.length === 0 ? T.noModelsYet : T.noMatchingModels;
             list.appendChild(empty);
           }
           ids.forEach((id) => {
@@ -1845,23 +2263,23 @@ const SCRIPT = /* js */ String.raw`
               renderList();
             });
             const text = document.createElement("span");
-            text.textContent = id + (isAdded ? "（已添加）" : "");
+            text.textContent = id + (isAdded ? T.addedSuffix : "");
             row.append(checkbox, text);
             list.appendChild(row);
           });
           const targets = selectableVisibleIds();
           const allSelected = targets.length > 0 && targets.every((id) => selected.has(id));
-          selectAllButton.textContent = allSelected ? "取消全选" : "全选";
+          selectAllButton.textContent = allSelected ? T.deselectAll : T.selectAll;
           selectAllButton.disabled = targets.length === 0;
           const count = allIds.filter((id) => selected.has(id) && !addedModels.has(id)).length;
-          addButton.textContent = "添加模型（" + count + "）";
+          addButton.textContent = tr(T.addModelsCount, { n: count });
           addButton.disabled = count === 0;
         }
 
         async function load() {
           reloadButton.disabled = true;
           status.className = "status warn";
-          status.textContent = "拉取中...";
+          status.textContent = T.fetching;
           try {
             const response = isSubscription
               ? await fetch("/admin/providers/" + encodeURIComponent(providerName) + "/models", { cache: "no-store" })
@@ -1871,11 +2289,11 @@ const SCRIPT = /* js */ String.raw`
                   body: JSON.stringify({ provider: provider.provider, base_url: provider.base_url, api_key: provider.api_key, proxy: provider.proxy || "" }),
                 });
             const payload = readJsonResponse(await response.text());
-            if (!response.ok || !payload.ok) throw new Error(typeof payload.error === "string" ? payload.error : "拉取模型列表失败");
+            if (!response.ok || !payload.ok) throw new Error(typeof payload.error === "string" ? payload.error : T.fetchModelsFailed);
             allIds = Array.isArray(payload.models) ? payload.models : [];
             selected.clear();
             status.className = "status success";
-            status.textContent = "共获取 " + allIds.length + " 个模型。";
+            status.textContent = tr(T.fetchedCount, { n: allIds.length });
           } catch (error) {
             allIds = [];
             status.className = "status error";
@@ -1925,19 +2343,19 @@ const SCRIPT = /* js */ String.raw`
         title.appendChild(h3);
         const kindBadge = document.createElement("div");
         kindBadge.className = "pill kind";
-        kindBadge.textContent = "供应商";
+        kindBadge.textContent = T.providerBadge;
         title.appendChild(kindBadge);
         const countBadge = document.createElement("div");
         countBadge.className = "pill neutral";
-        countBadge.textContent = members.length + " 个模型";
+        countBadge.textContent = tr(T.modelCount, { n: members.length });
         title.appendChild(countBadge);
         const conflictedMembers = members.filter((model) => duplicateNames.has(normalizeModelRef(model.name)));
         if (conflictedMembers.length > 0) {
           card.classList.add("conflict");
           const badge = document.createElement("div");
           badge.className = "pill conflict";
-          badge.textContent = "⚠ " + conflictedMembers.length + " 个模型名冲突";
-          badge.title = "冲突的模型：" + conflictedMembers.map((model) => normalizeModelRef(model.name)).join("、") + "。展开后可看到具体标记。";
+          badge.textContent = "⚠ " + tr(T.modelNameConflicts, { n: conflictedMembers.length });
+          badge.title = T.conflictedModels + conflictedMembers.map((model) => normalizeModelRef(model.name)).join(T.listSeparator) + T.expandToSeeMarks;
           title.appendChild(badge);
         }
         toggleTop.append(chevron, title);
@@ -1945,8 +2363,8 @@ const SCRIPT = /* js */ String.raw`
         const summary = document.createElement("div");
         summary.className = "card-summary";
         summary.textContent = provider
-          ? (SUBSCRIPTION_PROVIDERS.includes(provider.provider) ? provider.provider : (provider.provider || "未选协议") + " · " + (provider.base_url || "未填 base_url"))
-          : "未找到该供应商，请检查供应商配置";
+          ? (SUBSCRIPTION_PROVIDERS.includes(provider.provider) ? provider.provider : (provider.provider || T.noProtocol) + " · " + (provider.base_url || T.noBaseUrl))
+          : T.providerNotFound;
         toggle.appendChild(summary);
         head.appendChild(toggle);
 
@@ -1954,15 +2372,15 @@ const SCRIPT = /* js */ String.raw`
         actions.className = "card-actions";
         const suffixLabel = document.createElement("label");
         suffixLabel.className = "suffix-toggle";
-        suffixLabel.title = "勾选后，该供应商下所有模型的名称变为“模型ID-供应商名”，取消勾选则恢复为模型ID。";
+        suffixLabel.title = T.suffixTitle;
         const suffixCheckbox = document.createElement("input");
         suffixCheckbox.type = "checkbox";
         suffixCheckbox.checked = isGroupSuffixed(providerName);
         suffixCheckbox.addEventListener("change", () => setGroupSuffix(providerName, suffixCheckbox.checked));
-        suffixLabel.append(suffixCheckbox, document.createTextNode("加供应商名后缀"));
-        if (provider) actions.appendChild(createActionButton("编辑供应商", "ghost", () => locateProvider(provider)));
+        suffixLabel.append(suffixCheckbox, document.createTextNode(T.addProviderSuffix));
+        if (provider) actions.appendChild(createActionButton(T.editProvider, "ghost", () => locateProvider(provider)));
         actions.appendChild(suffixLabel);
-        actions.appendChild(createActionButton("删除全部模型", "danger", () => deleteGroupModels(providerName)));
+        actions.appendChild(createActionButton(T.deleteAllModels, "danger", () => deleteGroupModels(providerName)));
         head.appendChild(actions);
         card.appendChild(head);
 
@@ -1981,7 +2399,7 @@ const SCRIPT = /* js */ String.raw`
         if (formState.models.length === 0) {
           const empty = document.createElement("div");
           empty.className = "note-box";
-          empty.textContent = "还没有模型，点击“添加模型”开始配置。";
+          empty.textContent = T.noModels;
           modelsContainer.appendChild(empty);
           return;
         }
@@ -2003,15 +2421,15 @@ const SCRIPT = /* js */ String.raw`
           modelsContainer.appendChild(heading);
         };
         const showHeadings = groupKeys.length > 0 && standalone.length > 0;
-        if (showHeadings) addHeading("供应商模型（" + groupKeys.length + "）");
+        if (showHeadings) addHeading(tr(T.providerModelsHeading, { n: groupKeys.length }));
         groupKeys.forEach((groupKey) => modelsContainer.appendChild(buildModelGroupCard(groupKey, duplicateNames)));
-        if (showHeadings) addHeading("独立配置的模型（" + standalone.length + "）");
+        if (showHeadings) addHeading(tr(T.standaloneModelsHeading, { n: standalone.length }));
         standalone.forEach(({ model, index }) => modelsContainer.appendChild(buildModelCard(model, index, duplicateNames)));
       }
 
       function buildModelCard(model, index, duplicateNames) {
           const nameSources = duplicateNames.get(normalizeModelRef(model.name));
-          const nameConflict = nameSources ? "与 " + describeOtherSources(nameSources, model) + " 重名，请修改名称" : "";
+          const nameConflict = nameSources ? tr(T.nameClash, { others: describeOtherSources(nameSources, model) }) : "";
           const card = document.createElement("section");
           card.className = "card" + (model._expanded ? "" : " compact") + (nameConflict ? " conflict" : "");
 
@@ -2035,19 +2453,19 @@ const SCRIPT = /* js */ String.raw`
           const title = document.createElement("div");
           title.className = "card-title";
           const h3 = document.createElement("h3");
-          h3.textContent = model.name?.trim() || "未命名模型 " + (index + 1);
+          h3.textContent = model.name?.trim() || tr(T.unnamedModelN, { n: index + 1 });
           title.appendChild(h3);
           if (nameConflict) {
             const badge = document.createElement("div");
             badge.className = "pill conflict";
-            badge.textContent = "⚠ 名称冲突";
+            badge.textContent = "⚠ " + T.nameConflict;
             badge.title = nameConflict;
             title.appendChild(badge);
           }
           if (model.extras && Object.keys(model.extras).length > 0) {
             const badge = document.createElement("div");
             badge.className = "pill neutral";
-            badge.textContent = "保留高级字段";
+            badge.textContent = T.keepsAdvanced;
             badge.title = formatExtrasDetail(model.extras);
             title.appendChild(badge);
           }
@@ -2070,17 +2488,17 @@ const SCRIPT = /* js */ String.raw`
           const actions = document.createElement("div");
           actions.className = "card-actions";
           if (getEffectiveModelProvider(model) !== "openai-image") {
-            const testButton = createActionButton("测试", "secondary", () => openModelTestDialog(model));
+            const testButton = createActionButton(T.test, "secondary", () => openModelTestDialog(model));
             if (!isModelSaved(model)) {
               // Testing uses the server-side saved config, so an unsaved model would always fail.
               testButton.disabled = true;
               testButton.setAttribute("data-blocked", "1");
-              testButton.title = "模型尚未保存，请先点击“保存并应用”后再测试";
+              testButton.title = T.saveBeforeTest;
             }
             actions.appendChild(testButton);
           }
           actions.appendChild(
-            createActionButton("复刻", "secondary", () => {
+            createActionButton(T.duplicate, "secondary", () => {
               const id = nextId("model");
               const duplicate = clone(model);
               duplicate._id = id;
@@ -2092,7 +2510,7 @@ const SCRIPT = /* js */ String.raw`
             }),
           );
           actions.appendChild(
-            createActionButton("删除模型", "danger", () => {
+            createActionButton(T.deleteModel, "danger", () => {
               const deletedName = normalizeModelRef(model.name);
               formState.models = formState.models.filter((item) => item._id !== model._id);
               formState.fallbackGroups.forEach((group) => {
@@ -2153,11 +2571,11 @@ const SCRIPT = /* js */ String.raw`
             },
           });
           if (model.connection_mode === "custom") {
-            bindField(grid, "custom_provider（引用上方供应商连接配置）", {
+            bindField(grid, T.customProviderLabel, {
               type: "select",
               options: formState.providers.map((provider) => provider.name),
               value: model.custom_provider || "",
-              helper: formState.providers.length > 0 ? "" : "请先添加供应商。",
+              helper: formState.providers.length > 0 ? "" : T.addProviderFirst,
               onInput(value) {
                 model.custom_provider = value;
                 if (value) expandedModelGroups.add(value);
@@ -2178,7 +2596,7 @@ const SCRIPT = /* js */ String.raw`
           }
           bindField(grid, "model", {
             value: model.model,
-            placeholder: "上游真实模型名",
+            placeholder: T.upstreamModelPlaceholder,
             onInput(value) {
               model.model = value;
               markDirty(true);
@@ -2188,7 +2606,7 @@ const SCRIPT = /* js */ String.raw`
             bindField(grid, "api_key", {
               spanClass: "span-2",
               value: model.api_key,
-              placeholder: "支持直接填 key 或 \${ENV_VAR}",
+              placeholder: T.apiKeyPlaceholder,
               onInput(value) {
                 model.api_key = value;
                 markDirty(true);
@@ -2199,7 +2617,7 @@ const SCRIPT = /* js */ String.raw`
             spanClass: "span-2",
             value: model.proxy || "",
             placeholder: "http://127.0.0.1:7890",
-            helper: "可选。该模型调用上游时使用的 HTTP proxy，优先级最高；留空则依次回退到供应商 proxy、HTTPS_PROXY/HTTP_PROXY。",
+            helper: T.modelProxyHelper,
             onInput(value) {
               model.proxy = value;
               markDirty(true);
@@ -2207,11 +2625,11 @@ const SCRIPT = /* js */ String.raw`
           });
           bindExpressionField(grid, model, "body_expression", {
             placeholder: "({\n  ...body,\n  temperature: 0.2,\n})",
-            helper: "可选。JS 表达式，变量 body 为最终上游请求体，需同步返回新的 body；留空表示不改写。",
+            helper: T.bodyExpressionHelper,
           });
           bindExpressionField(grid, model, "response_expression", {
             placeholder: "(() => {\n  if (response.model !== 'expected') throw new Error('unexpected model');\n  return response;\n})()",
-            helper: "可选。JS 表达式，变量 response 为上游 JSON/SSE 响应、headers 为只读的上游响应头，需返回新的 response；留空表示不改写。",
+            helper: T.responseExpressionHelper,
           });
           bindAdvancedJsonField(grid, model, index);
           body.appendChild(grid);
@@ -2226,7 +2644,7 @@ const SCRIPT = /* js */ String.raw`
         if (formState.fallbackGroups.length === 0) {
           const empty = document.createElement("div");
           empty.className = "note-box";
-          empty.textContent = "还没有 fallback 分组，点击“添加分组”后可以为分组选择模型列表。";
+          empty.textContent = T.noFallbackGroups;
           fallbackContainer.appendChild(empty);
           return;
         }
@@ -2256,20 +2674,20 @@ const SCRIPT = /* js */ String.raw`
           const title = document.createElement("div");
           title.className = "card-title";
           const h3 = document.createElement("h3");
-          h3.textContent = group.name?.trim() || "未命名分组 " + (index + 1);
+          h3.textContent = group.name?.trim() || tr(T.unnamedGroupN, { n: index + 1 });
           title.appendChild(h3);
           toggleTop.appendChild(chevron);
           toggleTop.appendChild(title);
           toggle.appendChild(toggleTop);
           const summary = document.createElement("div");
           summary.className = "card-summary";
-          summary.textContent = group.members.length + " models";
+          summary.textContent = tr(T.modelCount, { n: group.members.length });
           toggle.appendChild(summary);
           head.appendChild(toggle);
           const headActions = document.createElement("div");
           headActions.className = "card-actions";
           headActions.appendChild(
-            createActionButton("删除分组", "danger", () => {
+            createActionButton(T.deleteGroup, "danger", () => {
               formState.fallbackGroups = formState.fallbackGroups.filter((item) => item._id !== group._id);
               markDirty(true);
               renderAll();
@@ -2290,10 +2708,10 @@ const SCRIPT = /* js */ String.raw`
             spanClass: "span-3",
             value: group.name,
             invalid: Boolean(groupNameSources),
-            helper: groupNameSources ? "⚠ 与 " + describeOtherSourcesForGroup(groupNameSources) + " 重名，请修改分组名" : "",
+            helper: groupNameSources ? "⚠ " + tr(T.groupNameClash, { others: describeOtherSourcesForGroup(groupNameSources) }) : "",
             helperError: true,
             attributes: { "data-focus-id": "fallback-name-" + group._id },
-            placeholder: "例如 gpt-5.4",
+            placeholder: T.groupNamePlaceholder,
             onInput(value) {
               group.name = value;
               markDirty(true);
@@ -2308,13 +2726,13 @@ const SCRIPT = /* js */ String.raw`
           if (duplicateMembers.length > 0) {
             const helper = document.createElement("div");
             helper.className = "error-box";
-            helper.textContent = "当前分组存在重复模型名：" + duplicateMembers.join(", ") + "。保存时会被拦截。";
+            helper.textContent = tr(T.duplicateMembers, { names: duplicateMembers.join(", ") });
             membersWrap.appendChild(helper);
           }
           if (group.members.length === 0) {
             const helper = document.createElement("div");
             helper.className = "helper";
-            helper.textContent = "当前分组还没有成员。";
+            helper.textContent = T.noMembers;
             membersWrap.appendChild(helper);
           }
 
@@ -2358,14 +2776,14 @@ const SCRIPT = /* js */ String.raw`
             });
 
             const handle = createActionButton("⋮⋮", "ghost drag-handle", () => {});
-            handle.title = "拖拽排序";
-            handle.setAttribute("aria-label", "拖拽排序");
+            handle.title = T.dragToReorder;
+            handle.setAttribute("aria-label", T.dragToReorder);
             row.appendChild(handle);
 
             const select = document.createElement("select");
             const blank = document.createElement("option");
             blank.value = "";
-            blank.textContent = options.length === 0 ? "请先添加模型" : "选择模型";
+            blank.textContent = options.length === 0 ? T.addModelsFirst : T.chooseModel;
             select.appendChild(blank);
             const selectedElsewhere = new Set(
               group.members
@@ -2392,7 +2810,7 @@ const SCRIPT = /* js */ String.raw`
             const actions = document.createElement("div");
             actions.className = "member-actions";
             actions.appendChild(
-              createActionButton("上移", "ghost", () => {
+              createActionButton(T.moveUp, "ghost", () => {
                 if (memberIndex === 0) return;
                 moveArrayItem(group.members, memberIndex, memberIndex - 1);
                 markDirty(true);
@@ -2401,7 +2819,7 @@ const SCRIPT = /* js */ String.raw`
               }),
             );
             actions.appendChild(
-              createActionButton("下移", "ghost", () => {
+              createActionButton(T.moveDown, "ghost", () => {
                 if (memberIndex === group.members.length - 1) return;
                 moveArrayItem(group.members, memberIndex, memberIndex + 1);
                 markDirty(true);
@@ -2409,7 +2827,7 @@ const SCRIPT = /* js */ String.raw`
                 renderAll();
               }),
             );
-            actions.appendChild(createActionButton("删除", "ghost", () => {
+            actions.appendChild(createActionButton(T.remove, "ghost", () => {
               group.members = group.members.filter((item) => item._id !== member._id);
               markDirty(true);
               renderAll();
@@ -2423,7 +2841,7 @@ const SCRIPT = /* js */ String.raw`
           body.appendChild(membersWrap);
 
           body.appendChild(
-            createActionButton("添加模型到分组", "secondary", () => {
+            createActionButton(T.addModelToGroup, "secondary", () => {
               const memberId = nextId("member");
               const used = new Set(group.members.map((item) => item.value).filter(Boolean));
               const nextValue = options.find((option) => !used.has(option)) || "";
@@ -2458,7 +2876,7 @@ const SCRIPT = /* js */ String.raw`
         const response = await fetch("/admin/config/data", { cache: "no-store" });
         const payload = await response.json();
         if (!response.ok) {
-          throw new Error(payload.error || "刷新配置失败");
+          throw new Error(payload.error || T.refreshConfigFailed);
         }
         currentSnapshot = payload;
         formState = hydrateForm(payload.form);
@@ -2481,19 +2899,19 @@ const SCRIPT = /* js */ String.raw`
       function syncAfterHistoryRestore(event) {
         if (saving || dirty || !isHistoryRestore(event)) return;
         refreshFromServer().catch((error) => {
-          setStatus("error", error instanceof Error ? error.message : "刷新失败");
+          setStatus("error", error instanceof Error ? error.message : T.refreshFailed);
         });
       }
 
       async function saveConfig() {
         setSaving(true);
-        setStatus("warn", "正在保存并应用配置...");
+        setStatus("warn", T.saving);
         try {
           let config;
           try {
             config = dehydrateForm();
           } catch (error) {
-            setStatus("error", error instanceof Error ? error.message : "高级字段 JSON 校验失败");
+            setStatus("error", error instanceof Error ? error.message : T.advancedJsonInvalid);
             renderAll({ preserveScroll: true, scrollToFocus: false });
             return;
           }
@@ -2515,10 +2933,10 @@ const SCRIPT = /* js */ String.raw`
               renderAll();
             }
             if (response.status === 409) {
-              setStatus("error", "保存失败：配置已被外部更新，请先刷新页面上的内容。");
+              setStatus("error", T.saveConflict);
               return;
             }
-            setStatus("error", payload.error || "保存失败");
+            setStatus("error", payload.error || T.saveFailed);
             return;
           }
 
@@ -2527,12 +2945,12 @@ const SCRIPT = /* js */ String.raw`
           markDirty(false);
           renderAll();
           if (payload.requiresRestartFields.length > 0) {
-            setStatus("warn", "保存成功。除 port 外的配置已立即生效；port 变更需要重启服务。");
+            setStatus("warn", T.savedNeedsRestart);
           } else {
-            setStatus("success", "保存成功，配置已立即生效。");
+            setStatus("success", T.saved);
           }
         } catch (error) {
-          setStatus("error", error instanceof Error ? error.message : "保存失败");
+          setStatus("error", error instanceof Error ? error.message : T.saveFailed);
         } finally {
           setSaving(false);
         }
@@ -2596,21 +3014,21 @@ const SCRIPT = /* js */ String.raw`
       saveButton.addEventListener("click", () => {
         saveConfig().catch((error) => {
           setSaving(false);
-          setStatus("error", error instanceof Error ? error.message : "保存失败");
+          setStatus("error", error instanceof Error ? error.message : T.saveFailed);
         });
       });
 
       refreshButton.addEventListener("click", () => {
         refreshFromServer()
-          .then(() => setStatus("success", "已从服务端刷新到最新配置。"))
-          .catch((error) => setStatus("error", error instanceof Error ? error.message : "刷新失败"));
+          .then(() => setStatus("success", T.refreshed))
+          .catch((error) => setStatus("error", error instanceof Error ? error.message : T.refreshFailed));
       });
 
       resetButton.addEventListener("click", () => {
         formState = hydrateForm(currentSnapshot.form);
         markDirty(false);
         renderAll();
-        setStatus("", "已恢复到当前服务端配置。");
+        setStatus("", T.reverted);
       });
 
       window.addEventListener("pageshow", (event) => {
@@ -2620,9 +3038,10 @@ const SCRIPT = /* js */ String.raw`
       renderAll();
 `;
 
-function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
+function AdminConfigPage({ payload, lang }: { payload: Record<string, unknown>; lang: Lang }) {
+  const m = MESSAGES[lang];
   return (
-    <html lang="zh-CN">
+    <html lang={htmlLang(lang)}>
       <head>
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -2637,34 +3056,34 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
               <div class="section-header">
                 <div>
                   <h1>Config Admin</h1>
-                  <p class="meta">通过表单编辑服务配置、模型和 fallback 分组。保存后会自动校验并写回 <code>config.yaml</code>。</p>
+                  <p class="meta">{m.introBefore}<code>config.yaml</code>{m.introAfter}</p>
                 </div>
                 <div class="toolbar">
-                  <button id="save-button" type="button">保存并应用</button>
-                  <button id="refresh-button" class="secondary" type="button">从服务端刷新</button>
-                  <button id="reset-button" class="ghost" type="button">撤销未保存修改</button>
+                  <button id="save-button" type="button">{m.saveAndApply}</button>
+                  <button id="refresh-button" class="secondary" type="button">{m.refreshFromServer}</button>
+                  <button id="reset-button" class="ghost" type="button">{m.discardChanges}</button>
                 </div>
               </div>
               <div class="status-row">
                 <div class="pills" id="summary-pills"></div>
                 <div class="status" id="save-status"></div>
                 <div class="note-box" id="snapshot-meta"></div>
-                <div class="note-box">当前页面只展开常用字段。已有模型上的未展开高级字段会在保存时自动保留；API Key 输入框也支持 {"${ENV_VAR}"} 这种占位写法；当前运行端口只展示、不提供页面编辑。</div>
+                <div class="note-box">{m.noteBox}</div>
                 <div class="error-box" id="error-box" hidden>
                   <div id="error-text"></div>
                 </div>
                 <div class="quick-links">
                   <a class="quick-link" href="/status">
                     <div class="quick-link-title">/status</div>
-                    <div class="quick-link-desc">查看当前各个模型调用状况。</div>
+                    <div class="quick-link-desc">{m.statusDesc}</div>
                   </a>
                   <a class="quick-link" href="/record">
                     <div class="quick-link-title">/record</div>
-                    <div class="quick-link-desc">查看采样记录。</div>
+                    <div class="quick-link-desc">{m.recordDesc}</div>
                   </a>
                   <a class="quick-link" href="/jobs">
                     <div class="quick-link-title">/jobs</div>
-                    <div class="quick-link-desc">设置 cron、定时测试模型并对比历史作品。</div>
+                    <div class="quick-link-desc">{m.jobsDesc}</div>
                   </a>
                 </div>
               </div>
@@ -2679,9 +3098,9 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
               <div class="section-header">
                 <div>
                   <h2>Providers</h2>
-                  <p class="meta">集中配置可供多个模型引用的协议、上游地址和 API Key；供应商名称必须唯一。</p>
+                  <p class="meta">{m.providersIntro}</p>
                 </div>
-                <button id="add-provider-button" class="secondary" type="button">添加供应商</button>
+                <button id="add-provider-button" class="secondary" type="button">{m.addProvider}</button>
               </div>
               <div class="card-list" id="providers-container"></div>
             </section>
@@ -2690,9 +3109,9 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
               <div class="section-header">
                 <div>
                   <h2>Models</h2>
-                  <p class="meta">模型可以直接配置连接信息，也可以通过 custom_provider 引用上方供应商。</p>
+                  <p class="meta">{m.modelsIntro}</p>
                 </div>
-                <button id="add-model-button" class="secondary" type="button">添加模型</button>
+                <button id="add-model-button" class="secondary" type="button">{m.addModel}</button>
               </div>
               <div class="card-list" id="models-container"></div>
             </section>
@@ -2701,9 +3120,9 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
               <div class="section-header">
                 <div>
                   <h2>Fallback</h2>
-                  <p class="meta">为分组命名后，从上面已经配置过的模型里选择成员。</p>
+                  <p class="meta">{m.fallbackIntro}</p>
                 </div>
-                <button id="add-fallback-button" class="secondary" type="button">添加分组</button>
+                <button id="add-fallback-button" class="secondary" type="button">{m.addGroup}</button>
               </div>
               <div class="card-list" id="fallback-container"></div>
             </section>
@@ -2711,7 +3130,9 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
         </main>
         <script
           dangerouslySetInnerHTML={{
-            __html: SCRIPT.replace("__INITIAL_PAYLOAD__", serializeForScript(payload)),
+            __html: SCRIPT
+              .replace("__INITIAL_PAYLOAD__", serializeForScript(payload))
+              .replace("__MESSAGES__", serializeForScript(m)),
           }}
         />
       </body>
@@ -2719,6 +3140,6 @@ function AdminConfigPage({ payload }: { payload: Record<string, unknown> }) {
   );
 }
 
-export function renderAdminConfigPage(payload: Record<string, unknown>): string {
-  return "<!doctype html>" + renderToString(<AdminConfigPage payload={payload} />);
+export function renderAdminConfigPage(payload: Record<string, unknown>, lang: Lang = "zh"): string {
+  return withPageCorner("<!doctype html>" + renderToString(<AdminConfigPage payload={payload} lang={lang} />), lang, { scrolls: true });
 }

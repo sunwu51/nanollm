@@ -14,7 +14,8 @@ import { createClient } from "@libsql/client";
 import { Hono } from "hono";
 import { stringify } from "yaml";
 import type { ModelConfig } from "../src/core/config.js";
-import { JobConfigStore, nextJobDates, validateJob, type JobRun, type Job } from "../src/jobs/jobs.js";
+import { JobConfigStore, nextJobDates, RUN_MESSAGES, validateJob, type JobRun, type Job } from "../src/jobs/jobs.js";
+import { runWithLang } from "../src/core/i18n.js";
 import { MemoryJobRunStore, SqliteJobRunStore, type JobRunStore } from "../src/jobs/job-run-store.js";
 import { JobScheduler } from "../src/jobs/job-scheduler.js";
 import { createModelRequestExecutor, JobExecutionError, type JobExecutor } from "../src/jobs/job-executor.js";
@@ -383,13 +384,47 @@ test("job form hides filtered models and aligns the schedule checkbox with the o
   // `.model-picker label{display:flex}` would otherwise override the hidden attribute and break search.
   assert.ok(html.includes("[hidden]{display:none!important}"));
   assert.ok(html.includes("label.hidden=!label.textContent.toLowerCase().includes(search.value.toLowerCase())"));
-  assert.ok(html.includes("enabledField.append(node('label','定时调度'),enabledLabel)"));
+  assert.ok(html.includes("enabledField.append(node('label',T.scheduling),enabledLabel)"));
   assert.ok(html.includes(".check-row{display:flex;align-items:center;gap:8px;min-height:44px}"));
   assert.doesNotMatch(html, /刷新模型目录|订阅模型目录|model-options\?refresh/);
 });
 test("jobs page uses aligned URL and only user message editor", () => {
   const html=renderJobsPage();assert.match(html,/\/jobs\/api\//);
   assert.doesNotMatch(html,/请求协议|请求体 JSON|request-format|JSON.parse\(body.value\)/);
+});
+
+test("job errors follow the web UI request language and keep their field prefix", () => {
+  const invalid = { id: "ok-id", name: "", enabled: true, type: "model_request", schedule: { cron: "0 * * * *", timezone: "UTC" }, models: ["a"], request: { message: "hi" } };
+  assert.throws(() => runWithLang("en", () => validateJob(invalid)), { message: "name: the name must be 1–100 characters" });
+  assert.throws(() => runWithLang("en", () => validateJob({ ...invalid, name: "x", execution: { max_attempts: 9 } })), { message: "execution.max_attempts: must be an integer from 1 to 5" });
+  assert.throws(() => runWithLang("zh", () => validateJob(invalid)), { message: "name: 名称应为 1–100 个字符" });
+  // Outside a request (startup, scheduled runs) messages stay Chinese.
+  assert.throws(() => validateJob({ ...invalid, name: "x", models: [] }), { message: "models: 请选择 1–20 个具体模型" });
+});
+
+test("jobs page renders in English and translates stored run errors", () => {
+  const zhHtml = renderJobsPage("zh");
+  const enHtml = renderJobsPage("en");
+  const outsideSwitch = (html: string) => html.replace(/<div class="lang-switch"[\s\S]*?<\/div>/, "").match(/[一-鿿]+/g) ?? [];
+  // The only Chinese left is the stored run errors, which are the keys of the translation map.
+  const storedRunErrors = Object.values(RUN_MESSAGES).map(message => message.zh).join("\n");
+  for (const text of outsideSwitch(enHtml)) assert.ok(storedRunErrors.includes(text), text);
+  assert.match(enHtml, /<html lang="en">/);
+  assert.match(enHtml, /<div class="page-corner"><a class="back-admin" href="\/admin">← Admin<\/a><div class="lang-switch"/);
+  const script = enHtml.match(/<script>([\s\S]*)<\/script>/)![1];
+  assert.doesNotThrow(() => new Function(script));
+
+  const messagesOf = (html: string) => JSON.parse(/const T=(\{.*?\});\r?\n/.exec(html)![1]);
+  const zh = messagesOf(zhHtml), en = messagesOf(enHtml);
+  assert.deepEqual(Object.keys(en), Object.keys(zh));
+  assert.deepEqual(Object.keys(en.statuses), Object.keys(zh.statuses));
+  const placeholders = (text: string) => (text.match(/\{\w+\}/g) ?? []).filter(item => item !== "{s}").sort();
+  for (const key of Object.keys(zh)) if (typeof zh[key] === "string") assert.deepEqual(placeholders(en[key]), placeholders(zh[key]), key);
+  // Stored run errors are Chinese; the English page maps every known one, the Chinese page shows them as stored.
+  assert.deepEqual(zh.runMessages, {});
+  for (const { zh: stored, en: shown } of Object.values(RUN_MESSAGES)) assert.equal(en.runMessages[stored], shown);
+  assert.ok(script.includes("node('p',runMessage(run.error.message),'notice error')"));
+  assert.ok(script.includes("node('p',runMessage(result.error.message),'notice error')"));
 });
 
 test("logo is served as the page icon and matches assets/logo.svg", () => {

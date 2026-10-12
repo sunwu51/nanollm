@@ -1,6 +1,7 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "./auth.js";
 import { renderLoginPage } from "../pages/login-page.js";
+import { resolveLang } from "./i18n.js";
 
 const COOKIE_NAME = "nanollm_auth";
 const COOKIE_MAX_AGE = 90 * 24 * 60 * 60;
@@ -37,7 +38,7 @@ export function webAuth(getToken: () => string | undefined): MiddlewareHandler {
           if (token) persistCookie(c, token);
           return c.redirect(returnTo, 303);
         }
-        return c.html(renderLoginPage(returnTo));
+        return c.html(renderLoginPage(returnTo, false, resolveLang(c.req.header("cookie"), c.req.header("accept-language"))));
       }
       const body = await c.req.parseBody();
       const returnTo = safeReturnTo(body.returnTo);
@@ -45,7 +46,7 @@ export function webAuth(getToken: () => string | undefined): MiddlewareHandler {
         if (token) persistCookie(c, token);
         return c.redirect(returnTo, 303);
       }
-      return c.html(renderLoginPage(returnTo, true), 401);
+      return c.html(renderLoginPage(returnTo, true, resolveLang(c.req.header("cookie"), c.req.header("accept-language"))), 401);
     }
 
     if (PAGE_PATHS.has(c.req.path)) {

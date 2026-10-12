@@ -1,5 +1,6 @@
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { resolveEnvVars } from "../core/config.js";
+import { localize } from "../core/i18n.js";
 
 export interface UpstreamModelsRequest {
   provider: string;
@@ -39,9 +40,9 @@ function resolveProxy(proxy: string | undefined, env: NodeJS.ProcessEnv): string
   try {
     url = new URL(value);
   } catch {
-    throw new Error("proxy 必须是有效的 URL");
+    throw new Error(localize("proxy 必须是有效的 URL", "proxy must be a valid URL"));
   }
-  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("proxy 必须使用 http:// 或 https://");
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error(localize("proxy 必须使用 http:// 或 https://", "proxy must use http:// or https://"));
   return value;
 }
 
@@ -51,9 +52,9 @@ export async function fetchUpstreamModels(
   options: { env?: NodeJS.ProcessEnv } = {},
 ): Promise<string[]> {
   const provider = request.provider.trim();
-  if (!SUPPORTED_PROTOCOLS.has(provider)) throw new Error(`协议 '${provider || "(空)"}' 不支持拉取模型列表`);
+  if (!SUPPORTED_PROTOCOLS.has(provider)) throw new Error(localize(`协议 '${provider || "(空)"}' 不支持拉取模型列表`, `Protocol '${provider || "(empty)"}' doesn't support fetching models`));
   const baseUrl = request.base_url.trim().replace(/\/+$/, "");
-  if (!baseUrl) throw new Error("请先填写 base_url");
+  if (!baseUrl) throw new Error(localize("请先填写 base_url", "Enter base_url first"));
   const apiKey = resolveEnvVars(request.api_key ?? "").trim();
   const headers = buildHeaders(provider, apiKey);
   const proxyUrl = resolveProxy(request.proxy, options.env ?? process.env);
@@ -73,12 +74,12 @@ export async function fetchUpstreamModels(
         ...(dispatcher ? { dispatcher } : {}),
       });
       const text = await response.text();
-      if (!response.ok) throw new Error(`上游返回 HTTP ${response.status}：${text.slice(0, 200)}`);
+      if (!response.ok) throw new Error(localize(`上游返回 HTTP ${response.status}：${text.slice(0, 200)}`, `The upstream returned HTTP ${response.status}: ${text.slice(0, 200)}`));
       let payload: unknown;
       try {
         payload = JSON.parse(text);
       } catch {
-        throw new Error(`上游 /models 返回的不是 JSON：${text.slice(0, 200)}`);
+        throw new Error(localize(`上游 /models 返回的不是 JSON：${text.slice(0, 200)}`, `The upstream /models response is not JSON: ${text.slice(0, 200)}`));
       }
       ids.push(...extractUpstreamModelIds(payload));
       const meta = payload as { has_more?: unknown; last_id?: unknown } | null;

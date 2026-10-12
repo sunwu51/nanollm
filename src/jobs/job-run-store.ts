@@ -1,5 +1,6 @@
 import type { JobRun, JobReview } from "./jobs.js";
-import { clone, JobConflictError, JobValidationError } from "./jobs.js";
+import { localize } from "../core/i18n.js";
+import { clone, JobConflictError, JobValidationError, RUN_MESSAGES } from "./jobs.js";
 import { enqueueClientWrite, waitForClientWrites, type SqliteClient } from "../storage/sqlite.js";
 
 export type JobRunSummary = Omit<JobRun, "job_snapshot" | "results"> & { job_name: string; results: Array<Pick<JobRun["results"][number], "model_name" | "status" | "review" | "error" | "started_at" | "finished_at">> };
@@ -18,11 +19,11 @@ export interface JobRunStore {
   flush(): Promise<void>;
 }
 function updateReview(run: JobRun | undefined, modelName: string, status: unknown, note: unknown): JobRun {
-  if (!run) throw new JobValidationError("执行记录不存在或已被清理");
-  if (run.status === "running") throw new JobConflictError("请等待本次执行结束再审核");
-  if (!["unreviewed", "normal", "suspect"].includes(String(status)) || typeof note !== "string" || note.length > 2000) throw new JobValidationError("审核状态无效或备注超过 2000 字符");
+  if (!run) throw new JobValidationError(localize("执行记录不存在或已被清理", "The run doesn't exist or was cleaned up"));
+  if (run.status === "running") throw new JobConflictError(localize("请等待本次执行结束再审核", "Wait for this run to finish before reviewing it"));
+  if (!["unreviewed", "normal", "suspect"].includes(String(status)) || typeof note !== "string" || note.length > 2000) throw new JobValidationError(localize("审核状态无效或备注超过 2000 字符", "Invalid review status, or the note is longer than 2000 characters"));
   const result = run.results.find(r => r.model_name === modelName);
-  if (!result) throw new JobValidationError("模型结果不存在");
+  if (!result) throw new JobValidationError(localize("模型结果不存在", "Model result not found"));
   result.review = { status: status as JobReview["status"], note, reviewed_at: Date.now() };
   run.updated_at = Date.now(); return run;
 }
@@ -69,7 +70,7 @@ export class SqliteJobRunStore implements JobRunStore {
       const running = await this.client.execute({ sql: "SELECT * FROM job_runs WHERE namespace = ? AND status = 'running'", args: [this.namespace] });
       for (const row of running.rows) {
         const run = this.decode(row); run.status = "interrupted"; run.finished_at = run.updated_at = Date.now();
-        run.error = { message: "服务重启，本次执行已中断" };
+        run.error = { message: RUN_MESSAGES.restartInterrupted.zh };
         for (const result of run.results) if (["pending", "running"].includes(result.status)) {
           result.status = "interrupted"; result.finished_at = run.finished_at; result.error = run.error;
           for (const attempt of result.attempts) if (attempt.status === "running") { attempt.status = "interrupted"; attempt.finished_at = run.finished_at; attempt.error = run.error; }

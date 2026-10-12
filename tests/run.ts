@@ -28,7 +28,8 @@ import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, norma
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
 import { webAuth } from "../src/core/web-auth.js";
-import { withWebUIAuth } from "../src/pages/login-page.js";
+import { renderLoginPage, withWebUIAuth } from "../src/pages/login-page.js";
+import { resolveLang } from "../src/core/i18n.js";
 import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
 import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
 import { buildAdminConfigForm, buildYamlTextFromAdminForm } from "../src/pages/admin-config-form.js";
@@ -6050,7 +6051,7 @@ await runAsync("status page renders fallback group priority panel without top hi
       },
     ],
   };
-  const html = renderStatusPage({
+  const statusPayload: Parameters<typeof renderStatusPage>[0] = {
     availableWindows: [1, 3, 6],
     defaultWindowHours: 1,
     refreshedAt: Date.UTC(2026, 4, 15, 12, 10, 0),
@@ -6063,7 +6064,8 @@ await runAsync("status page renders fallback group priority panel without top hi
       { name: "group-a", members: ["beta", "alpha"] },
     ],
     usage: usagePayload,
-  });
+  };
+  const html = renderStatusPage(statusPayload);
 
   assert.match(html, /Usage in selected time range/);
   assert.match(html, /Persistent usage history requires --storage sqlite/);
@@ -6076,6 +6078,11 @@ await runAsync("status page renders fallback group priority panel without top hi
   assert.match(html, /\| Cache write /);
   assert.match(html, /未匹配部分按 DeepSeek V4.1 Flash 等效价格估算：\$0\.00/);
   assert.match(html, /\/status\?range=year&amp;year=2025&amp;model=alpha/);
+  const htmlEn = renderStatusPage(statusPayload, "en");
+  assert.deepEqual(cjkOutsideLangSwitch(htmlEn), []);
+  assert.match(htmlEn, /"avgTtfb":"Avg TTFB"/);
+  assert.match(htmlEn, /"unmatchedCost":"Models without a price/);
+  assert.match(htmlEn, /<i class="dot empty"><\/i>No data/);
   assert.match(html, /Fallback Groups/);
   assert.match(html, /id="groups"/);
   assert.match(html, /id="range-total"/);
@@ -6172,9 +6179,9 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /return "Codex"/);
   assert.match(html, /return "OpenCode"/);
   assert.match(html, /return "Other"/);
-  assert.match(html, /return "成功"/);
-  assert.match(html, /return "失败"/);
-  assert.match(html, /return "请求中\.\.\."/);
+  assert.match(html, /return T.statusSuccess/);
+  assert.match(html, /return T.statusFailure/);
+  assert.match(html, /return T.statusInProgress/);
   assert.match(html, /titleRow\.className = "recent-title-row"/);
   assert.match(html, /title\.className = "recent-title"/);
   assert.match(html, /sourceBadge\.className = "source-badge " \+ item\.source/);
@@ -6230,7 +6237,7 @@ run("model test extracts reply text from client SSE bodies", () => {
 });
 
 run("admin page relies on server cookie auth instead of client-side token storage", () => {
-  const html = renderAdminConfigPage({
+  const adminPayload = {
     version: 1,
     configPath: "C:/tmp/config.yaml",
     effectiveConfig: { port: 3000, models: [], fallback: {}, record: { max_size: 10 } },
@@ -6257,7 +6264,8 @@ run("admin page relies on server cookie auth instead of client-side token storag
       ],
       fallbackGroups: [],
     },
-  } as any);
+  };
+  const html = renderAdminConfigPage(adminPayload);
   assert.match(html, /fetch\("\/admin\/config\/data"/);
   assert.match(html, /fetch\("\/admin\/config\/apply"/);
   assert.match(html, /href="\/status"/);
@@ -6285,6 +6293,20 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.match(html, /pelican/);
   assert.match(html, /删除供应商/);
   assert.match(html, /不能覆盖 name\/provider\/base_url\/api_key\/model/);
+
+  const htmlEn = renderAdminConfigPage(adminPayload, "en");
+  assert.deepEqual(cjkOutsideLangSwitch(htmlEn), []);
+  assert.match(htmlEn, /<html lang="en">/);
+  assert.match(htmlEn, /type="button">Save and apply<\/button>/);
+  assert.match(htmlEn, /<div class="page-corner scrolls"><div class="lang-switch"/);
+  assert.doesNotMatch(htmlEn, /class="back-admin"/);
+  // Both languages carry the same keys, and each template uses the same {placeholders}.
+  const messagesOf = (page: string) => JSON.parse(/const T = (\{.*?\});\r?\n/.exec(page)![1]) as Record<string, string>;
+  const zhMessages = messagesOf(html);
+  const enMessages = messagesOf(htmlEn);
+  assert.deepEqual(Object.keys(enMessages), Object.keys(zhMessages));
+  const placeholders = (text: string) => (text.match(/\{\w+\}/g) ?? []).filter((item) => item !== "{s}").sort();
+  for (const key of Object.keys(zhMessages)) assert.deepEqual(placeholders(enMessages[key]), placeholders(zhMessages[key]), key);
   assert.match(html, /function bindExpressionField/);
   assert.match(html, /bindExpressionField\(grid, model, "body_expression"/);
   assert.match(html, /bindExpressionField\(grid, model, "response_expression"/);
@@ -6520,6 +6542,50 @@ await runAsync("record page filters recent requests by model and time range and 
   assert.equal(pager.querySelector(".current")?.textContent, "1");
 });
 
+run("page language follows the switch cookie, then the browser's preferred language, defaulting to English", () => {
+  assert.equal(resolveLang(undefined, undefined), "en");
+  assert.equal(resolveLang(undefined, "zh-CN,zh;q=0.9,en;q=0.8"), "zh");
+  assert.equal(resolveLang(undefined, "zh-TW"), "zh");
+  assert.equal(resolveLang(undefined, "zh"), "zh");
+  assert.equal(resolveLang(undefined, "en-US,en;q=0.9,zh-CN;q=0.8"), "en");
+  assert.equal(resolveLang(undefined, "en;q=0.5, zh-CN;q=0.8"), "zh");
+  assert.equal(resolveLang(undefined, "fr-FR,fr;q=0.9"), "en");
+  assert.equal(resolveLang(undefined, "*"), "en");
+  assert.equal(resolveLang("a=1; nanollm_lang=en", "zh-CN"), "en");
+  assert.equal(resolveLang("nanollm_lang=zh", "en-US"), "zh");
+  assert.equal(resolveLang("nanollm_lang=fr", "zh-CN"), "zh");
+});
+
+// The language switch itself is the only CJK text an English page may contain.
+function cjkOutsideLangSwitch(html: string): string[] {
+  return html.replace(/<div class="lang-switch"[\s\S]*?<\/div>/, "").match(/[\u4e00-\u9fff]+/g) ?? [];
+}
+
+run("record and login pages render in English with a language switch", () => {
+  const summary = { enabled: true, capturedCount: 1, limit: 100, sessionStartedAt: Date.UTC(2026, 3, 20), recentKeys: makeRecentKeys(1) };
+  const recordEn = renderRecordPage(summary, "en");
+  assert.deepEqual(cjkOutsideLangSwitch(recordEn), []);
+  assert.match(recordEn, /<html lang="en">/);
+  assert.match(recordEn, /Clear filters/);
+  assert.match(recordEn, /"allModels":"All models"/);
+  assert.match(recordEn, /--label-expand: "Expand"/);
+  assert.match(recordEn, /<div class="page-corner"><a class="back-admin" href="\/admin">← Admin<\/a><div class="lang-switch"/);
+  assert.match(recordEn, /<button type="button" aria-pressed="true" disabled>EN<\/button>/);
+  assert.match(recordEn, /onclick="document\.cookie='nanollm_lang=zh; Path=\/;[^"]*location\.reload\(\)">中文<\/button>/);
+  assert.equal(recordEn.match(/<script>/g)?.length, 1);
+
+  const recordZh = renderRecordPage(summary, "zh");
+  assert.match(recordZh, /<html lang="zh-CN">/);
+  assert.match(recordZh, /清除筛选/);
+  assert.match(recordZh, /<button type="button" aria-pressed="true" disabled>中文<\/button>/);
+
+  const loginEn = renderLoginPage("/record", true, "en");
+  assert.deepEqual(cjkOutsideLangSwitch(loginEn), []);
+  assert.match(loginEn, /Wrong password/);
+  assert.doesNotMatch(loginEn, /class="back-admin"/);
+  assert.match(renderLoginPage("/record", true, "zh"), /密码错误/);
+});
+
 await runAsync("record page hides the pager when all recent requests fit on one page", async () => {
   const recentKeys = makeRecentKeys(12);
   const { recent, pager } = await runRecordPageScript(recentKeys, "?requestId=" + recentKeys[11].requestId, makeRecordFor(recentKeys[11]));
@@ -6729,7 +6795,8 @@ await runAsync("WebUI login redirects pages, validates passwords, and preserves 
   const failure = await submit("wrong", "/record?requestId=abc");
   assert.equal(failure.status, 401);
   assert.equal(failure.headers.get("set-cookie"), null);
-  assert.match(await failure.text(), /密码错误/);
+  // No Accept-Language header, so the login page falls back to English.
+  assert.match(await failure.text(), /Wrong password/);
   const success = await submit("top-secret", "/record?requestId=abc&token=secret");
   assert.equal(success.status, 303);
   assert.equal(success.headers.get("location"), "/record?requestId=abc");
@@ -7358,12 +7425,12 @@ run("admin page disables testing unsaved models and groups custom provider model
   assert.match(html, /testButton\.disabled = true/);
   assert.match(html, /"\/admin\/upstream-models"/);
   assert.match(html, /function openFetchModelsDialog\(provider\)/);
-  assert.match(html, /createActionButton\("拉取模型"/);
+  assert.match(html, /createActionButton\(T\.fetchModels/);
   assert.match(html, /"全选"/);
   assert.match(html, /function buildModelGroupCard/);
   assert.match(html, /const expandedModelGroups = new Set\(\)/);
   assert.match(html, /加供应商名后缀/);
-  assert.match(html, /createActionButton\("删除全部模型"/);
+  assert.match(html, /createActionButton\(T\.deleteAllModels/);
   assert.match(html, /function isGroupSuffixed\(providerName\)/);
 });
 
@@ -7380,10 +7447,10 @@ run("admin page fetches subscription models from saved credentials and lists pro
     form: { server: { port: "3000", ttfb_timeout: "" }, record: { max_size: "10" }, providers: [], models: [], fallbackGroups: [] },
   });
   assert.match(html, /"\/admin\/providers\/" \+ encodeURIComponent\(providerName\) \+ "\/models"/);
-  assert.doesNotMatch(html, /if \(!SUBSCRIPTION_PROVIDERS\.includes\(provider\.provider\)\) \{\n\s+actions\.appendChild\(createActionButton\("拉取模型"/);
+  assert.doesNotMatch(html, /if \(!SUBSCRIPTION_PROVIDERS\.includes\(provider\.provider\)\) \{\n\s+actions\.appendChild\(createActionButton\(T\.fetchModels/);
   assert.match(html, /const showHeadings = groupKeys\.length > 0 && standalone\.length > 0/);
   assert.match(html, /\.card\.group-card \{/);
-  assert.match(html, /kindBadge\.textContent = "供应商"/);
+  assert.match(html, /kindBadge\.textContent = T\.providerBadge/);
 });
 
 run("admin page marks conflicting model and fallback names at provider, model and banner level", () => {
@@ -7395,11 +7462,11 @@ run("admin page marks conflicting model and fallback names at provider, model an
     form: { server: { port: "3000", ttfb_timeout: "" }, record: { max_size: "10" }, providers: [], models: [], fallbackGroups: [] },
   });
   assert.match(html, /function getNameConflicts\(\)/);
-  assert.match(html, /formState\.fallbackGroups\.forEach\(\(group\) => add\(normalizeModelRef\(group\.name\), \{ label: "fallback 分组"/);
+  assert.match(html, /formState\.fallbackGroups\.forEach\(\(group\) => add\(normalizeModelRef\(group\.name\), \{ label: T\.fallbackGroupLabel/);
   assert.match(html, /function buildConflictBanner\(conflicts\)/);
   assert.match(html, /function locateModel\(model\)/);
   assert.match(html, /个模型名冲突/);
-  assert.match(html, /badge\.textContent = "⚠ 名称冲突"/);
+  assert.match(html, /badge\.textContent = "⚠ " \+ T\.nameConflict/);
   assert.match(html, /invalid: Boolean\(nameConflict\)/);
   assert.match(html, /invalid: Boolean\(groupNameSources\)/);
   assert.match(html, /\.card\.group-card\.conflict \{/);
@@ -7415,10 +7482,10 @@ run("admin page links provider cards to their model groups and back", () => {
   });
   assert.match(html, /function locateModelGroup\(providerName\)/);
   assert.match(html, /function locateProvider\(provider\)/);
-  assert.match(html, /" 个模型" \+ \(conflictedCount > 0/);
+  assert.match(html, /tr\(T\.modelCount, \{ n: providerModels\.length \}\) \+ \(conflictedCount > 0/);
   assert.match(html, /modelsLink\.disabled = providerModels\.length === 0/);
   assert.match(html, /card\.setAttribute\("data-model-group", providerName\)/);
-  assert.match(html, /createActionButton\("编辑供应商"/);
+  assert.match(html, /createActionButton\(T\.editProvider/);
 });
 
 run("codex model catalog request carries the Codex CLI identity and a version at or above the upstream floor", () => {
@@ -7534,6 +7601,6 @@ run("admin page only blocks subscription model fetching on this provider's own u
     form: { server: { port: "3000", ttfb_timeout: "" }, record: { max_size: "10" }, providers: [], models: [], fallbackGroups: [] },
   });
   assert.doesNotMatch(html, /if \(!saved \|\| dirty\)/);
-  assert.match(html, /if \(!saved\) \{ window\.alert\("该订阅供应商还没有保存/);
+  assert.match(html, /if \(!saved\) \{ window\.alert\(T\.subscriptionNotSaved\)/);
   assert.match(html, /\(saved\.proxy \|\| ""\) !== \(provider\.proxy \|\| ""\)\.trim\(\)/);
 });

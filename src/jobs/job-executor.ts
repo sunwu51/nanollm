@@ -1,7 +1,7 @@
 import type { ModelConfig } from "../core/config.js";
 import { buildModelTestRequest } from "../proxy/model-test.js";
 import { createUsageCollector, SSEParser } from "../converters/streams.js";
-import { type Job, type JobOutput, type JobResult } from "./jobs.js";
+import { RUN_MESSAGES, type Job, type JobOutput, type JobResult } from "./jobs.js";
 
 export interface ExecutionOutput { output: JobOutput; metrics: JobResult["metrics"] }
 export class JobExecutionError extends Error {
@@ -50,7 +50,7 @@ export const createModelRequestExecutor = (send: JobRequestSender): JobExecutor 
       const bytes = Buffer.from(part);
       if (textBytes + bytes.length > job.execution.max_output_bytes) {
         text += new TextDecoder().decode(bytes.subarray(0, Math.max(0, job.execution.max_output_bytes - textBytes))).replace(/\uFFFD$/, "");
-        truncated = true; throw new Error("输出超过任务设置的大小限制");
+        truncated = true; throw new Error(RUN_MESSAGES.outputTooLarge.zh);
       }
       text += part; textBytes += bytes.length;
     };
@@ -58,8 +58,8 @@ export const createModelRequestExecutor = (send: JobRequestSender): JobExecutor 
       for (const event of events) {
         if (event.data === "[DONE]") { completed = true; continue; }
         let value: any; try { value = JSON.parse(event.data); } catch { continue; }
-        if (value.error || ["error", "response.failed"].includes(value.type)) streamError = "上游返回错误响应";
-        if (value.type === "response.incomplete" || value.response?.status === "incomplete") { truncated = true; streamError = "上游响应未完成"; }
+        if (value.error || ["error", "response.failed"].includes(value.type)) streamError = RUN_MESSAGES.upstreamError.zh;
+        if (value.type === "response.incomplete" || value.response?.status === "incomplete") { truncated = true; streamError = RUN_MESSAGES.upstreamIncomplete.zh; }
         if (model.provider === "openai-chat") {
           if (typeof value.choices?.[0]?.delta?.content === "string") append(value.choices[0].delta.content);
         } else if (model.provider === "openai-responses") {
@@ -72,7 +72,7 @@ export const createModelRequestExecutor = (send: JobRequestSender): JobExecutor 
           if (value.type === "content_block_delta" && value.delta?.type === "text_delta") append(value.delta.text);
         }
         const reason = value.choices?.[0]?.finish_reason ?? value.delta?.stop_reason;
-        if (["length", "max_tokens", "content_filter"].includes(reason)) { truncated = true; streamError = "输出被截断或过滤"; }
+        if (["length", "max_tokens", "content_filter"].includes(reason)) { truncated = true; streamError = RUN_MESSAGES.outputCutOff.zh; }
         if (reason || value.type === "response.completed" || value.type === "message_stop") completed = true;
       }
     };
@@ -82,14 +82,14 @@ export const createModelRequestExecutor = (send: JobRequestSender): JobExecutor 
         signal.throwIfAborted();
         const chunk = await reader.read(); signal.throwIfAborted(); if (chunk.done) break;
         ttfbMs ??= Date.now() - started; wireBytes += chunk.value.byteLength;
-        if (wireBytes > Math.max(1024 * 1024, job.execution.max_output_bytes * 16)) { truncated = true; throw new Error("上游响应流超过大小限制"); }
+        if (wireBytes > Math.max(1024 * 1024, job.execution.max_output_bytes * 16)) { truncated = true; throw new Error(RUN_MESSAGES.streamTooLarge.zh); }
         const decoded = decoder.decode(chunk.value, { stream: true }); collector.push(decoded); consume(parser.push(decoded));
       }
       const tail = decoder.decode(); collector.push(tail); consume([...parser.push(tail), ...parser.flush()]); collector.finish();
       signal.throwIfAborted();
       if (streamError) throw new Error(streamError);
-      if (!completed) throw new Error("上游响应流未正常结束");
-      if (!text.trim()) throw new Error("模型未返回文本内容");
+      if (!completed) throw new Error(RUN_MESSAGES.streamUnfinished.zh);
+      if (!text.trim()) throw new Error(RUN_MESSAGES.noText.zh);
       return partial();
     } catch (error) {
       throw new JobExecutionError(error instanceof Error ? error.message : String(error), partial(), { cause: error });

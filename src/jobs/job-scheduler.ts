@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ModelConfig } from "../core/config.js";
-import { clone, connectionFingerprint, JobConfigStore, JobConflictError, jobError, nextJobDates, type Job, type JobRun, type JobResult } from "./jobs.js";
+import { localize } from "../core/i18n.js";
+import { clone, connectionFingerprint, JobConfigStore, JobConflictError, jobError, nextJobDates, RUN_MESSAGES, type Job, type JobRun, type JobResult } from "./jobs.js";
 import type { JobRunStore } from "./job-run-store.js";
 import { JobExecutionError, type ExecutionOutput, type JobExecutor } from "./job-executor.js";
 
@@ -74,19 +75,19 @@ export class JobScheduler {
   }
   async runNow(id: string): Promise<JobRun> {
     const snapshot = this.sync();
-    if (snapshot.lastError) throw new JobConflictError("请先修复 jobs.yaml");
-    const job = snapshot.jobs.find(j => j.id === id); if (!job) throw new JobConflictError("任务不存在");
+    if (snapshot.lastError) throw new JobConflictError(localize("请先修复 jobs.yaml", "Fix jobs.yaml first"));
+    const job = snapshot.jobs.find(j => j.id === id); if (!job) throw new JobConflictError(localize("任务不存在", "Job not found"));
     return this.launch(job, "manual", null);
   }
   isRunning(id: string) { return this.active.has(id); }
   cancel(id: string) {
-    const active = this.active.get(id); if (!active) throw new JobConflictError("任务没有正在执行的运行");
-    active.controller.abort(new Error("管理员取消执行"));
+    const active = this.active.get(id); if (!active) throw new JobConflictError(localize("任务没有正在执行的运行", "The job has no run in progress"));
+    active.controller.abort(new Error(RUN_MESSAGES.cancelledByAdmin.zh));
   }
   private async launch(job: Job, trigger: JobRun["trigger"], scheduledAt: number | null): Promise<JobRun> {
-    if (this.stopped) throw new JobConflictError("调度器已停止");
-    if (this.active.has(job.id)) throw new JobConflictError("该任务正在执行，不能重复运行");
-    if (this.active.size >= this.maxConcurrentRuns) throw new JobConflictError("执行资源繁忙，请稍后重试");
+    if (this.stopped) throw new JobConflictError(localize("调度器已停止", "The scheduler is stopped"));
+    if (this.active.has(job.id)) throw new JobConflictError(localize("该任务正在执行，不能重复运行", "This job is already running"));
+    if (this.active.size >= this.maxConcurrentRuns) throw new JobConflictError(localize("执行资源繁忙，请稍后重试", "Too many runs in progress; try again later"));
     const models = clone(this.resolveTarget ? job.models.map(name => this.resolveTarget!(name)).filter((m): m is ModelConfig => !!m) : this.getModels());
     const now = this.now();
     const run: JobRun = { id: randomUUID(), job_id: job.id, trigger, scheduled_at: scheduledAt,
@@ -120,13 +121,13 @@ export class JobScheduler {
   private async executeResult(run: JobRun, result: JobResult, model: ModelConfig, parent: AbortSignal) {
     await this.withModelLock(model.name, parent, async () => {
       result.status = "running"; result.started_at = this.now(); await this.save(run);
-      const executor = this.executors.get(run.job_snapshot.type); if (!executor) throw new Error("任务执行器不存在");
+      const executor = this.executors.get(run.job_snapshot.type); if (!executor) throw new Error(RUN_MESSAGES.executorMissing.zh);
       for (let index = 1; index <= run.job_snapshot.execution.max_attempts; index++) {
         parent.throwIfAborted();
         const attempt: JobResult["attempts"][number] = { attempt: index, status: "running", started_at: this.now(), finished_at: null, error: null, request_id: randomUUID() };
         result.attempts.push(attempt); await this.save(run);
         const timeout = new AbortController();
-        const timer = setTimeout(() => timeout.abort(new Error("模型调用超过任务超时限制")), run.job_snapshot.execution.timeout_ms);
+        const timer = setTimeout(() => timeout.abort(new Error(RUN_MESSAGES.timedOut.zh)), run.job_snapshot.execution.timeout_ms);
         const signal = AbortSignal.any([parent, timeout.signal]);
         try {
           const output: ExecutionOutput = await abortable(executor.execute(run.job_snapshot, model, signal, { requestId: attempt.request_id! }), signal);
@@ -149,7 +150,7 @@ export class JobScheduler {
       for (const result of run.results) {
         if (controller.signal.aborted) break;
         const model = models.find(m => m.name === result.model_name && m.provider !== "openai-image" && !m.name.includes("*"));
-        if (!model) { result.status = "failed"; result.finished_at = this.now(); result.error = { message: "目标模型已移除或不支持任务测试" }; }
+        if (!model) { result.status = "failed"; result.finished_at = this.now(); result.error = { message: RUN_MESSAGES.modelUnavailable.zh }; }
         else {
           try { await this.executeResult(run, result, model, controller.signal); }
           catch (error) { if (!controller.signal.aborted) throw error; }
@@ -163,7 +164,7 @@ export class JobScheduler {
       run.finished_at = this.now();
       for (const result of run.results) if (["pending", "running"].includes(result.status)) {
         result.status = controller.signal.aborted ? "cancelled" : "failed"; result.finished_at = run.finished_at;
-        result.error = jobError(controller.signal.aborted ? controller.signal.reason : run.error?.message ?? "任务执行中断");
+        result.error = jobError(controller.signal.aborted ? controller.signal.reason : run.error?.message ?? RUN_MESSAGES.runInterrupted.zh);
         for (const attempt of result.attempts) if (attempt.status === "running") {
           attempt.status = result.status; attempt.finished_at = run.finished_at; attempt.error = result.error;
         }
@@ -172,6 +173,6 @@ export class JobScheduler {
     }
   }
   start() { this.timer = setInterval(() => { void this.tick().catch(e => { this.lastError = jobError(e).message; }); }, 1000); this.timer.unref(); }
-  stop() { this.stopped = true; clearInterval(this.timer); for (const active of this.active.values()) active.controller.abort(new Error("服务正在关闭")); }
+  stop() { this.stopped = true; clearInterval(this.timer); for (const active of this.active.values()) active.controller.abort(new Error(RUN_MESSAGES.shuttingDown.zh)); }
   async flush() { await Promise.allSettled([...this.active.values()].map(a => a.work)); await this.runs.flush(); }
 }
