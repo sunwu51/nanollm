@@ -169,6 +169,10 @@ const zh = {
   addProviderFirst: "请先添加供应商。",
   upstreamModelPlaceholder: "上游真实模型名",
   modelProxyHelper: "可选。该模型调用上游时使用的 HTTP proxy，优先级最高；留空则依次回退到供应商 proxy、HTTPS_PROXY/HTTP_PROXY。",
+  modelAuthTokenHelper: "可选。客户端用这个 token（Authorization: Bearer 或 x-api-key）只能以该模型名访问它；管理员 token 始终可用。支持 ${ENV_VAR}。",
+  groupAuthTokenHelper: "可选。客户端用这个 token 只能以分组名访问该分组（会按顺序回退到所有成员），不能直接访问成员模型；管理员 token 始终可用。支持 ${ENV_VAR}。",
+  authTokenPlaceholder: "留空则仅管理员 token 可访问",
+  generateToken: "生成",
   bodyExpressionHelper: "可选。JS 表达式，变量 body 为最终上游请求体，需同步返回新的 body；留空表示不改写。",
   responseExpressionHelper: "可选。JS 表达式，变量 response 为上游 JSON/SSE 响应、headers 为只读的上游响应头，需返回新的 response；留空表示不改写。",
   noFallbackGroups: "还没有 fallback 分组，点击“添加分组”后可以为分组选择模型列表。",
@@ -374,6 +378,10 @@ const MESSAGES: Record<Lang, typeof zh> = {
     addProviderFirst: "Add a provider first.",
     upstreamModelPlaceholder: "Upstream model name",
     modelProxyHelper: "Optional. HTTP proxy for this model's upstream calls, with the highest priority; if empty, falls back to the provider proxy, then HTTPS_PROXY/HTTP_PROXY.",
+    modelAuthTokenHelper: "Optional. Clients sending this token (Authorization: Bearer or x-api-key) can use this model by its name only; the admin token always works. Supports ${ENV_VAR}.",
+    groupAuthTokenHelper: "Optional. Clients sending this token can use this group by its name only (falling back through all members), not the member models directly; the admin token always works. Supports ${ENV_VAR}.",
+    authTokenPlaceholder: "Empty = admin token only",
+    generateToken: "Generate",
     bodyExpressionHelper: "Optional. A JS expression: body is the final upstream request body, and it must synchronously return the new body. Leave empty to keep it unchanged.",
     responseExpressionHelper: "Optional. A JS expression: response is the upstream JSON/SSE response and headers the read-only upstream response headers. It must return the new response. Leave empty to keep it unchanged.",
     noFallbackGroups: "No fallback groups yet. Click “Add group”, then choose its models.",
@@ -1016,7 +1024,7 @@ const SCRIPT = /* js */ String.raw`
       const MODEL_PROVIDERS = ["openai-chat", "openai-responses", "anthropic", "openai-image"];
       const SUBSCRIPTION_PROVIDERS = ["openai-subscription", "claude-subscription"];
       const PROVIDERS = [...MODEL_PROVIDERS, ...SUBSCRIPTION_PROVIDERS];
-      const RESERVED_MODEL_EXTRA_KEYS = new Set(["name", "provider", "custom_provider", "base_url", "api_key", "model", "proxy", "body_expression", "response_expression", "bodyExpression", "responseExpression"]);
+      const RESERVED_MODEL_EXTRA_KEYS = new Set(["name", "provider", "custom_provider", "base_url", "api_key", "model", "proxy", "body_expression", "response_expression", "bodyExpression", "responseExpression", "auth_token"]);
       let saving = false;
       let dirty = false;
       let localIdCounter = 0;
@@ -1061,6 +1069,7 @@ const SCRIPT = /* js */ String.raw`
             proxy: model.proxy || "",
             body_expression: model.body_expression || "",
             response_expression: model.response_expression || "",
+            auth_token: model.auth_token || "",
             _expanded: false,
             _advancedExpanded: false,
             extras: model.extras || {},
@@ -1069,6 +1078,7 @@ const SCRIPT = /* js */ String.raw`
           })),
           fallbackGroups: (form.fallbackGroups || []).map((group) => ({
             ...group,
+            auth_token: group.auth_token || "",
             _id: nextId("fallback"),
             _expanded: false,
             members: (group.members || []).map((member) => ({
@@ -1100,9 +1110,23 @@ const SCRIPT = /* js */ String.raw`
         statusEl.textContent = text || "";
       }
 
-      function focusPendingTarget({ scrollToFocus = true } = {}) {
+      // Re-rendering replaces the focused input, so remember its caret to put it back on the new one.
+      function captureFocusedSelection() {
+        const active = document.activeElement;
+        const focusId = active?.getAttribute?.("data-focus-id");
+        if (!focusId) return null;
+        try {
+          if (typeof active.selectionStart !== "number") return null;
+          return { focusId, start: active.selectionStart, end: active.selectionEnd, direction: active.selectionDirection || "none" };
+        } catch {
+          return null;
+        }
+      }
+
+      function focusPendingTarget({ scrollToFocus = true, selection = null } = {}) {
         if (!pendingFocusTarget) return;
-        const target = document.querySelector("[data-focus-id=\"" + pendingFocusTarget + "\"]");
+        const focusId = pendingFocusTarget;
+        const target = document.querySelector("[data-focus-id=\"" + focusId + "\"]");
         if (!target) return;
         pendingFocusTarget = null;
         requestAnimationFrame(() => {
@@ -1110,6 +1134,11 @@ const SCRIPT = /* js */ String.raw`
             target.scrollIntoView({ behavior: "smooth", block: "center" });
           }
           target.focus({ preventScroll: true });
+          if (selection && selection.focusId === focusId && typeof target.setSelectionRange === "function") {
+            try {
+              target.setSelectionRange(selection.start, selection.end, selection.direction);
+            } catch {}
+          }
         });
       }
 
@@ -1293,6 +1322,29 @@ const SCRIPT = /* js */ String.raw`
           field.appendChild(helper);
         }
         container.appendChild(field);
+      }
+
+      // An auth_token input with a button that fills in a random token; target is a model or fallback group draft.
+      function bindAuthTokenField(container, target, helper) {
+        bindField(container, "auth_token", {
+          spanClass: "span-2",
+          value: target.auth_token || "",
+          placeholder: T.authTokenPlaceholder,
+          helper,
+          onInput(value) {
+            target.auth_token = value;
+            markDirty(true);
+          },
+        });
+        const field = container.lastElementChild;
+        const button = createActionButton(T.generateToken, "ghost", () => {
+          const bytes = new Uint8Array(24);
+          crypto.getRandomValues(bytes);
+          target.auth_token = "sk-nanollm-" + Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+          markDirty(true);
+          renderAll({ preserveScroll: true, scrollToFocus: false });
+        });
+        field.insertBefore(button, field.querySelector(".helper"));
       }
 
       function bindExpressionField(container, model, key, options) {
@@ -2623,6 +2675,7 @@ const SCRIPT = /* js */ String.raw`
               markDirty(true);
             },
           });
+          bindAuthTokenField(grid, model, T.modelAuthTokenHelper);
           bindExpressionField(grid, model, "body_expression", {
             placeholder: "({\n  ...body,\n  temperature: 0.2,\n})",
             helper: T.bodyExpressionHelper,
@@ -2719,6 +2772,7 @@ const SCRIPT = /* js */ String.raw`
               renderAll({ preserveScroll: true, scrollToFocus: false });
             },
           });
+          bindAuthTokenField(grid, group, T.groupAuthTokenHelper);
           body.appendChild(grid);
 
           const membersWrap = document.createElement("div");
@@ -2860,13 +2914,14 @@ const SCRIPT = /* js */ String.raw`
       function renderAll({ preserveScroll = false, scrollToFocus = true } = {}) {
         const scrollX = window.scrollX;
         const scrollY = window.scrollY;
+        const selection = captureFocusedSelection();
         renderSnapshotMeta();
         renderGlobalFields();
         renderProviders();
         renderModels();
         renderFallbackGroups();
         if (preserveScroll) window.scrollTo(scrollX, scrollY);
-        focusPendingTarget({ scrollToFocus });
+        focusPendingTarget({ scrollToFocus, selection });
         if (preserveScroll) {
           requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
         }

@@ -290,17 +290,17 @@ server:
 
 - `server.auth.token` 为空或不配置时，认证关闭。
 - 运行中，修改 `server.auth.token` 会写回配置文件，但和 `server.port` 一样需要重启进程后才会真正生效。
-- 一旦配置，除了 `/health` 以外，其余入口都要求认证，包括 `/`、`/status`、`/record`、`/admin`、`/jobs`、`/v1/models` 和 `/v1/*`。
+- 一旦配置，除了 `/health` 以外，其余入口都要求认证，包括 `/`、`/status`、`/record`、`/admin`、`/jobs`、`/v1/models` 和 `/v1/*`。如果只想把某个模型或 fallback 分组开放给客户端，见[模型和分组访问 token](#模型和分组访问-token)。
 - 认证只保护访问 nanollm 本身，不会替代或覆盖 `models[*].api_key`，也不会转发到上游模型供应商。
 
-API 客户端使用标准 Bearer header：
+API 客户端可以用 `Authorization: Bearer <token>`，也可以用 `x-api-key: <token>`（Anthropic SDK 客户端，例如用 `ANTHROPIC_API_KEY` 的 Claude Code，就是这样发送的）：
 
 ```bash
 curl http://localhost:3000/v1/models \
   -H "Authorization: Bearer $NANOLLM_AUTH_TOKEN"
 ```
 
-如果你用 OpenAI SDK 或兼容客户端，把这个 token 当成访问 nanollm 的 API key 即可。
+如果你用 OpenAI / Anthropic SDK 或兼容客户端，把这个 token 当成访问 nanollm 的 API key 即可。
 
 浏览器直接打开页面：
 
@@ -314,6 +314,32 @@ http://localhost:3000/jobs
 未配置访问密码时直接进入页面；配置了密码时，未登录会跳转到 `/login`，输入 `server.auth.token`（或环境变量 `NANOLLM_AUTH_TOKEN`）对应的访问密码后返回原页面。URL 中的 `?token=` 不再用于认证，旧链接在未登录时也会跳转到登录页。
 
 登录成功（或 Bearer header 认证成功）后，nanollm 会写入有效期为 90 天的同源 `HttpOnly` 认证 cookie，成功访问时续期，HTTPS 下启用 `Secure`。浏览器会自动携带 cookie，无需重复输入密码。cookie 失效或服务器密码变更后，页面及页面内请求会引导重新登录；API 客户端仍收到标准的 `401 Unauthorized` 响应。
+
+### 模型和分组访问 token
+
+如果想让某个客户端只能访问某个模型或 fallback 分组、而不分享管理员 token，可以在模型或分组上配置 `auth_token`。分组需要使用对象写法；原来的数组写法仍然可用：
+
+```yaml
+models:
+  - name: gpt-5.4-a
+    # ...
+    auth_token: ${TEAM_A_TOKEN}
+fallback:
+  gpt-5.4:                # 原有数组写法，不变
+    - gpt-5.4-a
+    - gpt-5.4-b
+  gpt-5.4-team:           # 对象写法，只在需要 token 时使用
+    models:
+      - gpt-5.4-a
+      - gpt-5.4-b
+    auth_token: ${TEAM_B_TOKEN}
+```
+
+- token 只对它所在的那个名字生效。`TEAM_A_TOKEN` 可以调用 `gpt-5.4-a`；`TEAM_B_TOKEN` 可以调用 `gpt-5.4-team`（仍会按顺序回退到所有成员），但不能直接以 `gpt-5.4-a` 或 `gpt-5.4-b` 的名字调用。
+- 管理员 token（`server.auth.token`）始终可以调用所有模型和分组。
+- 没有自己 `auth_token` 的模型或分组只能用管理员 token 访问；如果没有配置管理员 token，则任何人都可访问。配置了自己 `auth_token` 的模型或分组，即使没有管理员 token 也需要 token 才能访问。
+- 这些 token 只能访问模型接口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/images/*`、`/v1/alpha/search`）和 `/v1/models`（只列出该 token 可用的名字）。页面、`/admin`、`/record`、`/status`、`/jobs` 仍需管理员 token，也不会写入登录 cookie。访问不允许的模型返回 `403`。
+- 客户端的发送方式和管理员 token 相同（`Authorization: Bearer` 或 `x-api-key`）。模型和分组 token 随 `models`、`fallback` 热更新，支持 `${ENV_VAR}`。`/admin` 页面里每个模型和分组都有 `auth_token` 输入框和"生成"按钮。
 
 ### 动态请求体表达式
 

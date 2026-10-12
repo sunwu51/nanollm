@@ -11,10 +11,11 @@ import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { randomUUID } from "node:crypto";
 import type { ModelConfig, ServerConfig } from "./src/core/config.js";
-import { webAuth } from "./src/core/web-auth.js";
+import { getRequestAuthToken, webAuth } from "./src/core/web-auth.js";
+import { canAccessModel, getAccessibleModelNames, isScopedToken } from "./src/core/auth.js";
 import { localize, resolveLang, runWithLang } from "./src/core/i18n.js";
 import { withWebUIAuth } from "./src/pages/login-page.js";
-import { getPublicModelNames, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
+import { getModelAuthToken, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
 import { ConfigManager } from "./src/core/config-manager.js";
 import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy/proxy.js";
 import { forwardRequest, forwardStreamRequest, passthroughAlphaSearchRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, type OpenAIImageOperation } from "./src/proxy/proxy.js";
@@ -161,7 +162,7 @@ const app = new Hono();
 const apiCors = cors({
   origin: "*",
   allowMethods: ["GET", "POST", "OPTIONS"],
-  allowHeaders: ["Content-Type", "Authorization"],
+  allowHeaders: ["Content-Type", "Authorization", "x-api-key"],
 });
 
 app.use("*", async (c, next) => {
@@ -208,7 +209,10 @@ app.use("*", async (c, next) => {
   return apiCors(c, next);
 });
 
-app.use("*", webAuth(() => configManager.getActiveSnapshot().effectiveConfig.auth?.token));
+app.use("*", webAuth(
+  () => configManager.getActiveSnapshot().effectiveConfig.auth?.token,
+  (candidate) => isScopedToken(configManager.getActiveSnapshot().effectiveConfig, candidate),
+));
 
 // Errors from the admin and jobs APIs are shown in the web UI, so they follow the page language.
 app.use("*", async (c, next) => {
@@ -243,7 +247,8 @@ const jobRequestExecutor = createModelRequestExecutor(async (model, request, sig
   const requestId = getRequestId() ?? createRequestId();
   const headers = new Headers({ "content-type": "application/json" });
   if (!model.subscription_provider && !model.claude_subscription_provider) headers.set("user-agent", "nanollm-scheduled-job");
-  if (config.auth?.token) headers.set("authorization", `Bearer ${config.auth.token}`);
+  const authToken = internalAuthToken(config, model.name);
+  if (authToken) headers.set("authorization", `Bearer ${authToken}`);
   jobRequestModels.set(requestId, model);
   try {
     return await app.fetch(new Request(`http://127.0.0.1:${config.port}${request.path}`, { method: "POST", headers, body: JSON.stringify(request.body), signal }));
@@ -336,6 +341,25 @@ async function readImageRequestBody(c: Context) {
 
 function orange(message: string): string {
   return `${ORANGE}${message}${RESET}`;
+}
+
+/** Token for in-process calls (jobs, replay, model test): the admin token, else the target's own token. */
+function internalAuthToken(config: ServerConfig, modelName: string | undefined): string | undefined {
+  return config.auth?.token ?? (modelName ? getModelAuthToken(config, modelName) : undefined);
+}
+
+/** Rejects a request whose token can't reach the named model or group; records the rejection if one is being recorded. */
+function rejectModelAccess(c: Context, config: ServerConfig, modelName: string): Response | undefined {
+  if (canAccessModel(config, modelName, getRequestAuthToken(c, config.auth?.token))) return undefined;
+  const errorBody = { error: `This token is not allowed to use model '${modelName}'` };
+  const response = c.json(errorBody, 403);
+  if (getRequestId()) {
+    setRecordedRequestError({ message: errorBody.error });
+    setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
+    setRecordedClientResponseBody({ body: errorBody });
+    finalizeRecordedRequest({});
+  }
+  return response;
 }
 
 function getCandidateModels(config: ServerConfig, primaryModel: string): ModelConfig[] {
@@ -490,7 +514,8 @@ async function replayRecordedRequest(record: RecordEntry, config: ServerConfig) 
   }
 
   const replayRequestId = createRequestId();
-  const headers = buildReplayHeaders(record, config.auth?.token);
+  const recordedModel = (record.clientRequest.body as { model?: unknown } | undefined)?.model;
+  const headers = buildReplayHeaders(record, internalAuthToken(config, typeof recordedModel === "string" ? recordedModel : undefined));
   const response = await runWithRequestId(replayRequestId, async () => app.fetch(new Request(`http://127.0.0.1:${config.port}${path}`, {
     method: "POST",
     headers,
@@ -523,7 +548,8 @@ async function testConfiguredModel(name: string, message: string, config: Server
   if (!model.subscription_provider && !model.claude_subscription_provider) {
     headers.set("user-agent", "nanollm-admin-model-test");
   }
-  if (config.auth?.token) headers.set("authorization", `Bearer ${config.auth.token}`);
+  const authToken = internalAuthToken(config, model.name);
+  if (authToken) headers.set("authorization", `Bearer ${authToken}`);
 
   const requestId = createRequestId();
   const started = Date.now();
@@ -710,9 +736,12 @@ function createRoute(incomingFormat: StreamFormat) {
       return response;
     }
 
+    const accessDenied = rejectModelAccess(c, config, modelName);
+    if (accessDenied) return accessDenied;
+
     const candidateModels = getCandidateModels(config, modelName);
     if (candidateModels.length === 0) {
-      const errorBody = { error: `Model '${modelName}' not found in config`, available: getPublicModelNames(config) };
+      const errorBody = { error: `Model '${modelName}' not found in config`, available: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)) };
       const response = c.json(errorBody, 404);
       setRecordedRequestError({ message: errorBody.error });
       setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
@@ -849,8 +878,9 @@ function createAlphaSearchRoute() {
     const rawBody = await c.req.json();
     const modelName = extractModel(rawBody);
     if (!modelName) return c.json({ error: "Missing 'model' in request body" }, 400);
+    if (!canAccessModel(config, modelName, getRequestAuthToken(c, config.auth?.token))) return c.json({ error: `This token is not allowed to use model '${modelName}'` }, 403);
     const candidateModels = getCandidateModels(config, modelName);
-    if (candidateModels.length === 0) return c.json({ error: `Model '${modelName}' not found in config`, available: getPublicModelNames(config) }, 404);
+    if (candidateModels.length === 0) return c.json({ error: `Model '${modelName}' not found in config`, available: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)) }, 404);
     const requestId = getRequestId();
     const stream = isStreamRequest(rawBody);
     if (requestId) beginRecordedRequest({ requestId, path: c.req.path, headers: c.req.raw.headers, body: rawBody, stream });
@@ -914,9 +944,12 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
       return response;
     }
 
+    const accessDenied = rejectModelAccess(c, config, modelName);
+    if (accessDenied) return accessDenied;
+
     const candidateModels = getCandidateModels(config, modelName);
     if (candidateModels.length === 0) {
-      const errorBody = { error: `Model '${modelName}' not found in config`, available: getPublicModelNames(config) };
+      const errorBody = { error: `Model '${modelName}' not found in config`, available: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)) };
       const response = c.json(errorBody, 404);
       setRecordedRequestError({ message: errorBody.error });
       setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
@@ -1223,7 +1256,7 @@ app.get("/", (c) => {
   return c.json({
     ok: true,
     message: "nanollm gateway",
-    models: getPublicModelNames(config).map((name) => ({
+    models: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)).map((name) => ({
       name,
       provider: config.fallback[name] ? "fallback-group" : resolveModel(config, name)?.provider,
       model: config.fallback[name] ? config.fallback[name] : resolveModel(config, name)?.model,
@@ -1464,7 +1497,7 @@ app.get("/v1/models", (c) => {
   const config = configManager.getActiveSnapshot().effectiveConfig;
   return c.json({
     object: "list",
-    data: getPublicModelNames(config).map((name) => ({
+    data: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)).map((name) => ({
       id: name,
       object: "model",
       owned_by: config.fallback[name] ? "fallback-group" : resolveModel(config, name)?.provider,

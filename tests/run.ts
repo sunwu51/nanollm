@@ -26,8 +26,8 @@ import {
 import { UnsupportedContentError } from "../src/converters/shared.js";
 import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
-import { buildAuthCookieValue, extractBearerToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
-import { webAuth } from "../src/core/web-auth.js";
+import { buildAuthCookieValue, canAccessModel, extractBearerToken, extractRequestToken, getAccessibleModelNames, isAuthorizedToken, isScopedToken, readAuthCookie } from "../src/core/auth.js";
+import { getRequestAuthToken, webAuth } from "../src/core/web-auth.js";
 import { renderLoginPage, withWebUIAuth } from "../src/pages/login-page.js";
 import { resolveLang } from "../src/core/i18n.js";
 import { getPublicModelNames, loadConfig, parseConfigText, resolveFallbackModels, resolveModelForRequest } from "../src/core/config.js";
@@ -209,9 +209,9 @@ function writeTempConfig(yaml: string): string {
   return file;
 }
 
-function buildAuthTestApp(token?: string) {
+function buildAuthTestApp(token?: string, isScoped?: (candidate: string | undefined) => boolean) {
   const app = new Hono();
-  app.use("*", webAuth(() => token));
+  app.use("*", webAuth(() => token, isScoped));
   app.get("/health", (c) => c.json({ ok: true }));
   app.get("/status", (c) => c.text("status-page"));
   app.get("/record", (c) => c.text("record-page"));
@@ -220,6 +220,7 @@ function buildAuthTestApp(token?: string) {
   app.get("/jobs", (c) => c.text("jobs-page"));
   app.get("/admin/config/data", (c) => c.json({ ok: true }));
   app.get("/v1/models", (c) => c.json({ object: "list", data: [] }));
+  app.post("/v1/messages", (c) => c.json({ ok: true }));
   return app;
 }
 
@@ -4928,6 +4929,44 @@ await runAsync("status store aggregates success rate and averages by five-minute
   assert.equal(getHealthTone(cell.successRate, cell.totalRequests), "orange");
 });
 
+await runAsync("status stores calculate speed for non-streaming and mixed responses", async () => {
+  const dir = mkdtempSync(join(os.tmpdir(), "nanollm-status-speed-"));
+  const db = createTestSqliteClient(join(dir, "status.sqlite3"));
+  try {
+    const now = Date.now();
+    for (const store of [new StatusStore(), new SqliteStatusStore(db)]) {
+      const usage = { outputTokens: 100 };
+      store.recordAttempt("non-stream", now);
+      store.recordSuccess("non-stream", 2000, 300, usage, now);
+      const nonStream = (await store.getModelSeries("non-stream", now)).at(-1)!;
+      assert.equal(nonStream.avgTokenSpeed, 50);
+      assert.equal(nonStream.avgDurationMs, 2000);
+      assert.equal(nonStream.avgTtfbMs, 300);
+
+      store.recordAttempt("non-stream", now);
+      store.recordSuccess("non-stream", 4000, 1000, usage, now, 3000);
+      store.recordAttempt("non-stream", now);
+      store.recordFailure("non-stream", 10000, now);
+      const mixed = (await store.getModelSeries("non-stream", now)).at(-1)!;
+      assert.equal(mixed.avgTokenSpeed, 40);
+      assert.equal(mixed.totalStreamMs, 5000);
+      assert.equal(mixed.streamSamples, 2);
+
+      for (const duration of [0, -1, NaN, Infinity]) {
+        store.recordSuccess("invalid", duration, undefined, usage, now);
+      }
+      assert.equal((await store.getModelSeries("invalid", now)).at(-1)!.avgTokenSpeed, null);
+      store.recordSuccess("empty", 2000, undefined, { outputTokens: 0 }, now);
+      assert.equal((await store.getModelSeries("empty", now)).at(-1)!.avgTokenSpeed, null);
+      store.recordSuccess("zero-stream", 2000, 2000, usage, now, 0);
+      assert.equal((await store.getModelSeries("zero-stream", now)).at(-1)!.avgTokenSpeed, null);
+    }
+  } finally {
+    db.close();
+    removeTestDir(dir);
+  }
+});
+
 await runAsync("status store keeps only the last 6 hours of buckets", async () => {
   const store = new StatusStore();
   const now = Date.UTC(2026, 3, 19, 23, 55, 0);
@@ -5648,6 +5687,38 @@ models:
   const legacy = buildYamlTextFromAdminForm({ ...form, models: [{ ...model, body_expression: "", extras: { bodyExpression: "body" } }] });
   assert.match(legacy, /body_expression: body/);
   assert.doesNotMatch(legacy, /bodyExpression/);
+});
+
+run("admin config form round-trips model and fallback group auth tokens", () => {
+  const form = buildAdminConfigForm(`
+models:
+  - name: m1
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: k
+    model: m1
+    auth_token: \${TEAM_TOKEN}
+fallback:
+  plain: [m1]
+  team:
+    models: [m1]
+    auth_token: team-token
+`);
+  assert.equal(form.models[0].auth_token, "${TEAM_TOKEN}");
+  assert.deepEqual(form.models[0].extras, {});
+  assert.deepEqual(form.fallbackGroups, [
+    { name: "plain", members: ["m1"], auth_token: "" },
+    { name: "team", members: ["m1"], auth_token: "team-token" },
+  ]);
+  const yamlText = buildYamlTextFromAdminForm(form);
+  assert.match(yamlText, /auth_token: \$\{TEAM_TOKEN\}/);
+  assert.match(yamlText, /plain:\n    - m1/);
+  assert.match(yamlText, /team:\n    models:\n      - m1\n    auth_token: team-token/);
+  form.fallbackGroups[1].auth_token = " ";
+  form.models[0].auth_token = "";
+  const cleared = buildYamlTextFromAdminForm(form);
+  assert.doesNotMatch(cleared, /auth_token/);
+  assert.match(cleared, /team:\n    - m1/);
 });
 
 run("admin config form preserves provider, model and fallback order", () => {
@@ -6406,7 +6477,9 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.match(html, /function bindExpressionField/);
   assert.match(html, /bindExpressionField\(grid, model, "body_expression"/);
   assert.match(html, /bindExpressionField\(grid, model, "response_expression"/);
-  assert.match(html, /"bodyExpression", "responseExpression"\]\)/);
+  assert.match(html, /"bodyExpression", "responseExpression", "auth_token"\]\)/);
+  assert.match(html, /bindAuthTokenField\(grid, model, T\.modelAuthTokenHelper\)/);
+  assert.match(html, /bindAuthTokenField\(grid, group, T\.groupAuthTokenHelper\)/);
   assert.match(html, /function attachCardDrag/);
   assert.match(html, /attachCardDrag\(card, head, "provider", \(\) => formState\.providers, provider\)/);
   assert.match(html, /attachCardDrag\(card, head, "model", \(\) => formState\.models, model\)/);
@@ -6872,6 +6945,119 @@ await runAsync("auth middleware rejects unauthenticated requests when token is c
   const healthResponse = await app.request("http://localhost/health");
   assert.equal(healthResponse.status, 200);
   assert.deepEqual(await healthResponse.json(), { ok: true });
+});
+
+const SCOPED_AUTH_CONFIG = `
+server:
+  auth:
+    token: admin-token
+models:
+  - name: m1
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: k
+    model: m1
+    auth_token: m1-token
+  - name: m2
+    provider: anthropic
+    base_url: https://example.com/v1
+    api_key: k
+    model: m2
+  - name: wild-*
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: k
+    model: "*"
+    auth_token: \${NANOLLM_TEST_WILD_TOKEN}
+fallback:
+  plain: [m1, m2]
+  team:
+    models: [m1, m2]
+    auth_token: team-token
+`;
+
+run("config parses model and fallback group auth tokens in both fallback forms", () => {
+  process.env.NANOLLM_TEST_WILD_TOKEN = "wild-token";
+  const config = parseConfigText(SCOPED_AUTH_CONFIG);
+  assert.equal(config.models[0].auth_token, "m1-token");
+  assert.equal("auth_token" in config.models[1], false);
+  assert.equal(config.models[2].auth_token, "wild-token");
+  assert.deepEqual(config.fallback, { plain: ["m1", "m2"], team: ["m1", "m2"] });
+  assert.deepEqual(config.fallback_auth_tokens, { team: "team-token" });
+  assert.equal(parseConfigText("models: []\nfallback: {}\n").fallback_auth_tokens, undefined);
+  assert.throws(() => parseConfigText(`
+models:
+  - { name: m1, provider: openai-chat, base_url: https://example.com/v1, api_key: k, model: m1 }
+fallback:
+  team: { auth_token: t }
+`), /Fallback group 'team' must be a non-empty model array/);
+});
+
+run("model access allows the admin token and each name's own token only", () => {
+  process.env.NANOLLM_TEST_WILD_TOKEN = "wild-token";
+  const config = parseConfigText(SCOPED_AUTH_CONFIG);
+  const cases: Array<[string, string | undefined, boolean]> = [
+    ["m1", "admin-token", true], ["m1", "m1-token", true], ["m1", "team-token", false], ["m1", undefined, false],
+    ["m2", "admin-token", true], ["m2", "m1-token", false], ["m2", "team-token", false],
+    ["team", "admin-token", true], ["team", "team-token", true], ["team", "m1-token", false],
+    ["plain", "admin-token", true], ["plain", "m1-token", false], ["plain", "team-token", false],
+    ["wild-x", "wild-token", true], ["wild-x", "m1-token", false],
+    ["unknown", "m1-token", false], ["unknown", "admin-token", true],
+  ];
+  for (const [name, token, expected] of cases) {
+    assert.equal(canAccessModel(config, name, token), expected, `${name} with ${token}`);
+  }
+  assert.deepEqual(getAccessibleModelNames(config, "team-token"), ["team"]);
+  assert.deepEqual(getAccessibleModelNames(config, "m1-token"), ["m1"]);
+  assert.deepEqual(getAccessibleModelNames(config, "admin-token"), ["plain", "team", "m1", "m2", "wild-*"]);
+  assert.equal(isScopedToken(config, "m1-token"), true);
+  assert.equal(isScopedToken(config, "team-token"), true);
+  assert.equal(isScopedToken(config, "admin-token"), false);
+  assert.equal(isScopedToken(config, undefined), false);
+});
+
+run("model access keeps names with their own token locked without an admin token", () => {
+  const config = parseConfigText(SCOPED_AUTH_CONFIG.replace("  auth:\n    token: admin-token\n", ""));
+  assert.equal(config.auth, undefined);
+  assert.equal(canAccessModel(config, "m2", undefined), true);
+  assert.equal(canAccessModel(config, "plain", undefined), true);
+  assert.equal(canAccessModel(config, "m1", undefined), false);
+  assert.equal(canAccessModel(config, "m1", "m1-token"), true);
+  assert.equal(canAccessModel(config, "team", "m1-token"), false);
+  assert.deepEqual(getAccessibleModelNames(config, undefined), ["plain", "m2"]);
+});
+
+run("request token comes from bearer first, then x-api-key", () => {
+  assert.equal(extractRequestToken(new Headers({ authorization: "Bearer a" })), "a");
+  assert.equal(extractRequestToken(new Headers({ "x-api-key": " b " })), "b");
+  assert.equal(extractRequestToken(new Headers({ authorization: "Bearer a", "x-api-key": "b" })), "a");
+  assert.equal(extractRequestToken(new Headers({ "x-api-key": "" })), undefined);
+  assert.equal(extractRequestToken(new Headers()), undefined);
+});
+
+await runAsync("auth middleware accepts x-api-key and lets scoped tokens reach only model routes", async () => {
+  const app = buildAuthTestApp("top-secret", (candidate) => candidate === "model-token");
+  const post = (headers: Record<string, string>) => app.request("http://localhost/v1/messages", { method: "POST", headers });
+  assert.equal((await post({ "x-api-key": "top-secret" })).status, 200);
+  assert.equal((await post({ "x-api-key": "wrong" })).status, 401);
+  const scoped = await post({ "x-api-key": "model-token" });
+  assert.equal(scoped.status, 200);
+  assert.equal(scoped.headers.get("set-cookie"), null);
+  assert.equal((await app.request("http://localhost/v1/models", { headers: { authorization: "Bearer model-token" } })).status, 200);
+  assert.equal((await app.request("http://localhost/admin/config/data", { headers: { "x-api-key": "top-secret" } })).status, 200);
+  assert.equal((await app.request("http://localhost/admin/config/data", { headers: { "x-api-key": "model-token" } })).status, 401);
+  assert.equal((await app.request("http://localhost/status", { headers: { authorization: "Bearer model-token" } })).status, 302);
+});
+
+await runAsync("routes treat a signed-in browser cookie as the admin token for model access", async () => {
+  const app = new Hono();
+  app.get("/token", (c) => c.json({ token: getRequestAuthToken(c, "top-secret") ?? null }));
+  const token = async (headers: Record<string, string>) => (await (await app.request("http://localhost/token", { headers })).json()).token;
+  assert.equal(await token({ Cookie: "nanollm_auth=top-secret" }), "top-secret");
+  assert.equal(await token({ Cookie: "nanollm_auth=top-secret", authorization: "Bearer model-token" }), "top-secret");
+  assert.equal(await token({ Cookie: "nanollm_auth=stale", "x-api-key": "model-token" }), "model-token");
+  assert.equal(await token({ authorization: "Bearer model-token" }), "model-token");
+  assert.equal(await token({}), null);
 });
 
 await runAsync("WebUI login redirects pages, validates passwords, and preserves safe return paths", async () => {
