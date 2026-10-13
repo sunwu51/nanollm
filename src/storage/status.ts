@@ -71,7 +71,9 @@ function floorToFiveMinutes(timestamp: number): number {
   return Math.floor(timestamp / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
 }
 
-function getTokenSpeedDuration(durationMs: number, streamDurationMs?: number): number | undefined {
+function getTokenSpeedDuration(durationMs: number, streamDurationMs: number | undefined, usage: NormalizedUsage | undefined): number | undefined {
+  // Requests without output tokens (alpha search, images) would only add time and dilute the speed.
+  if (!((usage?.outputTokens ?? 0) > 0)) return undefined;
   // Non-streaming responses have no separate generation timing; use end-to-end latency.
   const speedDurationMs = streamDurationMs ?? durationMs;
   return Number.isFinite(speedDurationMs) && speedDurationMs > 0 ? speedDurationMs : undefined;
@@ -139,7 +141,7 @@ export class StatusStore {
       metrics.totalTtfbMs += ttfbMs;
       metrics.ttfbSamples += 1;
     }
-    const speedDurationMs = getTokenSpeedDuration(durationMs, streamDurationMs);
+    const speedDurationMs = getTokenSpeedDuration(durationMs, streamDurationMs, usage);
     if (speedDurationMs !== undefined) {
       metrics.totalStreamMs += speedDurationMs;
       metrics.streamSamples += 1;
@@ -369,7 +371,7 @@ export class SqliteStatusStore implements StatusStoreLike {
     timestamp = Date.now(),
     streamDurationMs?: number,
   ) {
-    const speedDurationMs = getTokenSpeedDuration(durationMs, streamDurationMs);
+    const speedDurationMs = getTokenSpeedDuration(durationMs, streamDurationMs, usage);
     this.addMetrics(modelName, timestamp, {
       successRequests: 1,
       totalDurationMs: durationMs,

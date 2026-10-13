@@ -4960,6 +4960,16 @@ await runAsync("status stores calculate speed for non-streaming and mixed respon
       assert.equal((await store.getModelSeries("empty", now)).at(-1)!.avgTokenSpeed, null);
       store.recordSuccess("zero-stream", 2000, 2000, usage, now, 0);
       assert.equal((await store.getModelSeries("zero-stream", now)).at(-1)!.avgTokenSpeed, null);
+
+      // Requests without usage (alpha search, images) don't add time to the speed.
+      store.recordSuccess("with-search", 2000, 300, usage, now);
+      store.recordSuccess("with-search", 8000, 7000, undefined, now);
+      store.recordSuccess("with-search", 8000, 7000, { outputTokens: 0 }, now, 1000);
+      const withSearch = (await store.getModelSeries("with-search", now)).at(-1)!;
+      assert.equal(withSearch.avgTokenSpeed, 50);
+      assert.equal(withSearch.totalStreamMs, 2000);
+      assert.equal(withSearch.streamSamples, 1);
+      assert.equal(withSearch.avgDurationMs, 6000);
     }
   } finally {
     db.close();
