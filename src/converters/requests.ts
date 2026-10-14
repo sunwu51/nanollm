@@ -607,6 +607,11 @@ function normalizeAnthropicSystem(system: any): NormalizedMessage {
 }
 
 function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
+  // Compatible Messages providers may also send system messages in the messages array.
+  const role = message.role as string;
+  if (role === "system") {
+    return [{ ...normalizeAnthropicSystem(message.content), role }];
+  }
   if (typeof message.content === "string") return [{ role: message.role, parts: [text(message.content)] }];
   if (message.role === "assistant") {
     const parts: NormalizedMessage["parts"] = [];
@@ -871,7 +876,7 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
           return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
         });
       
-      return contentParts.length > 0 ? [{ type: "message", role: message.role, content: contentParts }] : [];
+      return contentParts.length > 0 ? [{ type: "message", role: message.role === "system" ? "developer" : message.role, content: contentParts }] : [];
     }
     case "assistant": {
       const contentParts = message.parts

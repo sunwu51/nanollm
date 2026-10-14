@@ -843,6 +843,66 @@ run("string content survives chat to responses to chat", () => {
   assert.equal(chat.messages[0].content, "hello");
 });
 
+run("chat system messages map to responses instructions or developer input", () => {
+  const responses = chatParamsToResponsesRequest({
+    model: "gpt-5",
+    messages: [
+      { role: "system", content: "initial system" },
+      { role: "developer", content: "initial developer" },
+      { role: "user", content: "hello" },
+      { role: "system", content: "later system" },
+      { role: "assistant", content: "reply" },
+      { role: "developer", content: "later developer" },
+    ],
+  });
+
+  assert.equal(responses.instructions, "initial system\ninitial developer");
+  assert.deepEqual(responses.input, [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+    { type: "message", role: "developer", content: [{ type: "input_text", text: "later system" }] },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "reply", annotations: [] }] },
+    { type: "message", role: "developer", content: [{ type: "input_text", text: "later developer" }] },
+  ]);
+});
+
+run("anthropic system remains responses instructions without system input", () => {
+  const responses = anthropicMessageRequestToResponsesRequest({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    system: [{ type: "text", text: "first instruction" }, { type: "text", text: "second instruction" }],
+    messages: [{ role: "user", content: "hello" }],
+  });
+
+  assert.equal(responses.instructions, "first instruction\nsecond instruction");
+  assert.deepEqual(responses.input, [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+  ]);
+});
+
+run("anthropic system messages preserve roles for string and text block content", () => {
+  for (const useBlocks of [false, true]) {
+    const content = (value: string) => useBlocks ? [{ type: "text", text: value }] : value;
+    const responses = anthropicMessageRequestToResponsesRequest({
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      system: "top-level instruction",
+      messages: [
+        { role: "system", content: content("initial system") },
+        { role: "user", content: "hello" },
+        { role: "system", content: content("later system") },
+        { role: "assistant", content: "reply" },
+      ],
+    } as any);
+
+    assert.equal(responses.instructions, "top-level instruction\ninitial system");
+    assert.deepEqual(responses.input, [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "later system" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "reply", annotations: [] }] },
+    ]);
+  }
+});
+
 run("responses instructions developer role becomes chat system role", () => {
   const chat = responsesRequestToChatParams({
     model: "gpt-5",
