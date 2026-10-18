@@ -426,7 +426,7 @@ models:
     proxy: http://127.0.0.1:7891 # optional, overrides providers[*].proxy
 ```
 
-Priority: `models[*].proxy` > `providers[*].proxy` (only for models using `custom_provider`) > `HTTPS_PROXY` > `HTTP_PROXY` > direct connection. An empty or missing `proxy` falls through to the next level. `http://` and `https://` proxy URLs are supported, and `proxy` can be edited on the provider and model cards in the admin page.
+Priority: `models[*].proxy` > `providers[*].proxy` (only for models using `custom_provider`) > `HTTPS_PROXY` > `HTTP_PROXY` > direct connection. An empty or missing `proxy` falls through to the next level. `NO_PROXY` (or `no_proxy`) lists hosts that skip `HTTPS_PROXY` / `HTTP_PROXY` and connect directly, using curl matching: comma- or space-separated, `*` matches every host, `example.com` and `.example.com` also cover subdomains, and `host:port` only matches that port. It does not affect `models[*].proxy` or `providers[*].proxy`. `http://` and `https://` proxy URLs are supported, and `proxy` can be edited on the provider and model cards in the admin page.
 
 ### Wildcard model names
 
@@ -643,6 +643,7 @@ The main program is still built with `@yao-pkg/pkg` in enhanced SEA mode so that
 | `NANOLLM_SQLITE_URL` / `NANOLLM_SQLITE_AUTH_TOKEN` | Remote libSQL/quicSQL URL and token, only used with `--storage sqlite` |
 | `NANOLLM_SHUTDOWN_TIMEOUT_MS` | Graceful shutdown timeout, default 25000 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | Default proxy for upstream providers (see the HTTP proxy section for priority) |
+| `NO_PROXY` / `no_proxy` | Hosts that bypass `HTTPS_PROXY` / `HTTP_PROXY`, e.g. `localhost,127.0.0.1,.internal.example` |
 
 ## Project structure
 

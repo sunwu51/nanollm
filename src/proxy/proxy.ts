@@ -21,10 +21,11 @@ import {
 import { runInNewContext } from "node:vm";
 import { randomUUID } from "node:crypto";
 import { Agent, ProxyAgent, fetch as undiciFetch, type Dispatcher, type RequestInit as UndiciRequestInit } from "undici";
+import { resolveEnvProxy } from "../core/env-proxy.js";
 import { extractErrorCauses } from "../core/error-details.js";
 import { getClientIp, getClientRequestHeaders } from "../core/request-context.js";
 import { getCachedSubscriptionCredential, ensureSubscriptionCredential, SUBSCRIPTION_URL } from "../subscriptions/openai-subscription.js";
-import { getCurrentCodexVersion } from "../subscriptions/codex-version.js";
+import { CODEX_RELEASES_URL, getCurrentCodexVersion } from "../subscriptions/codex-version.js";
 import { CLAUDE_CODE_DEFAULT_HEADERS, CLAUDE_CODE_PLATFORM_HEADERS, CODEX_CLI_ORIGINATOR, CODEX_CLI_VERSION, buildCodexCliUserAgent } from "../subscriptions/subscription-client-compat.js";
 import { addClaudeBillingBlock } from "../subscriptions/claude-billing.js";
 import { applyClaudeSubscriptionSessionIdentity, hasClaudeMetadataUserId, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../subscriptions/claude-subscription-body.js";
@@ -569,14 +570,15 @@ function getForwardHeaders(config: ModelConfig, body: unknown, options?: Upstrea
   );
   if (config.claude_subscription_provider) applyClaudeSubscriptionHeaders(headers, isPlainObject(body) && body.stream === true);
   if (config.subscription_provider) {
-    applyCodexSubscriptionIdentityHeaders(headers, getCurrentCodexVersion(resolveProxyUrl(config)));
+    applyCodexSubscriptionIdentityHeaders(headers, getCurrentCodexVersion(resolveProxyUrl(config, CODEX_RELEASES_URL)));
     applyCodexSubscriptionHeaders(headers, body);
   }
   return mergeHeaders(headers, config.headers);
 }
 
-export function resolveProxyUrl(config: ModelConfig): string | undefined {
-  return config.proxy || config.provider_proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+/** Model proxy, then custom provider proxy, then the environment proxy unless `NO_PROXY` lists the target host. */
+export function resolveProxyUrl(config: ModelConfig, targetUrl = getUpstreamURL(config)): string | undefined {
+  return config.proxy || config.provider_proxy || resolveEnvProxy(targetUrl);
 }
 
 const upstreamAgents = {
@@ -659,7 +661,7 @@ async function upstreamFetchToUrl(
   options?: UpstreamRequestOptions,
   recordedRequestBody: unknown = typeof body === "string" ? body : "[binary body]",
 ): Promise<{ response: Response; timing: UpstreamTiming }> {
-  const proxyUrl = resolveProxyUrl(config);
+  const proxyUrl = resolveProxyUrl(config, url);
   const timeoutMs = config.ttfb_timeout;
   const abortController = timeoutMs !== undefined ? new AbortController() : undefined;
   let timeoutHandle: NodeJS.Timeout | undefined;
@@ -928,7 +930,7 @@ function getRawForwardHeaders(
     headers[key] = value;
   }
   const forwardHeaders = mergeHeaders(headers, getAuthHeaders(config), options?.userAgent ? { "User-Agent": options.userAgent } : undefined);
-  if (config.subscription_provider) applyCodexSubscriptionIdentityHeaders(forwardHeaders, getCurrentCodexVersion(resolveProxyUrl(config)));
+  if (config.subscription_provider) applyCodexSubscriptionIdentityHeaders(forwardHeaders, getCurrentCodexVersion(resolveProxyUrl(config, CODEX_RELEASES_URL)));
   return mergeHeaders(forwardHeaders, config.headers);
 }
 

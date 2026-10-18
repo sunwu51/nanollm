@@ -1,7 +1,7 @@
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { CODEX_CLI_VERSION } from "./subscription-client-compat.js";
 
-const RELEASES_URL = "https://api.github.com/repos/openai/codex/releases/latest";
+export const CODEX_RELEASES_URL = "https://api.github.com/repos/openai/codex/releases/latest";
 /** The Codex backend answers 404 to versions below this (sub2api #3901). */
 const CODEX_UPSTREAM_MIN_VERSION = "0.144.0";
 const SYNC_INTERVAL_MS = 6 * 60 * 60_000;
@@ -28,7 +28,7 @@ export function parseCodexReleaseVersion(tag: unknown): string | undefined {
 export async function fetchLatestCodexVersion(options: { url?: string; proxyUrl?: string } = {}): Promise<string> {
   const dispatcher = options.proxyUrl ? new ProxyAgent(options.proxyUrl) : undefined;
   try {
-    const response = await undiciFetch(options.url ?? RELEASES_URL, {
+    const response = await undiciFetch(options.url ?? CODEX_RELEASES_URL, {
       dispatcher,
       headers: { Accept: "application/vnd.github+json", "User-Agent": "nanollm" },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),

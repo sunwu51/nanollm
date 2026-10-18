@@ -48,6 +48,7 @@ import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "..
 import { renderRecordPage } from "../src/pages/record-page.js";
 import { renderStatusPage } from "../src/pages/status-page.js";
 import { handleServerStartupError } from "../src/core/startup-error.js";
+import { bypassesProxy, resolveEnvProxy } from "../src/core/env-proxy.js";
 import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
@@ -3463,6 +3464,68 @@ run("model proxy has higher priority than environment proxy", () => {
       process.env.HTTP_PROXY = previousHTTPProxy;
     }
   }
+});
+
+run("NO_PROXY matching follows curl: wildcards, domain suffixes, ports and IPv6", () => {
+  const list = "localhost, 127.0.0.1 ::1,.internal.example,*.corp.example,api.example.com:8443";
+  assert.equal(bypassesProxy("http://localhost:11434/v1", list), true);
+  assert.equal(bypassesProxy("http://LOCALHOST:11434/v1", list), true);
+  assert.equal(bypassesProxy("http://127.0.0.1:8080", list), true);
+  assert.equal(bypassesProxy("http://[::1]:8080", list), true);
+  assert.equal(bypassesProxy("https://gpu.internal.example/v1", list), true);
+  assert.equal(bypassesProxy("https://internal.example/v1", list), true);
+  assert.equal(bypassesProxy("https://a.b.corp.example", list), true);
+  assert.equal(bypassesProxy("https://notinternal.example", list), false);
+  assert.equal(bypassesProxy("https://api.example.com:8443/v1", list), true);
+  assert.equal(bypassesProxy("https://api.example.com/v1", list), false);
+  assert.equal(bypassesProxy("https://api.openai.com/v1", list), false);
+  assert.equal(bypassesProxy("https://example.com", "example.com:443"), true);
+  assert.equal(bypassesProxy("http://[::1]:8080", "[::1]:8080"), true);
+  assert.equal(bypassesProxy("http://[::1]:9090", "[::1]:8080"), false);
+  assert.equal(bypassesProxy("https://anything.example", "*"), true);
+  assert.equal(bypassesProxy("https://anything.example", ""), false);
+  assert.equal(bypassesProxy("not a url", "*"), false);
+});
+
+run("environment proxy skips hosts listed in NO_PROXY or no_proxy", () => {
+  const proxy = "http://127.0.0.1:7890";
+  assert.equal(resolveEnvProxy("http://localhost:11434/v1", { HTTPS_PROXY: proxy, NO_PROXY: "localhost,127.0.0.1" }), undefined);
+  assert.equal(resolveEnvProxy("http://localhost:11434/v1", { HTTP_PROXY: proxy, no_proxy: "localhost" }), undefined);
+  assert.equal(resolveEnvProxy("https://api.openai.com/v1", { HTTPS_PROXY: proxy, NO_PROXY: "localhost" }), proxy);
+  assert.equal(resolveEnvProxy("https://api.openai.com/v1", { HTTPS_PROXY: proxy, HTTP_PROXY: "http://other:1" }), proxy);
+  assert.equal(resolveEnvProxy("https://api.openai.com/v1", { HTTP_PROXY: proxy }), proxy);
+  assert.equal(resolveEnvProxy("https://api.openai.com/v1", { NO_PROXY: "localhost" }), undefined);
+});
+
+run("model proxy resolution honors NO_PROXY only for the environment fallback", () => {
+  const saved = { HTTPS_PROXY: process.env.HTTPS_PROXY, HTTP_PROXY: process.env.HTTP_PROXY, NO_PROXY: process.env.NO_PROXY, no_proxy: process.env.no_proxy };
+  try {
+    process.env.HTTPS_PROXY = "http://env-https-proxy.example:8080";
+    delete process.env.HTTP_PROXY;
+    delete process.env.no_proxy;
+    process.env.NO_PROXY = "localhost,127.0.0.1";
+    const local = { name: "ollama", provider: "openai-chat", base_url: "http://localhost:11434/v1", api_key: "", model: "llama3" } as const;
+    assert.equal(resolveProxyUrl(local), undefined);
+    assert.equal(resolveProxyUrl({ ...local, proxy: "http://model-proxy.example:7890" }), "http://model-proxy.example:7890");
+    assert.equal(resolveProxyUrl({ ...local, provider_proxy: "http://provider-proxy.example:7890" }), "http://provider-proxy.example:7890");
+    assert.equal(resolveProxyUrl({ ...local, base_url: "https://api.openai.com/v1" }), "http://env-https-proxy.example:8080");
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+await runAsync("fetchUpstreamModels reaches NO_PROXY hosts directly instead of through the environment proxy", async () => {
+  await withHTTPServer((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ id: "llama3" }] }));
+  }, async (baseURL) => {
+    // Nothing listens on port 9, so the request would fail if it went through the proxy.
+    const env = { HTTPS_PROXY: "http://127.0.0.1:9", HTTP_PROXY: "http://127.0.0.1:9", NO_PROXY: "127.0.0.1,localhost" };
+    assert.deepEqual(await fetchUpstreamModels({ provider: "openai-chat", base_url: baseURL + "/v1", api_key: "" }, { env }), ["llama3"]);
+  });
 });
 
 run("config applies server-level ttfb_timeout and model override", () => {

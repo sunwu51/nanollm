@@ -1,5 +1,6 @@
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { resolveEnvVars } from "../core/config.js";
+import { resolveEnvProxy } from "../core/env-proxy.js";
 import { localize } from "../core/i18n.js";
 
 export interface UpstreamModelsRequest {
@@ -33,8 +34,8 @@ function buildHeaders(provider: string, apiKey: string): Record<string, string> 
   return { Authorization: `Bearer ${apiKey}` };
 }
 
-function resolveProxy(proxy: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
-  const value = proxy?.trim() || env.HTTPS_PROXY || env.HTTP_PROXY;
+function resolveProxy(proxy: string | undefined, targetUrl: string, env: NodeJS.ProcessEnv): string | undefined {
+  const value = proxy?.trim() || resolveEnvProxy(targetUrl, env);
   if (!value) return undefined;
   let url: URL;
   try {
@@ -57,7 +58,7 @@ export async function fetchUpstreamModels(
   if (!baseUrl) throw new Error(localize("请先填写 base_url", "Enter base_url first"));
   const apiKey = resolveEnvVars(request.api_key ?? "").trim();
   const headers = buildHeaders(provider, apiKey);
-  const proxyUrl = resolveProxy(request.proxy, options.env ?? process.env);
+  const proxyUrl = resolveProxy(request.proxy, baseUrl, options.env ?? process.env);
   const dispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
 
   const ids: string[] = [];
