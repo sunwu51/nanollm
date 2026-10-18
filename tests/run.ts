@@ -7828,6 +7828,202 @@ await runAsync("fetchUpstreamModels reports upstream errors and invalid input", 
   await assert.rejects(fetchUpstreamModels({ provider: "openai-chat", base_url: " ", api_key: "" }), /base_url/);
 });
 
+/** Minimal DOM element for running the admin config page script; supports what rendering and card toggles touch. */
+class FakeAdminElement {
+  children: FakeAdminElement[] = [];
+  parent?: FakeAdminElement;
+  className = "";
+  dataset: Record<string, string> = {};
+  style: Record<string, string> = {};
+  hidden = false;
+  disabled = false;
+  value = "";
+  checked = false;
+  type = "";
+  title = "";
+  private text = "";
+  private readonly attributes = new Map<string, string>();
+  private readonly listeners = new Map<string, Array<(event: unknown) => void>>();
+
+  constructor(readonly tagName: string) {}
+
+  get textContent(): string {
+    return this.text + this.children.map((child) => child.textContent).join("");
+  }
+
+  set textContent(value: string) {
+    this.children = [];
+    this.text = value;
+  }
+
+  get firstChild() {
+    return this.children[0] ?? null;
+  }
+
+  get classList() {
+    const names = () => new Set(this.className.split(/\s+/).filter(Boolean));
+    return {
+      contains: (name: string) => names().has(name),
+      add: (...items: string[]) => { this.className = [...names(), ...items].join(" "); },
+      remove: (...items: string[]) => { this.className = [...names()].filter((item) => !items.includes(item)).join(" "); },
+      toggle: (name: string, force?: boolean) => {
+        const set = names();
+        if (force ?? !set.has(name)) set.add(name); else set.delete(name);
+        this.className = [...set].join(" ");
+      },
+    };
+  }
+
+  appendChild(child: FakeAdminElement) {
+    child.parent = this;
+    this.children.push(child);
+    return child;
+  }
+
+  append(...children: Array<FakeAdminElement | string>) {
+    for (const child of children) {
+      this.appendChild(typeof child === "string" ? Object.assign(new FakeAdminElement("#text"), { textContent: child }) : child);
+    }
+  }
+
+  insertBefore(child: FakeAdminElement, reference: FakeAdminElement | null) {
+    child.parent = this;
+    const index = reference ? this.children.indexOf(reference) : -1;
+    if (index < 0) this.children.push(child); else this.children.splice(index, 0, child);
+    return child;
+  }
+
+  remove() {
+    if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this);
+  }
+
+  setAttribute(name: string, value: string) {
+    this.attributes.set(name, String(value));
+  }
+
+  getAttribute(name: string) {
+    return this.attributes.get(name) ?? null;
+  }
+
+  addEventListener(type: string, listener: (event: unknown) => void) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  click() {
+    if (!this.disabled) this.listeners.get("click")?.forEach((listener) => listener({ preventDefault() {}, stopPropagation() {} }));
+  }
+
+  focus() {}
+  scrollIntoView() {}
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+
+  findAll(predicate: (element: FakeAdminElement) => boolean): FakeAdminElement[] {
+    return this.children.flatMap((child) => [...(predicate(child) ? [child] : []), ...child.findAll(predicate)]);
+  }
+}
+
+/**
+ * Run the admin config page script against a fake DOM with two subscription providers and one plain provider.
+ * `statusResponse` answers each `/device-login/status` request; every requested status URL is recorded.
+ */
+function runAdminConfigPageScript(statusResponse: () => { ok: boolean; body: unknown }) {
+  const form = {
+    server: { port: "3000", ttfb_timeout: "" },
+    record: { max_size: "10" },
+    providers: [
+      { name: "codex", provider: "openai-subscription", base_url: "", api_key: "" },
+      { name: "claude", provider: "claude-subscription", base_url: "", api_key: "" },
+      { name: "plain", provider: "openai-chat", base_url: "https://example.com/v1", api_key: "k" },
+    ],
+    models: [],
+    fallbackGroups: [],
+  };
+  const payload = {
+    version: 1,
+    configPath: "config.yaml",
+    effectiveConfig: { port: 3000, models: [], providers: [], fallback: {}, record: { max_size: 10 } },
+    requiresRestartFields: [],
+    form,
+  };
+  const html = renderAdminConfigPage(payload, "en");
+  const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]).find((body) => body.includes("providers-container"));
+  assert.ok(script, "admin config page script");
+  const elements = new Map<string, FakeAdminElement>();
+  const getElement = (id: string) => {
+    if (!elements.has(id)) elements.set(id, new FakeAdminElement("div"));
+    return elements.get(id)!;
+  };
+  const statusRequests: string[] = [];
+  vm.runInContext(script, vm.createContext({
+    document: {
+      body: new FakeAdminElement("body"),
+      activeElement: null,
+      getElementById: getElement,
+      createElement: (tagName: string) => new FakeAdminElement(tagName),
+      createTextNode: (text: string) => Object.assign(new FakeAdminElement("#text"), { textContent: text }),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    },
+    window: { scrollX: 0, scrollY: 0, scrollTo() {}, addEventListener() {}, alert() {}, confirm: () => true },
+    performance: { getEntriesByType: () => [] },
+    requestAnimationFrame: () => 0,
+    fetch: async (url: string) => {
+      if (url === "/admin/config/data") return { ok: true, json: async () => payload };
+      assert.match(url, /\/device-login\/status$/);
+      statusRequests.push(url);
+      const { ok, body } = statusResponse();
+      return { ok, json: async () => body };
+    },
+  }));
+  const providers = getElement("providers-container");
+  return {
+    statusRequests,
+    toggleCard: (index: number) => providers.findAll((element) => element.className === "card-toggle")[index].click(),
+    signedInLabels: () => providers.findAll((element) => element.className === "success").map((element) => element.textContent),
+    clickRefresh: () => getElement("refresh-button").click(),
+  };
+}
+
+const settleAdminPage = () => new Promise((resolve) => setImmediate(resolve));
+const CODEX_AND_CLAUDE_STATUS = ["/admin/providers/codex/device-login/status", "/admin/providers/claude/device-login/status"];
+
+await runAsync("admin page reuses subscription sign-in status when cards expand or collapse", async () => {
+  const page = runAdminConfigPageScript(() => ({ ok: true, body: { authenticated: true, expiresAt: Date.now() + 3_600_000 } }));
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, CODEX_AND_CLAUDE_STATUS);
+  assert.deepEqual(page.signedInLabels(), ["Signed in", "Signed in"]);
+
+  page.toggleCard(2);
+  page.toggleCard(0);
+  page.toggleCard(0);
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, CODEX_AND_CLAUDE_STATUS);
+  assert.deepEqual(page.signedInLabels(), ["Signed in", "Signed in"]);
+
+  page.clickRefresh();
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, [...CODEX_AND_CLAUDE_STATUS, ...CODEX_AND_CLAUDE_STATUS]);
+});
+
+await runAsync("admin page re-queries subscription status after a failed lookup or an expired credential", async () => {
+  let response = { ok: false, body: { error: "boom" } as unknown };
+  const page = runAdminConfigPageScript(() => response);
+  await settleAdminPage();
+  assert.deepEqual(page.signedInLabels(), []);
+
+  response = { ok: true, body: { authenticated: true, expiresAt: Date.now() + 50 } };
+  page.toggleCard(2);
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, [...CODEX_AND_CLAUDE_STATUS, ...CODEX_AND_CLAUDE_STATUS]);
+  assert.deepEqual(page.signedInLabels(), ["Signed in", "Signed in"]);
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  page.toggleCard(2);
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, [...CODEX_AND_CLAUDE_STATUS, ...CODEX_AND_CLAUDE_STATUS, ...CODEX_AND_CLAUDE_STATUS]);
+});
+
 run("admin page disables testing unsaved models and groups custom provider models", () => {
   const html = renderAdminConfigPage({
     version: 1,

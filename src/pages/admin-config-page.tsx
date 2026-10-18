@@ -1033,6 +1033,35 @@ const SCRIPT = /* js */ String.raw`
       let draggedCard = null;
       // Provider names whose grouped model card is expanded; groups are collapsed by default.
       const expandedModelGroups = new Set();
+      // Sign-in status lookups per subscription provider ("type:name"), kept across renders so that expanding or
+      // collapsing any card does not query every subscription provider again. Cleared when the saved config reloads.
+      const subscriptionStatusCache = new Map();
+
+      function subscriptionStatusKey(provider) {
+        return provider.provider + ":" + provider.name;
+      }
+
+      function loadSubscriptionStatus(provider) {
+        const key = subscriptionStatusKey(provider);
+        const cached = subscriptionStatusCache.get(key);
+        if (cached && !(cached.expiresAt && cached.expiresAt <= Date.now())) return cached.request;
+        const entry = { expiresAt: null, request: null };
+        entry.request = fetch("/admin/providers/" + encodeURIComponent(provider.name) + "/device-login/status", { cache: "no-store" })
+          .then((response) => {
+            if (!response.ok) throw new Error(T.statusUnknown);
+            return response.json();
+          })
+          .then((value) => {
+            entry.expiresAt = value.authenticated ? value.expiresAt : null;
+            return value;
+          });
+        // Forget failed lookups so the next render retries instead of replaying the error.
+        entry.request.catch(() => {
+          if (subscriptionStatusCache.get(key) === entry) subscriptionStatusCache.delete(key);
+        });
+        subscriptionStatusCache.set(key, entry);
+        return entry.request;
+      }
 
       function nextId(prefix) {
         localIdCounter += 1;
@@ -1555,7 +1584,10 @@ const SCRIPT = /* js */ String.raw`
           actions.className = "card-actions";
           if (SUBSCRIPTION_PROVIDERS.includes(provider.provider)) {
             const isClaude = provider.provider === "claude-subscription";
-            const markAuthenticated = () => { status.textContent = T.signedIn; status.className = "success"; loginButton.textContent = T.signInAgain; usageButton.hidden = false; };
+            const markAuthenticated = () => {
+              // The next render re-reads the new credential's expiry from the server.
+              subscriptionStatusCache.delete(subscriptionStatusKey(provider));
+              status.textContent = T.signedIn; status.className = "success"; loginButton.textContent = T.signInAgain; usageButton.hidden = false; };
             const status = document.createElement("span");
             status.className = "meta";
             status.textContent = T.checkingSignIn;
@@ -1632,8 +1664,7 @@ const SCRIPT = /* js */ String.raw`
               finally { usageButton.disabled = false; usageButton.textContent = T.checkUsage; }
             });
             usageButton.hidden = true;
-            fetch("/admin/providers/" + encodeURIComponent(provider.name) + "/device-login/status")
-              .then((response) => response.json())
+            loadSubscriptionStatus(provider)
               .then((value) => {
                 status.textContent = value.authenticated ? T.signedIn : T.notSignedIn;
                 status.className = value.authenticated ? "success" : "meta";
@@ -2935,6 +2966,7 @@ const SCRIPT = /* js */ String.raw`
         }
         currentSnapshot = payload;
         formState = hydrateForm(payload.form);
+        subscriptionStatusCache.clear();
         markDirty(false);
         renderAll();
         return payload;
@@ -2984,6 +3016,7 @@ const SCRIPT = /* js */ String.raw`
               currentSnapshot = payload.currentSnapshot;
               if (response.status === 409) {
                 formState = hydrateForm(payload.currentSnapshot.form);
+                subscriptionStatusCache.clear();
               }
               renderAll();
             }
@@ -2997,6 +3030,7 @@ const SCRIPT = /* js */ String.raw`
 
           currentSnapshot = payload.snapshot;
           formState = hydrateForm(payload.snapshot.form);
+          subscriptionStatusCache.clear();
           markDirty(false);
           renderAll();
           if (payload.requiresRestartFields.length > 0) {
