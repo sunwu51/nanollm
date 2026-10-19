@@ -219,6 +219,26 @@ export function createResponsesCustomToolSchema(format?: unknown): Record<string
   };
 }
 
+// Responses clients often drop reasoning summaries from history but send
+// encrypted_content back verbatim, so thinking converted from another protocol
+// is also carried there (with its signature) under a nanollm-specific prefix.
+const REASONING_CARRIER_PREFIX = "nanollm.reasoning.v1:";
+
+export function encodeReasoningCarrier(thinking: string, signature?: string): string {
+  return REASONING_CARRIER_PREFIX + Buffer.from(JSON.stringify({ thinking, ...(signature ? { signature } : {}) }), "utf8").toString("base64");
+}
+
+export function decodeReasoningCarrier(value: unknown): { thinking: string; signature?: string } | undefined {
+  if (typeof value !== "string" || !value.startsWith(REASONING_CARRIER_PREFIX)) return undefined;
+  try {
+    const parsed = JSON.parse(Buffer.from(value.slice(REASONING_CARRIER_PREFIX.length), "base64").toString("utf8"));
+    if (typeof parsed?.thinking !== "string") return undefined;
+    return { thinking: parsed.thinking, ...(typeof parsed.signature === "string" && parsed.signature ? { signature: parsed.signature } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
 export function wrapResponsesCustomToolInput(input: unknown): string {
   return JSON.stringify({ content: stringifyCustomToolValue(input) });
 }

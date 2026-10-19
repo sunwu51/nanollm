@@ -15,6 +15,7 @@ import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages/mes
 import {
   collapseText,
   createResponsesCustomToolSchema,
+  decodeReasoningCarrier,
   fail,
   joinOpenAIResponsesNamespacePath,
   makeDataUrl,
@@ -474,9 +475,15 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
     if (itemType === "message") return [normalizeOpenAIResponsesMessage(item)];
     if (itemType === "agent_message") return [normalizeOpenAIResponsesAgentMessage(item)];
     if (itemType === "reasoning") {
-      const reasoningParts = Array.isArray(item.summary) && item.summary.length > 0 ? item.summary : Array.isArray(item.content) ? item.content : [];
+      // Thinking nanollm converted from another protocol comes back intact (with its
+      // signature) even when the client dropped the summary.
+      const carried = decodeReasoningCarrier(item.encrypted_content);
+      if (carried) return [{ role: "assistant", parts: [{ type: "thinking", thinking: carried.thinking, signature: carried.signature }] }];
+      // Same priority as the response side: raw reasoning text first, summary as fallback.
+      const reasoningParts = Array.isArray(item.content) && item.content.length > 0 ? item.content : Array.isArray(item.summary) ? item.summary : [];
       const thinking = reasoningParts.map((part: any) => ({ type: "thinking" as const, thinking: part.text }));
-      const redactedThinking = item.encrypted_content && thinking.length === 0 ? [{ type: "redacted_thinking" as const, data: item.encrypted_content }] : [];
+      // Native encrypted reasoning is independent of any readable content or summary.
+      const redactedThinking = item.encrypted_content ? [{ type: "redacted_thinking" as const, data: item.encrypted_content }] : [];
       return [{
         role: "assistant",
         parts: [...thinking, ...redactedThinking],

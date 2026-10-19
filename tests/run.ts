@@ -23,7 +23,7 @@ import {
   responsesResponseToAnthropicMessage,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
-import { UnsupportedContentError } from "../src/converters/shared.js";
+import { decodeReasoningCarrier, encodeReasoningCarrier, UnsupportedContentError } from "../src/converters/shared.js";
 import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, canAccessModel, extractBearerToken, extractRequestToken, getAccessibleModelNames, isAuthorizedToken, isScopedToken, readAuthCookie } from "../src/core/auth.js";
@@ -1191,6 +1191,79 @@ run("chat stream restores converted custom tools in responses events", () => {
   });
 });
 
+function responsesReasoningTextStream(options: { deltas?: boolean; summary?: boolean } = {}) {
+  const { deltas = true, summary = false } = options;
+  const reasoningItem = {
+    id: "rs_raw",
+    type: "reasoning",
+    status: "completed",
+    summary: summary ? [{ type: "summary_text", text: "Short summary." }] : [],
+    content: [{ type: "reasoning_text", text: "Re-render the table." }],
+    encrypted_content: "opaque",
+  };
+  const messageItem = { id: "msg_raw", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Fixed.", annotations: [] }] };
+  return [
+    { type: "response.created", response: { id: "resp_raw", object: "response", created_at: 1, model: "gpt-oss", status: "in_progress", output: [], usage: null } },
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_raw", type: "reasoning", status: "in_progress", summary: [] } },
+    ...(deltas
+      ? [
+          ...(summary ? [{ type: "response.reasoning_summary_text.delta", item_id: "rs_raw", output_index: 0, summary_index: 0, delta: "Short summary." }] : []),
+          { type: "response.content_part.added", item_id: "rs_raw", output_index: 0, content_index: 0, part: { type: "reasoning_text", text: "" } },
+          { type: "response.reasoning_text.delta", item_id: "rs_raw", output_index: 0, content_index: 0, delta: "Re-render " },
+          { type: "response.reasoning_text.delta", item_id: "rs_raw", output_index: 0, content_index: 0, delta: "the table." },
+          { type: "response.reasoning_text.done", item_id: "rs_raw", output_index: 0, content_index: 0, text: "Re-render the table." },
+          { type: "response.content_part.done", item_id: "rs_raw", output_index: 0, content_index: 0, part: { type: "reasoning_text", text: "Re-render the table." } },
+        ]
+      : []),
+    { type: "response.output_item.done", output_index: 0, item: reasoningItem },
+    { type: "response.output_item.added", output_index: 1, item: { ...messageItem, status: "in_progress", content: [] } },
+    { type: "response.content_part.added", item_id: "msg_raw", output_index: 1, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+    { type: "response.output_text.delta", item_id: "msg_raw", output_index: 1, content_index: 0, delta: "Fixed." },
+    { type: "response.content_part.done", item_id: "msg_raw", output_index: 1, content_index: 0, part: { type: "output_text", text: "Fixed.", annotations: [] } },
+    { type: "response.output_item.done", output_index: 1, item: messageItem },
+    { type: "response.completed", response: { id: "resp_raw", object: "response", created_at: 1, model: "gpt-oss", status: "completed", output: [reasoningItem, messageItem], usage: null } },
+  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+function chatReasoningAndContent(stream: string) {
+  const converter = createSSEConverter("openai-responses", "openai-chat");
+  const deltas = parseSSEObjects([...converter.push(stream), ...converter.flush()])
+    .flatMap((event) => event.data.choices ?? [])
+    .map((choice: any) => choice.delta ?? {});
+  return {
+    reasoning: deltas.map((delta: any) => delta.reasoning_content ?? "").join(""),
+    content: deltas.map((delta: any) => delta.content ?? "").join(""),
+  };
+}
+
+run("responses stream reasoning_text becomes chat reasoning_content", () => {
+  assert.deepEqual(chatReasoningAndContent(responsesReasoningTextStream()), { reasoning: "Re-render the table.", content: "Fixed." });
+});
+
+run("responses stream reasoning only in output_item.done still reaches chat", () => {
+  assert.deepEqual(chatReasoningAndContent(responsesReasoningTextStream({ deltas: false })), { reasoning: "Re-render the table.", content: "Fixed." });
+});
+
+run("responses stream with both summary and reasoning_text keeps a single copy", () => {
+  assert.deepEqual(chatReasoningAndContent(responsesReasoningTextStream({ summary: true })), { reasoning: "Short summary.", content: "Fixed." });
+});
+
+run("responses stream reasoning_text becomes an anthropic thinking block", () => {
+  for (const deltas of [true, false]) {
+    const converter = createSSEConverter("openai-responses", "anthropic");
+    const events = parseSSEObjects([...converter.push(responsesReasoningTextStream({ deltas })), ...converter.flush()]).map((event) => event.data);
+    const starts = events.filter((event) => event.type === "content_block_start");
+    assert.deepEqual(starts.map((event) => event.content_block.type), ["thinking", "text"]);
+    const thinkingIndex = starts[0].index;
+    const thinking = events
+      .filter((event) => event.type === "content_block_delta" && event.index === thinkingIndex)
+      .map((event) => event.delta.thinking)
+      .join("");
+    assert.equal(thinking, "Re-render the table.");
+    assert.equal(events.filter((event) => event.type === "content_block_stop" && event.index === thinkingIndex).length, 1);
+  }
+});
+
 run("responses custom tool stream preserves windows paths through chat arguments", () => {
   const converter = createSSEConverter("openai-responses", "openai-chat");
   const input = "*** Begin Patch\n*** Update File: C:\\temp\\docs\\file.md\n*** End Patch\n";
@@ -1278,6 +1351,73 @@ run("responses stream namespaced mcp function calls become qualified chat tool n
     .find(Boolean);
 
   assert.equal(toolName, "mcp__mcpcenter___n1a2n3o_calendar_get_events");
+});
+
+run("reasoning carrier round-trips thinking and signature and ignores foreign encrypted content", () => {
+  assert.deepEqual(decodeReasoningCarrier(encodeReasoningCarrier("想一想 | think", "sig_1")), { thinking: "想一想 | think", signature: "sig_1" });
+  assert.deepEqual(decodeReasoningCarrier(encodeReasoningCarrier("no signature")), { thinking: "no signature" });
+  assert.equal(decodeReasoningCarrier("gAAAAABopenai-encrypted"), undefined);
+  assert.equal(decodeReasoningCarrier("nanollm.reasoning.v1:not-json"), undefined);
+  assert.equal(decodeReasoningCarrier(null), undefined);
+});
+
+run("anthropic stream thinking signature is carried in responses encrypted_content", () => {
+  const converter = createSSEConverter("anthropic", "openai-responses");
+  const events = parseSSEObjects([
+    ...converter.push(
+      [
+        { type: "message_start", message: { id: "msg_sig", type: "message", role: "assistant", model: "deepseek", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } },
+        { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Need the " } },
+        { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "weather tool." } },
+        { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "46faa449-sig" } },
+        { type: "content_block_stop", index: 0 },
+        { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "call_sig", name: "weather", input: {} } },
+        { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"city\":\"Singapore\"}" } },
+        { type: "content_block_stop", index: 1 },
+        { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } },
+        { type: "message_stop" },
+      ].map((event) => `event: ${event.type}
+data: ${JSON.stringify(event)}
+
+`).join(""),
+    ),
+    ...converter.flush(),
+  ]).map((event) => event.data);
+
+  const reasoningDone = events.find((event) => event.type === "response.output_item.done" && event.item.type === "reasoning");
+  assert.deepEqual(reasoningDone?.item.summary, [{ type: "summary_text", text: "Need the weather tool." }]);
+  assert.deepEqual(decodeReasoningCarrier(reasoningDone?.item.encrypted_content), { thinking: "Need the weather tool.", signature: "46faa449-sig" });
+  const completed = events.find((event) => event.type === "response.completed");
+  assert.equal(completed?.response.output[0].encrypted_content, reasoningDone?.item.encrypted_content);
+});
+
+function responsesToolTurnWithCarriedReasoning() {
+  return {
+    model: "deepseek",
+    input: [
+      { role: "user", content: "weather in Singapore?" },
+      // The client kept encrypted_content but dropped the display-only summary.
+      { type: "reasoning", summary: [], encrypted_content: encodeReasoningCarrier("Need the weather tool.", "46faa449-sig") },
+      { type: "function_call", call_id: "call_sig", name: "weather", arguments: "{\"city\":\"Singapore\"}" },
+      { type: "function_call_output", call_id: "call_sig", output: "sunny" },
+    ],
+  } as any;
+}
+
+run("responses request carried reasoning restores signed thinking before anthropic tool_use", () => {
+  const anthropic = responsesRequestToAnthropicMessageRequest(responsesToolTurnWithCarriedReasoning());
+  const assistant = (anthropic.messages as any[]).find((message) => message.role === "assistant");
+  assert.deepEqual(assistant.content.map((block: any) => block.type), ["thinking", "tool_use"]);
+  assert.equal(assistant.content[0].thinking, "Need the weather tool.");
+  assert.equal(assistant.content[0].signature, "46faa449-sig");
+});
+
+run("responses request carried reasoning restores chat reasoning_content on the tool call turn", () => {
+  const chat = responsesRequestToChatParams(responsesToolTurnWithCarriedReasoning());
+  const assistant = (chat.messages as any[]).find((message) => message.role === "assistant");
+  assert.equal(assistant.reasoning_content, "Need the weather tool.");
+  assert.equal(assistant.tool_calls[0].id, "call_sig");
 });
 
 run("anthropic stream qualified mcp tool_use becomes responses namespaced function_call events", () => {
@@ -2246,7 +2386,7 @@ run("anthropic request thinking block is not synthesized as responses reasoning 
   assert.equal((input[0] as any).content[0].text, "Let me check.");
 });
 
-run("anthropic response thinking block is preserved in responses response without encrypted content", () => {
+run("anthropic response thinking block is carried in responses summary and encrypted_content", () => {
   const responses = anthropicMessageToResponsesResponse({
     id: "msg_thinking",
     type: "message",
@@ -2284,7 +2424,7 @@ run("anthropic response thinking block is preserved in responses response withou
   assert.match((responses.output[0] as any).id, /^rs_/);
   assert.deepEqual((responses.output[0] as any).summary, [{ type: "summary_text", text: "Need to reason first." }]);
   assert.equal((responses.output[0] as any).content, undefined);
-  assert.equal((responses.output[0] as any).encrypted_content, undefined);
+  assert.deepEqual(decodeReasoningCarrier((responses.output[0] as any).encrypted_content), { thinking: "Need to reason first.", signature: "sig_resp" });
   assert.equal((responses.output[1] as any).type, "message");
   assert.equal(((responses.output[1] as any).content[0] ?? {}).text, "final answer");
 });
@@ -2334,10 +2474,57 @@ run("responses request reasoning block keeps empty signature when invalid histor
 
   const content = (anthropic.messages as any[])[0].content ?? [];
   assert.equal(content[0].type, "thinking");
-  assert.equal(content[0].thinking, "internal summary");
+  assert.equal(content[0].thinking, "internal detail");
   assert.equal(content[0].signature, "");
   assert.equal(content[1].type, "text");
   assert.equal(content[1].text, "visible answer");
+});
+
+for (const source of ["content", "summary"] as const) {
+  run(`responses request reasoning preserves encrypted content alongside ${source}`, () => {
+    const normalized = normalizeOpenAIResponsesRequest({
+      model: "gpt-5",
+      input: [{
+        type: "reasoning",
+        [source]: [{ type: source === "content" ? "reasoning_text" : "summary_text", text: "readable thinking" }],
+        encrypted_content: "gAAAAABupstream-encrypted",
+      }],
+    } as any);
+
+    assert.deepEqual(normalized.messages[0].parts, [
+      { type: "thinking", thinking: "readable thinking" },
+      { type: "redacted_thinking", data: "gAAAAABupstream-encrypted" },
+    ]);
+  });
+}
+
+run("responses request reasoning preserves encrypted content without plaintext", () => {
+  const normalized = normalizeOpenAIResponsesRequest({
+    model: "gpt-5",
+    input: [{ type: "reasoning", summary: [], encrypted_content: "gAAAAABupstream-encrypted" }],
+  } as any);
+
+  assert.deepEqual(normalized.messages[0].parts, [
+    { type: "redacted_thinking", data: "gAAAAABupstream-encrypted" },
+  ]);
+});
+
+run("responses request reasoning prefers content and falls back to summary in chat history", () => {
+  const toChatReasoning = (reasoning: any) => {
+    const chat = responsesRequestToChatParams({
+      model: "gpt-oss",
+      input: [
+        { role: "user", content: "hi" },
+        { type: "reasoning", ...reasoning },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "visible answer" }] },
+      ],
+    } as any);
+    return (chat.messages as any[]).find((message) => message.role === "assistant")?.reasoning_content;
+  };
+  assert.equal(toChatReasoning({ summary: [{ type: "summary_text", text: "internal summary" }], content: [{ type: "reasoning_text", text: "internal detail" }] }), "internal detail");
+  assert.equal(toChatReasoning({ summary: [], content: [{ type: "reasoning_text", text: "internal detail" }] }), "internal detail");
+  assert.equal(toChatReasoning({ summary: [{ type: "summary_text", text: "internal summary" }], content: [] }), "internal summary");
+  assert.equal(toChatReasoning({ summary: [{ type: "summary_text", text: "internal summary" }] }), "internal summary");
 });
 
 run("anthropic assistant thinking block becomes top-level chat reasoning fields", () => {
@@ -4398,6 +4585,33 @@ await runAsync("openai responses passthrough drops persisted item ids when store
     assert.deepEqual(upstreamBody.input, [
       { type: "reasoning", summary: [{ type: "summary_text", text: "internal" }], status: "completed" },
       { type: "function_call", call_id: "call_1", name: "lookup", arguments: "{\"city\":\"Shanghai\"}", status: "completed" },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+    ]);
+  });
+});
+
+await runAsync("openai responses passthrough drops nanollm reasoning carriers but keeps upstream encrypted reasoning", async () => {
+  let upstreamBody: any;
+  await withHTTPServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ id: "resp_1", object: "response", usage: { input_tokens: 1, output_tokens: 1 } }));
+    });
+  }, async (baseURL) => {
+    await passthroughRequest({ name: "alpha", provider: "openai-responses", base_url: baseURL, api_key: "test-key", model: "upstream-alpha" }, {
+      model: "alpha",
+      input: [
+        { type: "reasoning", summary: [], encrypted_content: encodeReasoningCarrier("converted thinking", "sig") },
+        { type: "reasoning", summary: [], encrypted_content: "gAAAAABopenai-encrypted" },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+      ],
+    });
+
+    assert.deepEqual(upstreamBody.input, [
+      { type: "reasoning", summary: [], encrypted_content: "gAAAAABopenai-encrypted" },
       { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
     ]);
   });
@@ -7007,6 +7221,34 @@ run("record page stream reconstructor handles Anthropic server_tool_use events",
     name: "web_search",
     input: { query: "test search" },
   });
+});
+
+run("record page stream reconstructor collects Responses reasoning_text deltas", () => {
+  const script = /<script>([\s\S]*)<\/script>/.exec(renderRecordPage({ enabled: true, capturedCount: 0, limit: 100, recentKeys: [] } as any))?.[1];
+  assert.ok(script, "record page script");
+  const sandbox: any = {
+    document: {
+      addEventListener: () => {},
+      createElement: () => ({ appendChild: () => {}, addEventListener: () => {} }),
+      getElementById: () => ({ addEventListener: () => {}, appendChild: () => {}, classList: { toggle: () => {} } }),
+    },
+    window: { location: { search: "" } },
+    history: { replaceState: () => {} },
+    fetch: async () => ({ ok: true, json: async () => ({}) }),
+    setInterval: () => 0,
+    URLSearchParams,
+  };
+  vm.runInContext(script + "\n;globalThis.__reconstruct = reconstructStreamResponse;\nglobalThis.__parse = parseStreamEvents;", vm.createContext(sandbox));
+  // Drop output_item.done / response.completed so the result depends on the deltas alone.
+  const rawStream = [
+    { type: "response.created", response: { id: "resp_raw", object: "response", created_at: 1, model: "gpt-oss", status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_raw", type: "reasoning", status: "in_progress", summary: [] } },
+    { type: "response.reasoning_text.delta", item_id: "rs_raw", output_index: 0, content_index: 0, delta: "Re-render " },
+    { type: "response.reasoning_text.delta", item_id: "rs_raw", output_index: 0, content_index: 0, delta: "the table." },
+  ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n`).join("\n");
+
+  const reconstructed = JSON.parse(JSON.stringify(sandbox.__reconstruct(sandbox.__parse(rawStream))));
+  assert.deepEqual(reconstructed.output[0].content, [{ type: "reasoning_text", text: "Re-render the table." }]);
 });
 
 run("server and protocol converters keep TypeScript checking enabled", () => {

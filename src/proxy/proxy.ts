@@ -1,6 +1,7 @@
 import type { ModelConfig } from "../core/config.js";
 import { SSEParser, type StreamFormat } from "../converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "../converters/shared.js";
+import { decodeReasoningCarrier } from "../converters/shared.js";
 import {
   denormalizeToOpenAIChatRequest,
   denormalizeToOpenAIResponsesRequest,
@@ -355,10 +356,21 @@ export async function aggregateCodexResponsesStream(body: ReadableStream<Uint8Ar
   return result;
 }
 
+/**
+ * Reasoning items whose encrypted_content is nanollm's own carrier hold thinking
+ * converted from another protocol; a Responses upstream cannot verify them, and
+ * the converted path drops such thinking too, so drop them before passthrough.
+ */
+function stripNanollmReasoningCarriers(config: ModelConfig, body: unknown): unknown {
+  if (config.provider !== "openai-responses" || !isPlainObject(body) || !Array.isArray(body.input)) return body;
+  const input = body.input.filter((item) => !(isPlainObject(item) && item.type === "reasoning" && decodeReasoningCarrier(item.encrypted_content)));
+  return input.length === body.input.length ? body : { ...body, input };
+}
+
 function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unknown>, stream: boolean): unknown {
   return stripOpenAIResponsesUnstoredItemIds(
     config,
-    applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream }),
+    stripNanollmReasoningCarriers(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream })),
   );
 }
 

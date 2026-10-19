@@ -10,6 +10,7 @@ import {
   denormalizeUsageToAnthropic,
   denormalizeUsageToOpenAIChat,
   denormalizeUsageToOpenAIResponses,
+  encodeReasoningCarrier,
   fail,
   normalizeUsage,
   parseToolArguments,
@@ -212,6 +213,7 @@ export function denormalizeToOpenAIResponsesResponse(response: NormalizedRespons
         id: `rs_${index}`,
         type: "reasoning",
         summary: [{ type: "summary_text", text: part.thinking }],
+        encrypted_content: encodeReasoningCarrier(part.thinking, part.signature),
         status: "completed",
       })),
       ...(visibleParts.length > 0
