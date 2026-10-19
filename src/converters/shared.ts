@@ -40,7 +40,7 @@ export type NormalizedPart =
   | { type: "text"; text: string; cacheControl?: { type: "ephemeral" } }
   | { type: "refusal"; text: string }
   | { type: "thinking"; thinking: string; signature?: string }
-  | { type: "redacted_thinking"; data: string }
+  | { type: "redacted_thinking"; data: string; origin?: "anthropic" | "openai-responses" }
   | { type: "image_url"; url: string; detail?: "auto" | "low" | "high"; cacheControl?: { type: "ephemeral" } }
   | { type: "input_audio"; data: string; format: "mp3" | "wav" };
 
@@ -72,6 +72,8 @@ export type NormalizedToolCall =
 export interface NormalizedMessage {
   role: NormalizedRole;
   parts: NormalizedPart[];
+  // Native input item boundaries keep its readable and opaque parts together on replay.
+  responsesReasoning?: { id?: string; textField: "content" | "summary" };
   toolCalls?: NormalizedToolCall[];
   toolCallId?: string;
   isError?: boolean;
@@ -224,16 +226,29 @@ export function createResponsesCustomToolSchema(format?: unknown): Record<string
 // is also carried there (with its signature) under a nanollm-specific prefix.
 const REASONING_CARRIER_PREFIX = "nanollm.reasoning.v1:";
 
+export function isReasoningCarrier(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith(REASONING_CARRIER_PREFIX);
+}
+
 export function encodeReasoningCarrier(thinking: string, signature?: string): string {
   return REASONING_CARRIER_PREFIX + Buffer.from(JSON.stringify({ thinking, ...(signature ? { signature } : {}) }), "utf8").toString("base64");
 }
 
-export function decodeReasoningCarrier(value: unknown): { thinking: string; signature?: string } | undefined {
-  if (typeof value !== "string" || !value.startsWith(REASONING_CARRIER_PREFIX)) return undefined;
+export function encodeRedactedReasoningCarrier(data: string): string {
+  return REASONING_CARRIER_PREFIX + Buffer.from(JSON.stringify({ thinking: "", redactedThinking: data }), "utf8").toString("base64");
+}
+
+export function decodeReasoningCarrier(value: unknown): { thinking: string; signature?: string; redactedThinking?: string } | undefined {
+  if (!isReasoningCarrier(value)) return undefined;
   try {
     const parsed = JSON.parse(Buffer.from(value.slice(REASONING_CARRIER_PREFIX.length), "base64").toString("utf8"));
     if (typeof parsed?.thinking !== "string") return undefined;
-    return { thinking: parsed.thinking, ...(typeof parsed.signature === "string" && parsed.signature ? { signature: parsed.signature } : {}) };
+    if (parsed.redactedThinking !== undefined && typeof parsed.redactedThinking !== "string") return undefined;
+    return {
+      thinking: parsed.thinking,
+      ...(typeof parsed.signature === "string" && parsed.signature ? { signature: parsed.signature } : {}),
+      ...(parsed.redactedThinking !== undefined ? { redactedThinking: parsed.redactedThinking } : {}),
+    };
   } catch {
     return undefined;
   }

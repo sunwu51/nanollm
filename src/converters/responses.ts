@@ -7,11 +7,14 @@ import type {
 } from "./shared.js";
 import {
   collapseText,
+  decodeReasoningCarrier,
   denormalizeUsageToAnthropic,
   denormalizeUsageToOpenAIChat,
   denormalizeUsageToOpenAIResponses,
   encodeReasoningCarrier,
+  encodeRedactedReasoningCarrier,
   fail,
+  isReasoningCarrier,
   normalizeUsage,
   parseToolArguments,
   qualifyOpenAIResponsesToolName,
@@ -85,12 +88,21 @@ export function normalizeOpenAIResponsesResponse(response: OpenAIResponsesRespon
     }
 
     if (item.type === "reasoning") {
+      const carried = decodeReasoningCarrier(item.encrypted_content);
+      if (carried) {
+        if (carried.redactedThinking !== undefined) {
+          parts.push({ type: "redacted_thinking", data: carried.redactedThinking, origin: "anthropic" });
+        } else {
+          parts.push({ type: "thinking", thinking: carried.thinking, signature: carried.signature });
+        }
+        continue;
+      }
       const reasoningParts = item.content?.length ? item.content : item.summary ?? [];
       for (const part of reasoningParts) {
         parts.push({ type: "thinking", thinking: part.text });
       }
-      if (item.encrypted_content) {
-        parts.push({ type: "redacted_thinking", data: item.encrypted_content });
+      if (item.encrypted_content && !isReasoningCarrier(item.encrypted_content)) {
+        parts.push({ type: "redacted_thinking", data: item.encrypted_content, origin: "openai-responses" });
       }
     }
   }
@@ -135,7 +147,7 @@ export function normalizeAnthropicResponse(response: AnthropicMessagesResponse):
     }
 
     if (block.type === "redacted_thinking") {
-      parts.push({ type: "redacted_thinking", data: block.data });
+      parts.push({ type: "redacted_thinking", data: block.data, origin: "anthropic" });
       continue;
     }
 
@@ -196,7 +208,7 @@ export function denormalizeToOpenAIChatResponse(response: NormalizedResponse): O
 }
 
 export function denormalizeToOpenAIResponsesResponse(response: NormalizedResponse): OpenAIResponsesResponse {
-  const reasoningParts = response.message.parts.filter((part) => part.type === "thinking");
+  const reasoningParts = response.message.parts.filter((part) => part.type === "thinking" || part.type === "redacted_thinking");
   const visibleParts = response.message.parts.filter((part) => part.type === "text" || part.type === "refusal");
   return {
     id: response.id,
@@ -212,8 +224,12 @@ export function denormalizeToOpenAIResponsesResponse(response: NormalizedRespons
       ...reasoningParts.map((part, index) => ({
         id: `rs_${index}`,
         type: "reasoning",
-        summary: [{ type: "summary_text", text: part.thinking }],
-        encrypted_content: encodeReasoningCarrier(part.thinking, part.signature),
+        summary: part.type === "thinking" ? [{ type: "summary_text", text: part.thinking }] : [],
+        encrypted_content: part.type === "thinking"
+          ? encodeReasoningCarrier(part.thinking, part.signature)
+          : part.origin === "anthropic" || (!part.origin && response.sourceFormat === "anthropic")
+            ? encodeRedactedReasoningCarrier(part.data)
+            : part.data,
         status: "completed",
       })),
       ...(visibleParts.length > 0
@@ -282,7 +298,11 @@ export function denormalizeToAnthropicResponse(response: NormalizedResponse): An
       ...response.message.parts.flatMap<AnthropicMessagesResponse["content"][number]>((part) => {
         if (part.type === "text" || part.type === "refusal") return [{ type: "text" as const, text: part.text, citations: null }];
         if (part.type === "thinking") return [{ type: "thinking" as const, thinking: part.thinking, signature: part.signature ?? "" }];
-        if (part.type === "redacted_thinking") return [];
+        if (part.type === "redacted_thinking") {
+          return part.origin === "anthropic" || (!part.origin && response.sourceFormat === "anthropic")
+            ? [{ type: "redacted_thinking" as const, data: part.data }]
+            : [];
+        }
         return [{ type: "text" as const, text: collapseText([part]), citations: null }];
       }),
       ...(response.message.toolCalls?.map((toolCall) => {

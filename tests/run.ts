@@ -23,8 +23,8 @@ import {
   responsesResponseToAnthropicMessage,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
-import { decodeReasoningCarrier, encodeReasoningCarrier, UnsupportedContentError } from "../src/converters/shared.js";
-import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { decodeReasoningCarrier, encodeReasoningCarrier, encodeRedactedReasoningCarrier, UnsupportedContentError } from "../src/converters/shared.js";
+import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, denormalizeToOpenAIResponsesRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, canAccessModel, extractBearerToken, extractRequestToken, getAccessibleModelNames, isAuthorizedToken, isScopedToken, readAuthCookie } from "../src/core/auth.js";
 import { getRequestAuthToken, webAuth } from "../src/core/web-auth.js";
@@ -78,6 +78,7 @@ import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/storage/usa
 import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, requireTextOnly, type NormalizedPart, type OpenAIChatResponse } from "../src/converters/shared.js";
 import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch, waitForClientWrites } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
+import { runReasoningStreamTests } from "./reasoning-streams.js";
 
 function createTestSqliteClient(path: string): Client {
   return createClient({ url: `file:${path}`, intMode: "number", timeout: 5000 });
@@ -125,6 +126,8 @@ function runThrows(name: string, fn: () => void, expectedMessage: string) {
     assert.throws(fn, new RegExp(expectedMessage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 }
+
+runReasoningStreamTests(run);
 
 run("extractErrorCauses preserves useful nested transport details and redacts secrets", () => {
   const nested = Object.assign(new Error("HTTP/2 GOAWAY Bearer secret-token"), {
@@ -2358,7 +2361,7 @@ run("chat response round-trip through anthropic preserves tool call name", () =>
   assert.equal((chat.choices[0].message.tool_calls?.[0] as any).function.name, "lookup");
 });
 
-run("anthropic request thinking block is not synthesized as responses reasoning input", () => {
+run("anthropic request thinking is preserved as plaintext responses reasoning input", () => {
   const responses = anthropicMessageRequestToResponsesRequest({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -2381,9 +2384,10 @@ run("anthropic request thinking block is not synthesized as responses reasoning 
   });
 
   const input = responses.input as Array<{ type: string }>;
-  assert.equal(input.length, 1);
-  assert.equal(input[0].type, "message");
-  assert.equal((input[0] as any).content[0].text, "Let me check.");
+  assert.equal(input.length, 2);
+  assert.deepEqual(input[0], { type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "I should call the weather tool." }] });
+  assert.equal(input[1].type, "message");
+  assert.equal((input[1] as any).content[0].text, "Let me check.");
 });
 
 run("anthropic response thinking block is carried in responses summary and encrypted_content", () => {
@@ -2493,7 +2497,7 @@ for (const source of ["content", "summary"] as const) {
 
     assert.deepEqual(normalized.messages[0].parts, [
       { type: "thinking", thinking: "readable thinking" },
-      { type: "redacted_thinking", data: "gAAAAABupstream-encrypted" },
+      { type: "redacted_thinking", data: "gAAAAABupstream-encrypted", origin: "openai-responses" },
     ]);
   });
 }
@@ -2505,7 +2509,7 @@ run("responses request reasoning preserves encrypted content without plaintext",
   } as any);
 
   assert.deepEqual(normalized.messages[0].parts, [
-    { type: "redacted_thinking", data: "gAAAAABupstream-encrypted" },
+    { type: "redacted_thinking", data: "gAAAAABupstream-encrypted", origin: "openai-responses" },
   ]);
 });
 
@@ -2525,6 +2529,94 @@ run("responses request reasoning prefers content and falls back to summary in ch
   assert.equal(toChatReasoning({ summary: [], content: [{ type: "reasoning_text", text: "internal detail" }] }), "internal detail");
   assert.equal(toChatReasoning({ summary: [{ type: "summary_text", text: "internal summary" }], content: [] }), "internal summary");
   assert.equal(toChatReasoning({ summary: [{ type: "summary_text", text: "internal summary" }] }), "internal summary");
+});
+
+run("native responses reasoning replays plaintext and encrypted content in the same history item", () => {
+  for (const textField of ["content", "summary"] as const) {
+    const item = {
+      id: `rs_${textField}`,
+      type: "reasoning",
+      summary: [],
+      [textField]: ["first part", "second part"].map((value) => ({ type: textField === "content" ? "reasoning_text" : "summary_text", text: value })),
+      encrypted_content: `opaque_${textField}`,
+    };
+    const converted = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({ model: "deepseek", input: [item] } as any));
+    assert.deepEqual(converted.input, [item]);
+  }
+  const item = { type: "reasoning", id: "rs_encrypted", summary: [], encrypted_content: "opaque_only" };
+  const converted = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({ model: "gpt", input: [item] } as any));
+  assert.deepEqual(converted.input, [item]);
+});
+
+run("responses carrier history becomes plaintext for a responses upstream without foreign encryption", () => {
+  const converted = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({
+    model: "deepseek",
+    input: [
+      { type: "reasoning", summary: [], encrypted_content: encodeReasoningCarrier("tool reasoning", "real-claude-signature") },
+      { type: "function_call", call_id: "call_reasoning", name: "lookup", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_reasoning", output: "result" },
+    ],
+  } as any));
+  const input = converted.input as any[];
+  assert.deepEqual(input[0], { type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "tool reasoning" }] });
+  assert.deepEqual(input.filter((item) => item.type === "function_call" || item.type === "function_call_output").map((item) => [item.type, item.call_id]), [
+    ["function_call", "call_reasoning"], ["function_call_output", "call_reasoning"],
+  ]);
+  assert.doesNotMatch(JSON.stringify(input), /nanollm\.reasoning|real-claude-signature/);
+});
+
+run("deepseek shaped responses reasoning survives chat and anthropic history back to responses", () => {
+  const response = {
+    id: "resp_ds", model: "deepseek", created_at: 1, status: "completed",
+    output: [
+      { type: "reasoning", id: "ds_reasoning", content: [{ type: "reasoning_text", text: "DeepSeek plaintext reasoning" }], summary: [], encrypted_content: "uuid-like-opaque" },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] },
+    ],
+  } as any;
+  const chat = responsesResponseToChatCompletion(response);
+  const anthropic = responsesResponseToAnthropicMessage(response);
+  const requests = [
+    chatParamsToResponsesRequest({ model: "deepseek", messages: [chat.choices[0].message] } as any),
+    anthropicMessageRequestToResponsesRequest({ model: "deepseek", max_tokens: 1024, messages: [{ role: "assistant", content: anthropic.content }] } as any),
+  ];
+  for (const converted of requests) {
+    assert.deepEqual((converted.input as any[])[0], { type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "DeepSeek plaintext reasoning" }] });
+  }
+});
+
+run("claude signed and redacted thinking survives non-stream responses and next request history", () => {
+  const original = {
+    id: "msg_signed", model: "claude", type: "message", role: "assistant", stop_reason: "end_turn", usage: {},
+    content: [
+      { type: "thinking", thinking: "", signature: "opaque-real-signature" },
+      { type: "redacted_thinking", data: "opaque-claude-redacted" },
+      { type: "text", text: "answer", citations: null },
+    ],
+  } as any;
+  const responses = anthropicMessageToResponsesResponse(original);
+  assert.deepEqual(responsesResponseToAnthropicMessage(responses).content, original.content);
+  const request = responsesRequestToAnthropicMessageRequest({
+    model: "claude", input: [...responses.output, { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] }],
+  } as any);
+  assert.deepEqual((request.messages[0] as any).content, original.content);
+  const backToResponses = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({ model: "deepseek", input: responses.output } as any));
+  assert.doesNotMatch(JSON.stringify(backToResponses.input), /opaque-real-signature|opaque-claude-redacted|nanollm\.reasoning/);
+});
+
+run("native responses encryption is never emitted as claude redacted thinking or a signature", () => {
+  const converted = responsesResponseToAnthropicMessage({
+    id: "resp_native", model: "gpt", created_at: 1, status: "completed", output: [
+      { type: "reasoning", summary: [{ type: "summary_text", text: "readable" }], encrypted_content: "native-ciphertext" },
+    ],
+  } as any);
+  assert.deepEqual(converted.content, [{ type: "thinking", thinking: "readable", signature: "" }]);
+});
+
+run("malformed private reasoning carriers are not replayed as native encryption", () => {
+  const converted = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({
+    model: "deepseek", input: [{ type: "reasoning", content: [{ type: "reasoning_text", text: "preserve me" }], encrypted_content: "nanollm.reasoning.v1:broken" }],
+  } as any));
+  assert.deepEqual(converted.input, [{ type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "preserve me" }] }]);
 });
 
 run("anthropic assistant thinking block becomes top-level chat reasoning fields", () => {
@@ -4590,7 +4682,7 @@ await runAsync("openai responses passthrough drops persisted item ids when store
   });
 });
 
-await runAsync("openai responses passthrough drops nanollm reasoning carriers but keeps upstream encrypted reasoning", async () => {
+await runAsync("openai responses passthrough restores carrier plaintext and keeps native encrypted reasoning", async () => {
   let upstreamBody: any;
   await withHTTPServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -4605,12 +4697,16 @@ await runAsync("openai responses passthrough drops nanollm reasoning carriers bu
       model: "alpha",
       input: [
         { type: "reasoning", summary: [], encrypted_content: encodeReasoningCarrier("converted thinking", "sig") },
+        { type: "reasoning", summary: [], encrypted_content: encodeRedactedReasoningCarrier("claude-redacted") },
+        { type: "reasoning", summary: [{ type: "summary_text", text: "recoverable" }], encrypted_content: "nanollm.reasoning.v1:broken" },
         { type: "reasoning", summary: [], encrypted_content: "gAAAAABopenai-encrypted" },
         { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
       ],
     });
 
     assert.deepEqual(upstreamBody.input, [
+      { type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "converted thinking" }] },
+      { type: "reasoning", summary: [{ type: "summary_text", text: "recoverable" }] },
       { type: "reasoning", summary: [], encrypted_content: "gAAAAABopenai-encrypted" },
       { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
     ]);

@@ -1,7 +1,7 @@
 import type { ModelConfig } from "../core/config.js";
 import { SSEParser, type StreamFormat } from "../converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "../converters/shared.js";
-import { decodeReasoningCarrier } from "../converters/shared.js";
+import { decodeReasoningCarrier, isReasoningCarrier } from "../converters/shared.js";
 import {
   denormalizeToOpenAIChatRequest,
   denormalizeToOpenAIResponsesRequest,
@@ -357,20 +357,30 @@ export async function aggregateCodexResponsesStream(body: ReadableStream<Uint8Ar
 }
 
 /**
- * Reasoning items whose encrypted_content is nanollm's own carrier hold thinking
- * converted from another protocol; a Responses upstream cannot verify them, and
- * the converted path drops such thinking too, so drop them before passthrough.
+ * A Responses upstream cannot verify nanollm's private carrier. Restore its
+ * plaintext as reasoning content instead of discarding the entire history item.
  */
-function stripNanollmReasoningCarriers(config: ModelConfig, body: unknown): unknown {
+function restoreNanollmReasoningCarriers(config: ModelConfig, body: unknown): unknown {
   if (config.provider !== "openai-responses" || !isPlainObject(body) || !Array.isArray(body.input)) return body;
-  const input = body.input.filter((item) => !(isPlainObject(item) && item.type === "reasoning" && decodeReasoningCarrier(item.encrypted_content)));
-  return input.length === body.input.length ? body : { ...body, input };
+  let changed = false;
+  const input = body.input.flatMap((item) => {
+    if (!isPlainObject(item) || item.type !== "reasoning" || !isReasoningCarrier(item.encrypted_content)) return [item];
+    changed = true;
+    const carried = decodeReasoningCarrier(item.encrypted_content);
+    if (carried) return carried.thinking
+      ? [{ type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: carried.thinking }] }]
+      : [];
+    // A malformed private carrier is still not a native encrypted payload.
+    const { encrypted_content: _carrier, ...readable } = item;
+    return [readable];
+  });
+  return changed ? { ...body, input } : body;
 }
 
 function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unknown>, stream: boolean): unknown {
   return stripOpenAIResponsesUnstoredItemIds(
     config,
-    stripNanollmReasoningCarriers(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream })),
+    restoreNanollmReasoningCarriers(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream })),
   );
 }
 
