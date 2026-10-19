@@ -273,6 +273,58 @@ function parseSSEObjects(chunks: string[]): Array<{ event?: string; data: any }>
     });
 }
 
+run("chat stream history with empty assistant content sends no empty anthropic text block", () => {
+  // A streaming Chat client accumulates content: "" when a tool-call turn has no visible text.
+  const result = chatParamsToAnthropicMessageRequest({
+    model: "claude-haiku",
+    messages: [
+      { role: "user", content: "weather in Singapore?" },
+      {
+        role: "assistant",
+        content: "",
+        reasoning_content: "Need the weather tool.",
+        tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: "{\"city\":\"Singapore\"}" } }],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "sunny" },
+    ],
+  } as any);
+
+  const assistant = (result.messages as any[]).find((message) => message.role === "assistant");
+  assert.deepEqual(assistant.content.map((block: any) => block.type), ["tool_use"]);
+});
+
+run("anthropic request drops empty text parts from user and tool_result arrays", () => {
+  const image = "data:image/png;base64,iVBORw0KGgo=";
+  const result = chatParamsToAnthropicMessageRequest({
+    model: "claude-haiku",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "" }, { type: "image_url", image_url: { url: image } }] },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "look", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: [{ type: "text", text: "" }, { type: "image_url", image_url: { url: image } }] },
+    ],
+  } as any);
+
+  const [user, , toolTurn] = result.messages as any[];
+  assert.deepEqual(user.content.map((block: any) => block.type), ["image"]);
+  assert.deepEqual(toolTurn.content[0].content.map((block: any) => block.type), ["image"]);
+});
+
+run("anthropic request keeps non-empty assistant text and a lone empty user text", () => {
+  const result = chatParamsToAnthropicMessageRequest({
+    model: "claude-haiku",
+    messages: [
+      { role: "user", content: "" },
+      { role: "assistant", content: "I'll check.", tool_calls: [{ id: "call_1", type: "function", function: { name: "look", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "" },
+    ],
+  } as any);
+
+  const [user, assistant, toolTurn] = result.messages as any[];
+  assert.equal(user.content, "");
+  assert.deepEqual(assistant.content.map((block: any) => [block.type, block.text]), [["text", "I'll check."], ["tool_use", undefined]]);
+  assert.equal(toolTurn.content[0].content, "");
+});
+
 run("chat tool result becomes anthropic tool_result block", () => {
   const result = chatParamsToAnthropicMessageRequest({
     model: "gpt-4o-mini",

@@ -980,7 +980,16 @@ function denormalizeAnthropicMessage(message: NormalizedMessage, preserveThinkin
   }
 }
 
-function denormalizeAnthropicUserParts(parts: NormalizedMessage["parts"]): any {
+// Anthropic rejects empty text blocks ("text content blocks must be non-empty"),
+// e.g. the content: "" a streaming Chat client keeps for a tool-call turn.
+// Drop them, unless nothing else is left to send.
+function dropEmptyAnthropicText(parts: NormalizedMessage["parts"]): NormalizedMessage["parts"] {
+  const kept = parts.filter((part) => !((part.type === "text" || part.type === "refusal") && part.text === ""));
+  return kept.length > 0 ? kept : parts;
+}
+
+function denormalizeAnthropicUserParts(allParts: NormalizedMessage["parts"]): any {
+  const parts = dropEmptyAnthropicText(allParts);
   if (parts.length === 1 && parts[0].type === "text") return parts[0].text;
   return parts.map((part) => {
     if (part.type === "text") return { type: "text", text: part.text, cache_control: part.cacheControl };
@@ -994,7 +1003,7 @@ function denormalizeAnthropicUserParts(parts: NormalizedMessage["parts"]): any {
 
 function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserveThinking: boolean, ignoreInvalidHistory: boolean): ContentBlockParam[] {
   const blocks = message.parts.flatMap<ContentBlockParam>((part) => {
-    if (part.type === "text" || part.type === "refusal") return { type: "text", text: part.text, citations: null };
+    if (part.type === "text" || part.type === "refusal") return part.text === "" ? [] : [{ type: "text", text: part.text, citations: null }];
     if (part.type === "thinking") {
       if (ignoreInvalidHistory && (part.signature === undefined || part.signature === null || part.signature === "")) return [];
       return [{ type: "thinking", thinking: part.thinking, signature: part.signature ?? "" }];
@@ -1009,8 +1018,9 @@ function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserve
   return blocks;
 }
 
-function denormalizeAnthropicToolResultParts(parts: NormalizedMessage["parts"]): any {
-  if (parts.every((part) => part.type === "text")) return collapseText(parts);
+function denormalizeAnthropicToolResultParts(allParts: NormalizedMessage["parts"]): any {
+  if (allParts.every((part) => part.type === "text")) return collapseText(allParts);
+  const parts = dropEmptyAnthropicText(allParts);
   return parts.map((part) => {
     if (part.type === "text") return { type: "text", text: part.text };
     if (part.type === "image_url") {
