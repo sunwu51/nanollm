@@ -23,8 +23,8 @@ import {
   responsesResponseToAnthropicMessage,
   responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
-import { UnsupportedContentError } from "../src/converters/shared.js";
-import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { decodeReasoningCarrier, encodeReasoningCarrier, encodeRedactedReasoningCarrier, UnsupportedContentError } from "../src/converters/shared.js";
+import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, denormalizeToOpenAIResponsesRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, canAccessModel, extractBearerToken, extractRequestToken, getAccessibleModelNames, isAuthorizedToken, isScopedToken, readAuthCookie } from "../src/core/auth.js";
 import { getRequestAuthToken, webAuth } from "../src/core/web-auth.js";
@@ -42,12 +42,14 @@ import { extractUpstreamModelIds, fetchUpstreamModels } from "../src/proxy/upstr
 import { ConfigManager } from "../src/core/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/proxy/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/core/http-log.js";
+import { applyReasoningHistoryRules, resolveReasoningProfile } from "../src/proxy/reasoning-history.js";
 import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, applyCodexSubscriptionIdentityHeaders, forwardRequest, mergeHeaders, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy/proxy.js";
 import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "../src/proxy/response-cache.js";
 import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/core/response-compression.js";
 import { renderRecordPage } from "../src/pages/record-page.js";
 import { renderStatusPage } from "../src/pages/status-page.js";
 import { handleServerStartupError } from "../src/core/startup-error.js";
+import { bypassesProxy, resolveEnvProxy } from "../src/core/env-proxy.js";
 import {
   appendRecordedAttemptResponseBody,
   appendRecordedClientResponseBody,
@@ -77,6 +79,7 @@ import { SqliteUsageStore, UsageStore, formatLocalDay } from "../src/storage/usa
 import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, requireTextOnly, type NormalizedPart, type OpenAIChatResponse } from "../src/converters/shared.js";
 import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch, waitForClientWrites } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
+import { runReasoningStreamTests } from "./reasoning-streams.js";
 
 function createTestSqliteClient(path: string): Client {
   return createClient({ url: `file:${path}`, intMode: "number", timeout: 5000 });
@@ -124,6 +127,8 @@ function runThrows(name: string, fn: () => void, expectedMessage: string) {
     assert.throws(fn, new RegExp(expectedMessage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   });
 }
+
+runReasoningStreamTests(run);
 
 run("extractErrorCauses preserves useful nested transport details and redacts secrets", () => {
   const nested = Object.assign(new Error("HTTP/2 GOAWAY Bearer secret-token"), {
@@ -268,6 +273,58 @@ function parseSSEObjects(chunks: string[]): Array<{ event?: string; data: any }>
       return { event, data: JSON.parse(dataLines.join("\n")) };
     });
 }
+
+run("chat stream history with empty assistant content sends no empty anthropic text block", () => {
+  // A streaming Chat client accumulates content: "" when a tool-call turn has no visible text.
+  const result = chatParamsToAnthropicMessageRequest({
+    model: "claude-haiku",
+    messages: [
+      { role: "user", content: "weather in Singapore?" },
+      {
+        role: "assistant",
+        content: "",
+        reasoning_content: "Need the weather tool.",
+        tool_calls: [{ id: "call_1", type: "function", function: { name: "get_weather", arguments: "{\"city\":\"Singapore\"}" } }],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "sunny" },
+    ],
+  } as any);
+
+  const assistant = (result.messages as any[]).find((message) => message.role === "assistant");
+  assert.deepEqual(assistant.content.map((block: any) => block.type), ["tool_use"]);
+});
+
+run("anthropic request drops empty text parts from user and tool_result arrays", () => {
+  const image = "data:image/png;base64,iVBORw0KGgo=";
+  const result = chatParamsToAnthropicMessageRequest({
+    model: "claude-haiku",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "" }, { type: "image_url", image_url: { url: image } }] },
+      { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "look", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: [{ type: "text", text: "" }, { type: "image_url", image_url: { url: image } }] },
+    ],
+  } as any);
+
+  const [user, , toolTurn] = result.messages as any[];
+  assert.deepEqual(user.content.map((block: any) => block.type), ["image"]);
+  assert.deepEqual(toolTurn.content[0].content.map((block: any) => block.type), ["image"]);
+});
+
+run("anthropic request keeps non-empty assistant text and a lone empty user text", () => {
+  const result = chatParamsToAnthropicMessageRequest({
+    model: "claude-haiku",
+    messages: [
+      { role: "user", content: "" },
+      { role: "assistant", content: "I'll check.", tool_calls: [{ id: "call_1", type: "function", function: { name: "look", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call_1", content: "" },
+    ],
+  } as any);
+
+  const [user, assistant, toolTurn] = result.messages as any[];
+  assert.equal(user.content, "");
+  assert.deepEqual(assistant.content.map((block: any) => [block.type, block.text]), [["text", "I'll check."], ["tool_use", undefined]]);
+  assert.equal(toolTurn.content[0].content, "");
+});
 
 run("chat tool result becomes anthropic tool_result block", () => {
   const result = chatParamsToAnthropicMessageRequest({
@@ -843,6 +900,66 @@ run("string content survives chat to responses to chat", () => {
   assert.equal(chat.messages[0].content, "hello");
 });
 
+run("chat system messages map to responses instructions or developer input", () => {
+  const responses = chatParamsToResponsesRequest({
+    model: "gpt-5",
+    messages: [
+      { role: "system", content: "initial system" },
+      { role: "developer", content: "initial developer" },
+      { role: "user", content: "hello" },
+      { role: "system", content: "later system" },
+      { role: "assistant", content: "reply" },
+      { role: "developer", content: "later developer" },
+    ],
+  });
+
+  assert.equal(responses.instructions, "initial system\ninitial developer");
+  assert.deepEqual(responses.input, [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+    { type: "message", role: "developer", content: [{ type: "input_text", text: "later system" }] },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "reply", annotations: [] }] },
+    { type: "message", role: "developer", content: [{ type: "input_text", text: "later developer" }] },
+  ]);
+});
+
+run("anthropic system remains responses instructions without system input", () => {
+  const responses = anthropicMessageRequestToResponsesRequest({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    system: [{ type: "text", text: "first instruction" }, { type: "text", text: "second instruction" }],
+    messages: [{ role: "user", content: "hello" }],
+  });
+
+  assert.equal(responses.instructions, "first instruction\nsecond instruction");
+  assert.deepEqual(responses.input, [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+  ]);
+});
+
+run("anthropic system messages preserve roles for string and text block content", () => {
+  for (const useBlocks of [false, true]) {
+    const content = (value: string) => useBlocks ? [{ type: "text", text: value }] : value;
+    const responses = anthropicMessageRequestToResponsesRequest({
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      system: "top-level instruction",
+      messages: [
+        { role: "system", content: content("initial system") },
+        { role: "user", content: "hello" },
+        { role: "system", content: content("later system") },
+        { role: "assistant", content: "reply" },
+      ],
+    } as any);
+
+    assert.equal(responses.instructions, "top-level instruction\ninitial system");
+    assert.deepEqual(responses.input, [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "later system" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "reply", annotations: [] }] },
+    ]);
+  }
+});
+
 run("responses instructions developer role becomes chat system role", () => {
   const chat = responsesRequestToChatParams({
     model: "gpt-5",
@@ -1130,6 +1247,79 @@ run("chat stream restores converted custom tools in responses events", () => {
   });
 });
 
+function responsesReasoningTextStream(options: { deltas?: boolean; summary?: boolean } = {}) {
+  const { deltas = true, summary = false } = options;
+  const reasoningItem = {
+    id: "rs_raw",
+    type: "reasoning",
+    status: "completed",
+    summary: summary ? [{ type: "summary_text", text: "Short summary." }] : [],
+    content: [{ type: "reasoning_text", text: "Re-render the table." }],
+    encrypted_content: "opaque",
+  };
+  const messageItem = { id: "msg_raw", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Fixed.", annotations: [] }] };
+  return [
+    { type: "response.created", response: { id: "resp_raw", object: "response", created_at: 1, model: "gpt-oss", status: "in_progress", output: [], usage: null } },
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_raw", type: "reasoning", status: "in_progress", summary: [] } },
+    ...(deltas
+      ? [
+          ...(summary ? [{ type: "response.reasoning_summary_text.delta", item_id: "rs_raw", output_index: 0, summary_index: 0, delta: "Short summary." }] : []),
+          { type: "response.content_part.added", item_id: "rs_raw", output_index: 0, content_index: 0, part: { type: "reasoning_text", text: "" } },
+          { type: "response.reasoning_text.delta", item_id: "rs_raw", output_index: 0, content_index: 0, delta: "Re-render " },
+          { type: "response.reasoning_text.delta", item_id: "rs_raw", output_index: 0, content_index: 0, delta: "the table." },
+          { type: "response.reasoning_text.done", item_id: "rs_raw", output_index: 0, content_index: 0, text: "Re-render the table." },
+          { type: "response.content_part.done", item_id: "rs_raw", output_index: 0, content_index: 0, part: { type: "reasoning_text", text: "Re-render the table." } },
+        ]
+      : []),
+    { type: "response.output_item.done", output_index: 0, item: reasoningItem },
+    { type: "response.output_item.added", output_index: 1, item: { ...messageItem, status: "in_progress", content: [] } },
+    { type: "response.content_part.added", item_id: "msg_raw", output_index: 1, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+    { type: "response.output_text.delta", item_id: "msg_raw", output_index: 1, content_index: 0, delta: "Fixed." },
+    { type: "response.content_part.done", item_id: "msg_raw", output_index: 1, content_index: 0, part: { type: "output_text", text: "Fixed.", annotations: [] } },
+    { type: "response.output_item.done", output_index: 1, item: messageItem },
+    { type: "response.completed", response: { id: "resp_raw", object: "response", created_at: 1, model: "gpt-oss", status: "completed", output: [reasoningItem, messageItem], usage: null } },
+  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+function chatReasoningAndContent(stream: string) {
+  const converter = createSSEConverter("openai-responses", "openai-chat");
+  const deltas = parseSSEObjects([...converter.push(stream), ...converter.flush()])
+    .flatMap((event) => event.data.choices ?? [])
+    .map((choice: any) => choice.delta ?? {});
+  return {
+    reasoning: deltas.map((delta: any) => delta.reasoning_content ?? "").join(""),
+    content: deltas.map((delta: any) => delta.content ?? "").join(""),
+  };
+}
+
+run("responses stream reasoning_text becomes chat reasoning_content", () => {
+  assert.deepEqual(chatReasoningAndContent(responsesReasoningTextStream()), { reasoning: "Re-render the table.", content: "Fixed." });
+});
+
+run("responses stream reasoning only in output_item.done still reaches chat", () => {
+  assert.deepEqual(chatReasoningAndContent(responsesReasoningTextStream({ deltas: false })), { reasoning: "Re-render the table.", content: "Fixed." });
+});
+
+run("responses stream with both summary and reasoning_text keeps a single copy", () => {
+  assert.deepEqual(chatReasoningAndContent(responsesReasoningTextStream({ summary: true })), { reasoning: "Short summary.", content: "Fixed." });
+});
+
+run("responses stream reasoning_text becomes an anthropic thinking block", () => {
+  for (const deltas of [true, false]) {
+    const converter = createSSEConverter("openai-responses", "anthropic");
+    const events = parseSSEObjects([...converter.push(responsesReasoningTextStream({ deltas })), ...converter.flush()]).map((event) => event.data);
+    const starts = events.filter((event) => event.type === "content_block_start");
+    assert.deepEqual(starts.map((event) => event.content_block.type), ["thinking", "text"]);
+    const thinkingIndex = starts[0].index;
+    const thinking = events
+      .filter((event) => event.type === "content_block_delta" && event.index === thinkingIndex)
+      .map((event) => event.delta.thinking)
+      .join("");
+    assert.equal(thinking, "Re-render the table.");
+    assert.equal(events.filter((event) => event.type === "content_block_stop" && event.index === thinkingIndex).length, 1);
+  }
+});
+
 run("responses custom tool stream preserves windows paths through chat arguments", () => {
   const converter = createSSEConverter("openai-responses", "openai-chat");
   const input = "*** Begin Patch\n*** Update File: C:\\temp\\docs\\file.md\n*** End Patch\n";
@@ -1217,6 +1407,73 @@ run("responses stream namespaced mcp function calls become qualified chat tool n
     .find(Boolean);
 
   assert.equal(toolName, "mcp__mcpcenter___n1a2n3o_calendar_get_events");
+});
+
+run("reasoning carrier round-trips thinking and signature and ignores foreign encrypted content", () => {
+  assert.deepEqual(decodeReasoningCarrier(encodeReasoningCarrier("想一想 | think", "sig_1")), { thinking: "想一想 | think", signature: "sig_1" });
+  assert.deepEqual(decodeReasoningCarrier(encodeReasoningCarrier("no signature")), { thinking: "no signature" });
+  assert.equal(decodeReasoningCarrier("gAAAAABopenai-encrypted"), undefined);
+  assert.equal(decodeReasoningCarrier("nanollm.reasoning.v1:not-json"), undefined);
+  assert.equal(decodeReasoningCarrier(null), undefined);
+});
+
+run("anthropic stream thinking signature is carried in responses encrypted_content", () => {
+  const converter = createSSEConverter("anthropic", "openai-responses");
+  const events = parseSSEObjects([
+    ...converter.push(
+      [
+        { type: "message_start", message: { id: "msg_sig", type: "message", role: "assistant", model: "deepseek", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } },
+        { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Need the " } },
+        { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "weather tool." } },
+        { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "46faa449-sig" } },
+        { type: "content_block_stop", index: 0 },
+        { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "call_sig", name: "weather", input: {} } },
+        { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"city\":\"Singapore\"}" } },
+        { type: "content_block_stop", index: 1 },
+        { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } },
+        { type: "message_stop" },
+      ].map((event) => `event: ${event.type}
+data: ${JSON.stringify(event)}
+
+`).join(""),
+    ),
+    ...converter.flush(),
+  ]).map((event) => event.data);
+
+  const reasoningDone = events.find((event) => event.type === "response.output_item.done" && event.item.type === "reasoning");
+  assert.deepEqual(reasoningDone?.item.summary, [{ type: "summary_text", text: "Need the weather tool." }]);
+  assert.deepEqual(decodeReasoningCarrier(reasoningDone?.item.encrypted_content), { thinking: "Need the weather tool.", signature: "46faa449-sig" });
+  const completed = events.find((event) => event.type === "response.completed");
+  assert.equal(completed?.response.output[0].encrypted_content, reasoningDone?.item.encrypted_content);
+});
+
+function responsesToolTurnWithCarriedReasoning() {
+  return {
+    model: "deepseek",
+    input: [
+      { role: "user", content: "weather in Singapore?" },
+      // The client kept encrypted_content but dropped the display-only summary.
+      { type: "reasoning", summary: [], encrypted_content: encodeReasoningCarrier("Need the weather tool.", "46faa449-sig") },
+      { type: "function_call", call_id: "call_sig", name: "weather", arguments: "{\"city\":\"Singapore\"}" },
+      { type: "function_call_output", call_id: "call_sig", output: "sunny" },
+    ],
+  } as any;
+}
+
+run("responses request carried reasoning restores signed thinking before anthropic tool_use", () => {
+  const anthropic = responsesRequestToAnthropicMessageRequest(responsesToolTurnWithCarriedReasoning());
+  const assistant = (anthropic.messages as any[]).find((message) => message.role === "assistant");
+  assert.deepEqual(assistant.content.map((block: any) => block.type), ["thinking", "tool_use"]);
+  assert.equal(assistant.content[0].thinking, "Need the weather tool.");
+  assert.equal(assistant.content[0].signature, "46faa449-sig");
+});
+
+run("responses request carried reasoning restores chat reasoning_content on the tool call turn", () => {
+  const chat = responsesRequestToChatParams(responsesToolTurnWithCarriedReasoning());
+  const assistant = (chat.messages as any[]).find((message) => message.role === "assistant");
+  assert.equal(assistant.reasoning_content, "Need the weather tool.");
+  assert.equal(assistant.tool_calls[0].id, "call_sig");
 });
 
 run("anthropic stream qualified mcp tool_use becomes responses namespaced function_call events", () => {
@@ -2157,7 +2414,7 @@ run("chat response round-trip through anthropic preserves tool call name", () =>
   assert.equal((chat.choices[0].message.tool_calls?.[0] as any).function.name, "lookup");
 });
 
-run("anthropic request thinking block is not synthesized as responses reasoning input", () => {
+run("anthropic request thinking is preserved as plaintext responses reasoning input", () => {
   const responses = anthropicMessageRequestToResponsesRequest({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -2180,12 +2437,13 @@ run("anthropic request thinking block is not synthesized as responses reasoning 
   });
 
   const input = responses.input as Array<{ type: string }>;
-  assert.equal(input.length, 1);
-  assert.equal(input[0].type, "message");
-  assert.equal((input[0] as any).content[0].text, "Let me check.");
+  assert.equal(input.length, 2);
+  assert.deepEqual(input[0], { type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "I should call the weather tool." }] });
+  assert.equal(input[1].type, "message");
+  assert.equal((input[1] as any).content[0].text, "Let me check.");
 });
 
-run("anthropic response thinking block is preserved in responses response without encrypted content", () => {
+run("anthropic response thinking block is carried in responses summary and encrypted_content", () => {
   const responses = anthropicMessageToResponsesResponse({
     id: "msg_thinking",
     type: "message",
@@ -2223,7 +2481,7 @@ run("anthropic response thinking block is preserved in responses response withou
   assert.match((responses.output[0] as any).id, /^rs_/);
   assert.deepEqual((responses.output[0] as any).summary, [{ type: "summary_text", text: "Need to reason first." }]);
   assert.equal((responses.output[0] as any).content, undefined);
-  assert.equal((responses.output[0] as any).encrypted_content, undefined);
+  assert.deepEqual(decodeReasoningCarrier((responses.output[0] as any).encrypted_content), { thinking: "Need to reason first.", signature: "sig_resp" });
   assert.equal((responses.output[1] as any).type, "message");
   assert.equal(((responses.output[1] as any).content[0] ?? {}).text, "final answer");
 });
@@ -2273,10 +2531,145 @@ run("responses request reasoning block keeps empty signature when invalid histor
 
   const content = (anthropic.messages as any[])[0].content ?? [];
   assert.equal(content[0].type, "thinking");
-  assert.equal(content[0].thinking, "internal summary");
+  assert.equal(content[0].thinking, "internal detail");
   assert.equal(content[0].signature, "");
   assert.equal(content[1].type, "text");
   assert.equal(content[1].text, "visible answer");
+});
+
+for (const source of ["content", "summary"] as const) {
+  run(`responses request reasoning preserves encrypted content alongside ${source}`, () => {
+    const normalized = normalizeOpenAIResponsesRequest({
+      model: "gpt-5",
+      input: [{
+        type: "reasoning",
+        [source]: [{ type: source === "content" ? "reasoning_text" : "summary_text", text: "readable thinking" }],
+        encrypted_content: "gAAAAABupstream-encrypted",
+      }],
+    } as any);
+
+    assert.deepEqual(normalized.messages[0].parts, [
+      { type: "thinking", thinking: "readable thinking" },
+      { type: "redacted_thinking", data: "gAAAAABupstream-encrypted", origin: "openai-responses" },
+    ]);
+  });
+}
+
+run("responses request reasoning preserves encrypted content without plaintext", () => {
+  const normalized = normalizeOpenAIResponsesRequest({
+    model: "gpt-5",
+    input: [{ type: "reasoning", summary: [], encrypted_content: "gAAAAABupstream-encrypted" }],
+  } as any);
+
+  assert.deepEqual(normalized.messages[0].parts, [
+    { type: "redacted_thinking", data: "gAAAAABupstream-encrypted", origin: "openai-responses" },
+  ]);
+});
+
+run("responses request reasoning prefers content and falls back to summary in chat history", () => {
+  const toChatReasoning = (reasoning: any) => {
+    const chat = responsesRequestToChatParams({
+      model: "gpt-oss",
+      input: [
+        { role: "user", content: "hi" },
+        { type: "reasoning", ...reasoning },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "visible answer" }] },
+      ],
+    } as any);
+    return (chat.messages as any[]).find((message) => message.role === "assistant")?.reasoning_content;
+  };
+  assert.equal(toChatReasoning({ summary: [{ type: "summary_text", text: "internal summary" }], content: [{ type: "reasoning_text", text: "internal detail" }] }), "internal detail");
+  assert.equal(toChatReasoning({ summary: [], content: [{ type: "reasoning_text", text: "internal detail" }] }), "internal detail");
+  assert.equal(toChatReasoning({ summary: [{ type: "summary_text", text: "internal summary" }], content: [] }), "internal summary");
+  assert.equal(toChatReasoning({ summary: [{ type: "summary_text", text: "internal summary" }] }), "internal summary");
+});
+
+run("native responses reasoning replays plaintext and encrypted content in the same history item", () => {
+  for (const textField of ["content", "summary"] as const) {
+    const item = {
+      id: `rs_${textField}`,
+      type: "reasoning",
+      summary: [],
+      [textField]: ["first part", "second part"].map((value) => ({ type: textField === "content" ? "reasoning_text" : "summary_text", text: value })),
+      encrypted_content: `opaque_${textField}`,
+    };
+    const converted = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({ model: "deepseek", input: [item] } as any));
+    assert.deepEqual(converted.input, [item]);
+  }
+  const item = { type: "reasoning", id: "rs_encrypted", summary: [], encrypted_content: "opaque_only" };
+  const converted = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({ model: "gpt", input: [item] } as any));
+  assert.deepEqual(converted.input, [item]);
+});
+
+run("responses carrier history becomes plaintext for a responses upstream without foreign encryption", () => {
+  const converted = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({
+    model: "deepseek",
+    input: [
+      { type: "reasoning", summary: [], encrypted_content: encodeReasoningCarrier("tool reasoning", "real-claude-signature") },
+      { type: "function_call", call_id: "call_reasoning", name: "lookup", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_reasoning", output: "result" },
+    ],
+  } as any));
+  const input = converted.input as any[];
+  assert.deepEqual(input[0], { type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "tool reasoning" }] });
+  assert.deepEqual(input.filter((item) => item.type === "function_call" || item.type === "function_call_output").map((item) => [item.type, item.call_id]), [
+    ["function_call", "call_reasoning"], ["function_call_output", "call_reasoning"],
+  ]);
+  assert.doesNotMatch(JSON.stringify(input), /nanollm\.reasoning|real-claude-signature/);
+});
+
+run("deepseek shaped responses reasoning survives chat and anthropic history back to responses", () => {
+  const response = {
+    id: "resp_ds", model: "deepseek", created_at: 1, status: "completed",
+    output: [
+      { type: "reasoning", id: "ds_reasoning", content: [{ type: "reasoning_text", text: "DeepSeek plaintext reasoning" }], summary: [], encrypted_content: "uuid-like-opaque" },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] },
+    ],
+  } as any;
+  const chat = responsesResponseToChatCompletion(response);
+  const anthropic = responsesResponseToAnthropicMessage(response);
+  const requests = [
+    chatParamsToResponsesRequest({ model: "deepseek", messages: [chat.choices[0].message] } as any),
+    anthropicMessageRequestToResponsesRequest({ model: "deepseek", max_tokens: 1024, messages: [{ role: "assistant", content: anthropic.content }] } as any),
+  ];
+  for (const converted of requests) {
+    assert.deepEqual((converted.input as any[])[0], { type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "DeepSeek plaintext reasoning" }] });
+  }
+});
+
+run("claude signed and redacted thinking survives non-stream responses and next request history", () => {
+  const original = {
+    id: "msg_signed", model: "claude", type: "message", role: "assistant", stop_reason: "end_turn", usage: {},
+    content: [
+      { type: "thinking", thinking: "", signature: "opaque-real-signature" },
+      { type: "redacted_thinking", data: "opaque-claude-redacted" },
+      { type: "text", text: "answer", citations: null },
+    ],
+  } as any;
+  const responses = anthropicMessageToResponsesResponse(original);
+  assert.deepEqual(responsesResponseToAnthropicMessage(responses).content, original.content);
+  const request = responsesRequestToAnthropicMessageRequest({
+    model: "claude", input: [...responses.output, { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] }],
+  } as any);
+  assert.deepEqual((request.messages[0] as any).content, original.content);
+  const backToResponses = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({ model: "deepseek", input: responses.output } as any));
+  assert.doesNotMatch(JSON.stringify(backToResponses.input), /opaque-real-signature|opaque-claude-redacted|nanollm\.reasoning/);
+});
+
+run("native responses encryption is never emitted as claude redacted thinking or a signature", () => {
+  const converted = responsesResponseToAnthropicMessage({
+    id: "resp_native", model: "gpt", created_at: 1, status: "completed", output: [
+      { type: "reasoning", summary: [{ type: "summary_text", text: "readable" }], encrypted_content: "native-ciphertext" },
+    ],
+  } as any);
+  assert.deepEqual(converted.content, [{ type: "thinking", thinking: "readable", signature: "" }]);
+});
+
+run("malformed private reasoning carriers are not replayed as native encryption", () => {
+  const converted = denormalizeToOpenAIResponsesRequest(normalizeOpenAIResponsesRequest({
+    model: "deepseek", input: [{ type: "reasoning", content: [{ type: "reasoning_text", text: "preserve me" }], encrypted_content: "nanollm.reasoning.v1:broken" }],
+  } as any));
+  assert.deepEqual(converted.input, [{ type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "preserve me" }] }]);
 });
 
 run("anthropic assistant thinking block becomes top-level chat reasoning fields", () => {
@@ -3405,6 +3798,68 @@ run("model proxy has higher priority than environment proxy", () => {
   }
 });
 
+run("NO_PROXY matching follows curl: wildcards, domain suffixes, ports and IPv6", () => {
+  const list = "localhost, 127.0.0.1 ::1,.internal.example,*.corp.example,api.example.com:8443";
+  assert.equal(bypassesProxy("http://localhost:11434/v1", list), true);
+  assert.equal(bypassesProxy("http://LOCALHOST:11434/v1", list), true);
+  assert.equal(bypassesProxy("http://127.0.0.1:8080", list), true);
+  assert.equal(bypassesProxy("http://[::1]:8080", list), true);
+  assert.equal(bypassesProxy("https://gpu.internal.example/v1", list), true);
+  assert.equal(bypassesProxy("https://internal.example/v1", list), true);
+  assert.equal(bypassesProxy("https://a.b.corp.example", list), true);
+  assert.equal(bypassesProxy("https://notinternal.example", list), false);
+  assert.equal(bypassesProxy("https://api.example.com:8443/v1", list), true);
+  assert.equal(bypassesProxy("https://api.example.com/v1", list), false);
+  assert.equal(bypassesProxy("https://api.openai.com/v1", list), false);
+  assert.equal(bypassesProxy("https://example.com", "example.com:443"), true);
+  assert.equal(bypassesProxy("http://[::1]:8080", "[::1]:8080"), true);
+  assert.equal(bypassesProxy("http://[::1]:9090", "[::1]:8080"), false);
+  assert.equal(bypassesProxy("https://anything.example", "*"), true);
+  assert.equal(bypassesProxy("https://anything.example", ""), false);
+  assert.equal(bypassesProxy("not a url", "*"), false);
+});
+
+run("environment proxy skips hosts listed in NO_PROXY or no_proxy", () => {
+  const proxy = "http://127.0.0.1:7890";
+  assert.equal(resolveEnvProxy("http://localhost:11434/v1", { HTTPS_PROXY: proxy, NO_PROXY: "localhost,127.0.0.1" }), undefined);
+  assert.equal(resolveEnvProxy("http://localhost:11434/v1", { HTTP_PROXY: proxy, no_proxy: "localhost" }), undefined);
+  assert.equal(resolveEnvProxy("https://api.openai.com/v1", { HTTPS_PROXY: proxy, NO_PROXY: "localhost" }), proxy);
+  assert.equal(resolveEnvProxy("https://api.openai.com/v1", { HTTPS_PROXY: proxy, HTTP_PROXY: "http://other:1" }), proxy);
+  assert.equal(resolveEnvProxy("https://api.openai.com/v1", { HTTP_PROXY: proxy }), proxy);
+  assert.equal(resolveEnvProxy("https://api.openai.com/v1", { NO_PROXY: "localhost" }), undefined);
+});
+
+run("model proxy resolution honors NO_PROXY only for the environment fallback", () => {
+  const saved = { HTTPS_PROXY: process.env.HTTPS_PROXY, HTTP_PROXY: process.env.HTTP_PROXY, NO_PROXY: process.env.NO_PROXY, no_proxy: process.env.no_proxy };
+  try {
+    process.env.HTTPS_PROXY = "http://env-https-proxy.example:8080";
+    delete process.env.HTTP_PROXY;
+    delete process.env.no_proxy;
+    process.env.NO_PROXY = "localhost,127.0.0.1";
+    const local = { name: "ollama", provider: "openai-chat", base_url: "http://localhost:11434/v1", api_key: "", model: "llama3" } as const;
+    assert.equal(resolveProxyUrl(local), undefined);
+    assert.equal(resolveProxyUrl({ ...local, proxy: "http://model-proxy.example:7890" }), "http://model-proxy.example:7890");
+    assert.equal(resolveProxyUrl({ ...local, provider_proxy: "http://provider-proxy.example:7890" }), "http://provider-proxy.example:7890");
+    assert.equal(resolveProxyUrl({ ...local, base_url: "https://api.openai.com/v1" }), "http://env-https-proxy.example:8080");
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+await runAsync("fetchUpstreamModels reaches NO_PROXY hosts directly instead of through the environment proxy", async () => {
+  await withHTTPServer((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ id: "llama3" }] }));
+  }, async (baseURL) => {
+    // Nothing listens on port 9, so the request would fail if it went through the proxy.
+    const env = { HTTPS_PROXY: "http://127.0.0.1:9", HTTP_PROXY: "http://127.0.0.1:9", NO_PROXY: "127.0.0.1,localhost" };
+    assert.deepEqual(await fetchUpstreamModels({ provider: "openai-chat", base_url: baseURL + "/v1", api_key: "" }, { env }), ["llama3"]);
+  });
+});
+
 run("config applies server-level ttfb_timeout and model override", () => {
   const configPath = writeTempConfig(`
 server:
@@ -4280,6 +4735,37 @@ await runAsync("openai responses passthrough drops persisted item ids when store
   });
 });
 
+await runAsync("openai responses passthrough restores carrier plaintext and keeps native encrypted reasoning", async () => {
+  let upstreamBody: any;
+  await withHTTPServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ id: "resp_1", object: "response", usage: { input_tokens: 1, output_tokens: 1 } }));
+    });
+  }, async (baseURL) => {
+    await passthroughRequest({ name: "alpha", provider: "openai-responses", base_url: baseURL, api_key: "test-key", model: "upstream-alpha" }, {
+      model: "alpha",
+      input: [
+        { type: "reasoning", summary: [], encrypted_content: encodeReasoningCarrier("converted thinking", "sig") },
+        { type: "reasoning", summary: [], encrypted_content: encodeRedactedReasoningCarrier("claude-redacted") },
+        { type: "reasoning", summary: [{ type: "summary_text", text: "recoverable" }], encrypted_content: "nanollm.reasoning.v1:broken" },
+        { type: "reasoning", summary: [], encrypted_content: "gAAAAABopenai-encrypted" },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+      ],
+    });
+
+    assert.deepEqual(upstreamBody.input, [
+      { type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "converted thinking" }] },
+      { type: "reasoning", summary: [{ type: "summary_text", text: "recoverable" }] },
+      { type: "reasoning", summary: [], encrypted_content: "gAAAAABopenai-encrypted" },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+    ]);
+  });
+});
+
 await runAsync("upstream requests forward only provider-specific client headers", async () => {
   const clientHeaders = new Headers({
     Authorization: "Bearer client-secret",
@@ -4845,6 +5331,157 @@ models:
   });
 });
 
+const CLAUDE_SIGNATURE = "CAQSmwgKEAgSGAI4AUIIdGhpbmtpbmc" + "A".repeat(120);
+const DEEPSEEK_SIGNATURE = "f37fde2f-9706-4e2b-9458-0cb452963217";
+const reasoningModel = (fields: Record<string, unknown>) => ({ name: "m", provider: "anthropic", base_url: "https://example.com/v1", api_key: "k", model: "m", ...fields }) as any;
+
+run("reasoning profile is detected from base_url and model name, and can be overridden", () => {
+  assert.equal(resolveReasoningProfile(reasoningModel({ base_url: "https://api.deepseek.com/anthropic/v1", model: "deepseek-flash" })), "deepseek");
+  assert.equal(resolveReasoningProfile(reasoningModel({ provider: "openai-chat", base_url: "https://ai-gateway.vercel.sh/v1", model: "deepseek/deepseek-v4-pro" })), "deepseek");
+  assert.equal(resolveReasoningProfile(reasoningModel({ base_url: "https://ai-gateway.vercel.sh/v1", model: "anthropic/claude-haiku-5.5" })), "claude");
+  assert.equal(resolveReasoningProfile(reasoningModel({ model: "us.anthropic.claude-sonnet-4-6-v1:0" })), "claude");
+  assert.equal(resolveReasoningProfile(reasoningModel({ base_url: "https://api.anthropic.com/v1", model: "some-alias" })), "claude");
+  assert.equal(resolveReasoningProfile(reasoningModel({ claude_subscription_provider: "claude", model: "opus" })), "claude");
+  assert.equal(resolveReasoningProfile(reasoningModel({ model: "glm-5.1" })), "none");
+  assert.equal(resolveReasoningProfile(reasoningModel({ model: "claude-sonnet-4-6", reasoning_profile: "none" })), "none");
+  assert.equal(resolveReasoningProfile(reasoningModel({ model: "my-proxy-model", reasoning_profile: "deepseek" })), "deepseek");
+});
+
+run("claude upstream drops thinking signed by another provider and keeps its own", () => {
+  const body = applyReasoningHistoryRules(reasoningModel({ model: "claude-haiku-5.5" }), {
+    messages: [
+      { role: "user", content: "q" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "ds", signature: DEEPSEEK_SIGNATURE }, { type: "tool_use", id: "call_00_x", name: "f", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_00_x", content: "ok" }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "", signature: CLAUDE_SIGNATURE }, { type: "tool_use", id: "toolu_1", name: "f", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "only thinking", signature: DEEPSEEK_SIGNATURE }] },
+    ],
+  }) as any;
+  assert.deepEqual(body.messages[1].content.map((block: any) => block.type), ["tool_use"]);
+  assert.deepEqual(body.messages[3].content.map((block: any) => block.type), ["thinking", "tool_use"]);
+  // Never leave an assistant message with no content.
+  assert.deepEqual(body.messages[5].content.map((block: any) => block.type), ["thinking"]);
+});
+
+run("claude upstream keeps empty signatures only when ignore_invalid_history is false", () => {
+  const body = { messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "plain", signature: "" }, { type: "text", text: "a" }] }] };
+  assert.deepEqual((applyReasoningHistoryRules(reasoningModel({ model: "claude-x" }), body) as any).messages[0].content.map((b: any) => b.type), ["text"]);
+  assert.deepEqual((applyReasoningHistoryRules(reasoningModel({ model: "claude-x", ignore_invalid_history: false }), body) as any).messages[0].content.map((b: any) => b.type), ["thinking", "text"]);
+});
+
+run("deepseek chat upstream adds reasoning_content only to tool calls it did not issue", () => {
+  const foreign = [{ id: "call_py4dAYEz1Nc06PP3nGgg3mH8", type: "function", function: { name: "f", arguments: "{}" } }];
+  const own = [{ id: "call_00_zVK3qJPAEMBZCufVC96A3787", type: "function", function: { name: "f", arguments: "{}" } }];
+  const body = applyReasoningHistoryRules(reasoningModel({ provider: "openai-chat", model: "deepseek-flash" }), {
+    messages: [
+      { role: "assistant", content: null, tool_calls: foreign },
+      { role: "assistant", content: null, tool_calls: own },
+      { role: "assistant", content: null, reasoning_content: "kept", tool_calls: foreign },
+      { role: "assistant", content: "no tools" },
+    ],
+  }) as any;
+  assert.equal(body.messages[0].reasoning_content, "");
+  // An explicit "" would replace the reasoning DeepSeek stores for its own turns.
+  assert.equal("reasoning_content" in body.messages[1], false);
+  assert.equal(body.messages[2].reasoning_content, "kept");
+  assert.equal("reasoning_content" in body.messages[3], false);
+});
+
+run("deepseek anthropic upstream adds an empty thinking block to foreign tool calls", () => {
+  const body = applyReasoningHistoryRules(reasoningModel({ base_url: "https://api.deepseek.com/anthropic/v1", model: "deepseek-flash" }), {
+    messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_01abc", name: "f", input: {} }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_00_yKbN7Gs3GyYFsX4v1eGM9190", name: "f", input: {} }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: CLAUDE_SIGNATURE }, { type: "tool_use", id: "toolu_02", name: "f", input: {} }] },
+    ],
+  }) as any;
+  assert.deepEqual(body.messages[0].content[0], { type: "thinking", thinking: "", signature: "" });
+  assert.deepEqual(body.messages[1].content.map((b: any) => b.type), ["tool_use"]);
+  assert.deepEqual(body.messages[2].content.map((b: any) => b.type), ["thinking", "tool_use"]);
+});
+
+run("deepseek responses upstream needs reasoning_text before foreign function calls", () => {
+  const call = (call_id: string) => ({ type: "function_call", call_id, name: "f", arguments: "{}" });
+  const output = (call_id: string) => ({ type: "function_call_output", call_id, output: "ok" });
+  const body = applyReasoningHistoryRules(reasoningModel({ provider: "openai-responses", base_url: "https://api.deepseek.com", model: "deepseek-flash" }), {
+    input: [
+      { role: "user", content: "q" },
+      call("call_gpt_1"), output("call_gpt_1"),
+      { type: "reasoning", summary: [{ type: "summary_text", text: "gpt summary" }], encrypted_content: "gAAAA" }, call("call_gpt_2"), output("call_gpt_2"),
+      { type: "reasoning", summary: [], encrypted_content: "gAAAA" }, call("call_gpt_3"), call("call_gpt_4"), output("call_gpt_3"), output("call_gpt_4"),
+      call("call_00_5dJHq7VwrGX4vxgRIKpX6610"), output("call_00_5dJHq7VwrGX4vxgRIKpX6610"),
+    ],
+  }) as any;
+  const types = body.input.map((item: any) => item.type ?? "message");
+  assert.deepEqual(types, [
+    "message",
+    "reasoning", "function_call", "function_call_output",
+    "reasoning", "function_call", "function_call_output",
+    "reasoning", "reasoning", "function_call", "function_call", "function_call_output", "function_call_output",
+    "function_call", "function_call_output",
+  ]);
+  assert.deepEqual(body.input[1].content, [{ type: "reasoning_text", text: " " }]);
+  // Summary-only reasoning is copied into content; DeepSeek rejects summaries alone.
+  assert.deepEqual(body.input[4].content, [{ type: "reasoning_text", text: "gpt summary" }]);
+  // Opaque-only reasoning has no text, so one placeholder covers the turn's parallel calls.
+  assert.deepEqual(body.input[8].content, [{ type: "reasoning_text", text: " " }]);
+});
+
+run("reasoning rules leave other upstreams untouched", () => {
+  const body = { messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t", signature: DEEPSEEK_SIGNATURE }, { type: "tool_use", id: "x", name: "f", input: {} }] }] };
+  assert.equal(applyReasoningHistoryRules(reasoningModel({ model: "glm-5.1" }), body), body);
+});
+
+run("config rejects an unknown reasoning_profile", () => {
+  assert.throws(() => parseConfigText(`
+models:
+  - name: m
+    provider: anthropic
+    base_url: https://example.com/v1
+    api_key: k
+    model: m
+    reasoning_profile: lenient
+`), /reasoning_profile' must be one of auto, claude, deepseek, none/);
+});
+
+await runAsync("deepseek converted and passthrough requests repair foreign tool-call history", async () => {
+  const bodies: any[] = [];
+  await withHTTPServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(req.url?.endsWith("/messages")
+        ? { id: "msg_1", type: "message", role: "assistant", model: "deepseek-flash", content: [{ type: "text", text: "ok", citations: null }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } }
+        : { id: "chatcmpl_1", object: "chat.completion", created: 1, model: "deepseek-flash", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+    });
+  }, async (baseURL) => {
+    const base = { base_url: baseURL, api_key: "k", model: "deepseek-flash" };
+    // Converted: unsigned thinking is kept for DeepSeek even though ignore_invalid_history defaults to true.
+    await forwardRequest({ ...base, name: "ds", provider: "anthropic", ignore_invalid_history: true } as any, normalizeOpenAIChatRequest({
+      model: "ds",
+      messages: [
+        { role: "user", content: "q" },
+        { role: "assistant", content: null, reasoning_content: "plain thinking", tool_calls: [{ id: "call_py4dAYEz", type: "function", function: { name: "f", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_py4dAYEz", content: "ok" },
+      ],
+    } as any));
+    assert.deepEqual(bodies[0].messages[1].content.map((b: any) => [b.type, b.signature]), [["thinking", ""], ["tool_use", undefined]]);
+    // Passthrough: a GPT tool call in Chat history gets reasoning_content "".
+    await passthroughRequest({ ...base, name: "ds", provider: "openai-chat" } as any, {
+      model: "ds",
+      messages: [
+        { role: "user", content: "q" },
+        { role: "assistant", content: null, tool_calls: [{ id: "call_py4dAYEz", type: "function", function: { name: "f", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_py4dAYEz", content: "ok" },
+      ],
+    });
+    assert.equal(bodies[1].messages[1].reasoning_content, "");
+  });
+});
+
 await runAsync("anthropic converted requests honor ignore_invalid_history false from config", async () => {
   let upstreamBody: any;
   await withHTTPServer(async (req, res) => {
@@ -4960,6 +5597,16 @@ await runAsync("status stores calculate speed for non-streaming and mixed respon
       assert.equal((await store.getModelSeries("empty", now)).at(-1)!.avgTokenSpeed, null);
       store.recordSuccess("zero-stream", 2000, 2000, usage, now, 0);
       assert.equal((await store.getModelSeries("zero-stream", now)).at(-1)!.avgTokenSpeed, null);
+
+      // Requests without usage (alpha search, images) don't add time to the speed.
+      store.recordSuccess("with-search", 2000, 300, usage, now);
+      store.recordSuccess("with-search", 8000, 7000, undefined, now);
+      store.recordSuccess("with-search", 8000, 7000, { outputTokens: 0 }, now, 1000);
+      const withSearch = (await store.getModelSeries("with-search", now)).at(-1)!;
+      assert.equal(withSearch.avgTokenSpeed, 50);
+      assert.equal(withSearch.totalStreamMs, 2000);
+      assert.equal(withSearch.streamSamples, 1);
+      assert.equal(withSearch.avgDurationMs, 6000);
     }
   } finally {
     db.close();
@@ -6876,6 +7523,34 @@ run("record page stream reconstructor handles Anthropic server_tool_use events",
   });
 });
 
+run("record page stream reconstructor collects Responses reasoning_text deltas", () => {
+  const script = /<script>([\s\S]*)<\/script>/.exec(renderRecordPage({ enabled: true, capturedCount: 0, limit: 100, recentKeys: [] } as any))?.[1];
+  assert.ok(script, "record page script");
+  const sandbox: any = {
+    document: {
+      addEventListener: () => {},
+      createElement: () => ({ appendChild: () => {}, addEventListener: () => {} }),
+      getElementById: () => ({ addEventListener: () => {}, appendChild: () => {}, classList: { toggle: () => {} } }),
+    },
+    window: { location: { search: "" } },
+    history: { replaceState: () => {} },
+    fetch: async () => ({ ok: true, json: async () => ({}) }),
+    setInterval: () => 0,
+    URLSearchParams,
+  };
+  vm.runInContext(script + "\n;globalThis.__reconstruct = reconstructStreamResponse;\nglobalThis.__parse = parseStreamEvents;", vm.createContext(sandbox));
+  // Drop output_item.done / response.completed so the result depends on the deltas alone.
+  const rawStream = [
+    { type: "response.created", response: { id: "resp_raw", object: "response", created_at: 1, model: "gpt-oss", status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: { id: "rs_raw", type: "reasoning", status: "in_progress", summary: [] } },
+    { type: "response.reasoning_text.delta", item_id: "rs_raw", output_index: 0, content_index: 0, delta: "Re-render " },
+    { type: "response.reasoning_text.delta", item_id: "rs_raw", output_index: 0, content_index: 0, delta: "the table." },
+  ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n`).join("\n");
+
+  const reconstructed = JSON.parse(JSON.stringify(sandbox.__reconstruct(sandbox.__parse(rawStream))));
+  assert.deepEqual(reconstructed.output[0].content, [{ type: "reasoning_text", text: "Re-render the table." }]);
+});
+
 run("server and protocol converters keep TypeScript checking enabled", () => {
   for (const path of ["server.ts", "src/proxy/proxy.ts", "src/converters/requests.ts", "src/converters/responses.ts", "src/converters/streams.ts"]) {
     assert.doesNotMatch(readFileSync(join(process.cwd(), path), "utf8"), /^\s*\/\/\s*@ts-nocheck/m);
@@ -7693,6 +8368,202 @@ await runAsync("fetchUpstreamModels reports upstream errors and invalid input", 
   });
   await assert.rejects(fetchUpstreamModels({ provider: "openai-subscription", base_url: "http://x", api_key: "" }), /不支持/);
   await assert.rejects(fetchUpstreamModels({ provider: "openai-chat", base_url: " ", api_key: "" }), /base_url/);
+});
+
+/** Minimal DOM element for running the admin config page script; supports what rendering and card toggles touch. */
+class FakeAdminElement {
+  children: FakeAdminElement[] = [];
+  parent?: FakeAdminElement;
+  className = "";
+  dataset: Record<string, string> = {};
+  style: Record<string, string> = {};
+  hidden = false;
+  disabled = false;
+  value = "";
+  checked = false;
+  type = "";
+  title = "";
+  private text = "";
+  private readonly attributes = new Map<string, string>();
+  private readonly listeners = new Map<string, Array<(event: unknown) => void>>();
+
+  constructor(readonly tagName: string) {}
+
+  get textContent(): string {
+    return this.text + this.children.map((child) => child.textContent).join("");
+  }
+
+  set textContent(value: string) {
+    this.children = [];
+    this.text = value;
+  }
+
+  get firstChild() {
+    return this.children[0] ?? null;
+  }
+
+  get classList() {
+    const names = () => new Set(this.className.split(/\s+/).filter(Boolean));
+    return {
+      contains: (name: string) => names().has(name),
+      add: (...items: string[]) => { this.className = [...names(), ...items].join(" "); },
+      remove: (...items: string[]) => { this.className = [...names()].filter((item) => !items.includes(item)).join(" "); },
+      toggle: (name: string, force?: boolean) => {
+        const set = names();
+        if (force ?? !set.has(name)) set.add(name); else set.delete(name);
+        this.className = [...set].join(" ");
+      },
+    };
+  }
+
+  appendChild(child: FakeAdminElement) {
+    child.parent = this;
+    this.children.push(child);
+    return child;
+  }
+
+  append(...children: Array<FakeAdminElement | string>) {
+    for (const child of children) {
+      this.appendChild(typeof child === "string" ? Object.assign(new FakeAdminElement("#text"), { textContent: child }) : child);
+    }
+  }
+
+  insertBefore(child: FakeAdminElement, reference: FakeAdminElement | null) {
+    child.parent = this;
+    const index = reference ? this.children.indexOf(reference) : -1;
+    if (index < 0) this.children.push(child); else this.children.splice(index, 0, child);
+    return child;
+  }
+
+  remove() {
+    if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this);
+  }
+
+  setAttribute(name: string, value: string) {
+    this.attributes.set(name, String(value));
+  }
+
+  getAttribute(name: string) {
+    return this.attributes.get(name) ?? null;
+  }
+
+  addEventListener(type: string, listener: (event: unknown) => void) {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+
+  click() {
+    if (!this.disabled) this.listeners.get("click")?.forEach((listener) => listener({ preventDefault() {}, stopPropagation() {} }));
+  }
+
+  focus() {}
+  scrollIntoView() {}
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+
+  findAll(predicate: (element: FakeAdminElement) => boolean): FakeAdminElement[] {
+    return this.children.flatMap((child) => [...(predicate(child) ? [child] : []), ...child.findAll(predicate)]);
+  }
+}
+
+/**
+ * Run the admin config page script against a fake DOM with two subscription providers and one plain provider.
+ * `statusResponse` answers each `/device-login/status` request; every requested status URL is recorded.
+ */
+function runAdminConfigPageScript(statusResponse: () => { ok: boolean; body: unknown }) {
+  const form = {
+    server: { port: "3000", ttfb_timeout: "" },
+    record: { max_size: "10" },
+    providers: [
+      { name: "codex", provider: "openai-subscription", base_url: "", api_key: "" },
+      { name: "claude", provider: "claude-subscription", base_url: "", api_key: "" },
+      { name: "plain", provider: "openai-chat", base_url: "https://example.com/v1", api_key: "k" },
+    ],
+    models: [],
+    fallbackGroups: [],
+  };
+  const payload = {
+    version: 1,
+    configPath: "config.yaml",
+    effectiveConfig: { port: 3000, models: [], providers: [], fallback: {}, record: { max_size: 10 } },
+    requiresRestartFields: [],
+    form,
+  };
+  const html = renderAdminConfigPage(payload, "en");
+  const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]).find((body) => body.includes("providers-container"));
+  assert.ok(script, "admin config page script");
+  const elements = new Map<string, FakeAdminElement>();
+  const getElement = (id: string) => {
+    if (!elements.has(id)) elements.set(id, new FakeAdminElement("div"));
+    return elements.get(id)!;
+  };
+  const statusRequests: string[] = [];
+  vm.runInContext(script, vm.createContext({
+    document: {
+      body: new FakeAdminElement("body"),
+      activeElement: null,
+      getElementById: getElement,
+      createElement: (tagName: string) => new FakeAdminElement(tagName),
+      createTextNode: (text: string) => Object.assign(new FakeAdminElement("#text"), { textContent: text }),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    },
+    window: { scrollX: 0, scrollY: 0, scrollTo() {}, addEventListener() {}, alert() {}, confirm: () => true },
+    performance: { getEntriesByType: () => [] },
+    requestAnimationFrame: () => 0,
+    fetch: async (url: string) => {
+      if (url === "/admin/config/data") return { ok: true, json: async () => payload };
+      assert.match(url, /\/device-login\/status$/);
+      statusRequests.push(url);
+      const { ok, body } = statusResponse();
+      return { ok, json: async () => body };
+    },
+  }));
+  const providers = getElement("providers-container");
+  return {
+    statusRequests,
+    toggleCard: (index: number) => providers.findAll((element) => element.className === "card-toggle")[index].click(),
+    signedInLabels: () => providers.findAll((element) => element.className === "success").map((element) => element.textContent),
+    clickRefresh: () => getElement("refresh-button").click(),
+  };
+}
+
+const settleAdminPage = () => new Promise((resolve) => setImmediate(resolve));
+const CODEX_AND_CLAUDE_STATUS = ["/admin/providers/codex/device-login/status", "/admin/providers/claude/device-login/status"];
+
+await runAsync("admin page reuses subscription sign-in status when cards expand or collapse", async () => {
+  const page = runAdminConfigPageScript(() => ({ ok: true, body: { authenticated: true, expiresAt: Date.now() + 3_600_000 } }));
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, CODEX_AND_CLAUDE_STATUS);
+  assert.deepEqual(page.signedInLabels(), ["Signed in", "Signed in"]);
+
+  page.toggleCard(2);
+  page.toggleCard(0);
+  page.toggleCard(0);
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, CODEX_AND_CLAUDE_STATUS);
+  assert.deepEqual(page.signedInLabels(), ["Signed in", "Signed in"]);
+
+  page.clickRefresh();
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, [...CODEX_AND_CLAUDE_STATUS, ...CODEX_AND_CLAUDE_STATUS]);
+});
+
+await runAsync("admin page re-queries subscription status after a failed lookup or an expired credential", async () => {
+  let response = { ok: false, body: { error: "boom" } as unknown };
+  const page = runAdminConfigPageScript(() => response);
+  await settleAdminPage();
+  assert.deepEqual(page.signedInLabels(), []);
+
+  response = { ok: true, body: { authenticated: true, expiresAt: Date.now() + 50 } };
+  page.toggleCard(2);
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, [...CODEX_AND_CLAUDE_STATUS, ...CODEX_AND_CLAUDE_STATUS]);
+  assert.deepEqual(page.signedInLabels(), ["Signed in", "Signed in"]);
+
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  page.toggleCard(2);
+  await settleAdminPage();
+  assert.deepEqual(page.statusRequests, [...CODEX_AND_CLAUDE_STATUS, ...CODEX_AND_CLAUDE_STATUS, ...CODEX_AND_CLAUDE_STATUS]);
 });
 
 run("admin page disables testing unsaved models and groups custom provider models", () => {

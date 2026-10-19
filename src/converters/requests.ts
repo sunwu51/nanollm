@@ -15,7 +15,9 @@ import type { ContentBlockParam } from "@anthropic-ai/sdk/resources/messages/mes
 import {
   collapseText,
   createResponsesCustomToolSchema,
+  decodeReasoningCarrier,
   fail,
+  isReasoningCarrier,
   joinOpenAIResponsesNamespacePath,
   makeDataUrl,
   normalizeReasoningEffort,
@@ -474,12 +476,27 @@ function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage
     if (itemType === "message") return [normalizeOpenAIResponsesMessage(item)];
     if (itemType === "agent_message") return [normalizeOpenAIResponsesAgentMessage(item)];
     if (itemType === "reasoning") {
-      const reasoningParts = Array.isArray(item.summary) && item.summary.length > 0 ? item.summary : Array.isArray(item.content) ? item.content : [];
+      // Thinking nanollm converted from another protocol comes back intact (with its
+      // signature) even when the client dropped the summary.
+      const carried = decodeReasoningCarrier(item.encrypted_content);
+      if (carried) return [{
+        role: "assistant",
+        parts: carried.redactedThinking !== undefined
+          ? [{ type: "redacted_thinking", data: carried.redactedThinking, origin: "anthropic" }]
+          : [{ type: "thinking", thinking: carried.thinking, signature: carried.signature }],
+      }];
+      // Same priority as the response side: raw reasoning text first, summary as fallback.
+      const reasoningParts = Array.isArray(item.content) && item.content.length > 0 ? item.content : Array.isArray(item.summary) ? item.summary : [];
       const thinking = reasoningParts.map((part: any) => ({ type: "thinking" as const, thinking: part.text }));
-      const redactedThinking = item.encrypted_content && thinking.length === 0 ? [{ type: "redacted_thinking" as const, data: item.encrypted_content }] : [];
+      // Native encrypted reasoning is independent of any readable content or summary.
+      const redactedThinking = item.encrypted_content && !isReasoningCarrier(item.encrypted_content) ? [{ type: "redacted_thinking" as const, data: item.encrypted_content, origin: "openai-responses" as const }] : [];
       return [{
         role: "assistant",
         parts: [...thinking, ...redactedThinking],
+        responsesReasoning: {
+          ...(typeof item.id === "string" ? { id: item.id } : {}),
+          textField: Array.isArray(item.content) && item.content.length > 0 ? "content" : "summary",
+        },
       }];
     }
     if (itemType === "function_call") {
@@ -607,6 +624,11 @@ function normalizeAnthropicSystem(system: any): NormalizedMessage {
 }
 
 function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
+  // Compatible Messages providers may also send system messages in the messages array.
+  const role = message.role as string;
+  if (role === "system") {
+    return [{ ...normalizeAnthropicSystem(message.content), role }];
+  }
   if (typeof message.content === "string") return [{ role: message.role, parts: [text(message.content)] }];
   if (message.role === "assistant") {
     const parts: NormalizedMessage["parts"] = [];
@@ -614,7 +636,7 @@ function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
     for (const block of message.content as any[]) {
       if (block.type === "text") parts.push(text(block.text));
       else if (block.type === "thinking") parts.push({ type: "thinking", thinking: block.thinking, signature: block.signature });
-      else if (block.type === "redacted_thinking") parts.push({ type: "redacted_thinking", data: block.data });
+      else if (block.type === "redacted_thinking") parts.push({ type: "redacted_thinking", data: block.data, origin: "anthropic" });
       else if (block.type === "tool_use" || block.type === "server_tool_use") toolCalls.push({ kind: "function", id: block.id, name: block.name, payload: JSON.stringify(block.input) });
     }
     return [{ role: "assistant", parts, toolCalls }];
@@ -871,9 +893,32 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
           return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
         });
       
-      return contentParts.length > 0 ? [{ type: "message", role: message.role, content: contentParts }] : [];
+      return contentParts.length > 0 ? [{ type: "message", role: message.role === "system" ? "developer" : message.role, content: contentParts }] : [];
     }
     case "assistant": {
+      const thinking = message.parts.filter((part) => part.type === "thinking");
+      // Opaque payloads are protocol-specific. Only native Responses reasoning
+      // may be replayed as encrypted_content; Claude signatures/redactions cannot.
+      const encrypted = preserveThinking
+        ? message.parts.filter((part) => part.type === "redacted_thinking").filter((part) => part.origin !== "anthropic")
+        : [];
+      const native = preserveThinking ? message.responsesReasoning : undefined;
+      const reasoningItems = native
+        ? [{
+            type: "reasoning",
+            ...(native.id ? { id: native.id } : {}),
+            summary: native.textField === "summary" ? thinking.map((part) => ({ type: "summary_text", text: part.thinking })) : [],
+            ...(native.textField === "content" ? { content: thinking.map((part) => ({ type: "reasoning_text", text: part.thinking })) } : {}),
+            ...(encrypted[0] ? { encrypted_content: encrypted[0].data } : {}),
+          }]
+        : [
+            ...thinking.filter((part) => part.thinking.length > 0).map((part) => ({
+              type: "reasoning",
+              summary: [],
+              content: [{ type: "reasoning_text", text: part.thinking }],
+            })),
+            ...encrypted.map((part) => ({ type: "reasoning", summary: [], encrypted_content: part.data })),
+          ];
       const contentParts = message.parts
         .filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking")
         .map((part) => {
@@ -905,6 +950,7 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
       }) ?? [];
       
       return [
+        ...reasoningItems,
         ...(contentParts.length > 0 || toolCallItems.length > 0 ? [{ type: "message", role: "assistant", content: contentParts }] : []),
         ...toolCallItems,
       ];
@@ -934,7 +980,16 @@ function denormalizeAnthropicMessage(message: NormalizedMessage, preserveThinkin
   }
 }
 
-function denormalizeAnthropicUserParts(parts: NormalizedMessage["parts"]): any {
+// Anthropic rejects empty text blocks ("text content blocks must be non-empty"),
+// e.g. the content: "" a streaming Chat client keeps for a tool-call turn.
+// Drop them, unless nothing else is left to send.
+function dropEmptyAnthropicText(parts: NormalizedMessage["parts"]): NormalizedMessage["parts"] {
+  const kept = parts.filter((part) => !((part.type === "text" || part.type === "refusal") && part.text === ""));
+  return kept.length > 0 ? kept : parts;
+}
+
+function denormalizeAnthropicUserParts(allParts: NormalizedMessage["parts"]): any {
+  const parts = dropEmptyAnthropicText(allParts);
   if (parts.length === 1 && parts[0].type === "text") return parts[0].text;
   return parts.map((part) => {
     if (part.type === "text") return { type: "text", text: part.text, cache_control: part.cacheControl };
@@ -948,12 +1003,12 @@ function denormalizeAnthropicUserParts(parts: NormalizedMessage["parts"]): any {
 
 function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserveThinking: boolean, ignoreInvalidHistory: boolean): ContentBlockParam[] {
   const blocks = message.parts.flatMap<ContentBlockParam>((part) => {
-    if (part.type === "text" || part.type === "refusal") return { type: "text", text: part.text, citations: null };
+    if (part.type === "text" || part.type === "refusal") return part.text === "" ? [] : [{ type: "text", text: part.text, citations: null }];
     if (part.type === "thinking") {
       if (ignoreInvalidHistory && (part.signature === undefined || part.signature === null || part.signature === "")) return [];
       return [{ type: "thinking", thinking: part.thinking, signature: part.signature ?? "" }];
     }
-    if (part.type === "redacted_thinking") return preserveThinking ? [{ type: "redacted_thinking", data: part.data }] : [];
+    if (part.type === "redacted_thinking") return part.origin === "anthropic" || (preserveThinking && part.origin === undefined) ? [{ type: "redacted_thinking", data: part.data }] : [];
     return { type: "text", text: collapseText([part]), citations: null };
   });
   for (const toolCall of message.toolCalls ?? []) {
@@ -963,8 +1018,9 @@ function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserve
   return blocks;
 }
 
-function denormalizeAnthropicToolResultParts(parts: NormalizedMessage["parts"]): any {
-  if (parts.every((part) => part.type === "text")) return collapseText(parts);
+function denormalizeAnthropicToolResultParts(allParts: NormalizedMessage["parts"]): any {
+  if (allParts.every((part) => part.type === "text")) return collapseText(allParts);
+  const parts = dropEmptyAnthropicText(allParts);
   return parts.map((part) => {
     if (part.type === "text") return { type: "text", text: part.text };
     if (part.type === "image_url") {

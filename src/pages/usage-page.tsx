@@ -574,7 +574,7 @@ export const USAGE_SCRIPT = String.raw`
       currentUsageMetric = USAGE_METRIC_EL.value;
       renderUsageSummary();
       renderUsageHeatmap();
-      fetch(MODEL_PRICES_URL, { cache: "force-cache" })
+      fetch(MODEL_PRICES_URL, { cache: "no-cache" })
         .then((response) => {
           if (!response.ok) throw new Error("HTTP " + response.status);
           return response.json();

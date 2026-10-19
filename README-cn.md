@@ -453,7 +453,7 @@ models:
 4. `HTTP_PROXY`
 5. 直连
 
-当 `proxy` 为空字符串或未配置时，会继续回退到下一级；当前支持 `http://` 和 `https://` 代理 URL。管理页面的供应商和模型卡片中都可以直接编辑 `proxy`。
+当 `proxy` 为空字符串或未配置时，会继续回退到下一级；`NO_PROXY`（或 `no_proxy`）中列出的主机不走 `HTTPS_PROXY` / `HTTP_PROXY`，直接连接，匹配规则与 curl 一致：逗号或空格分隔，`*` 匹配所有主机，`example.com` 与 `.example.com` 同时匹配子域名，`host:port` 只匹配该端口；它不影响 `models[*].proxy` 和 `providers[*].proxy`。当前支持 `http://` 和 `https://` 代理 URL。管理页面的供应商和模型卡片中都可以直接编辑 `proxy`。
 
 ### 模型名通配符 `*`
 
@@ -693,6 +693,7 @@ npm 发布包包含 Windows x64、Linux x64 和 macOS arm64 三个平台的 help
 | `NANOLLM_SQLITE_URL` / `NANOLLM_SQLITE_AUTH_TOKEN` | 远程 libSQL/quicSQL 地址与 token，仅 `--storage sqlite` 生效 |
 | `NANOLLM_SHUTDOWN_TIMEOUT_MS` | 优雅停机总超时，默认 25000 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | 访问下游供应商的默认代理（优先级见 HTTP proxy 一节） |
+| `NO_PROXY` / `no_proxy` | 不走 `HTTPS_PROXY` / `HTTP_PROXY` 的主机，例如 `localhost,127.0.0.1,.internal.example` |
 
 配置文件中的 `${ENV_NAME}` 写法会在加载时替换为同名环境变量。
 

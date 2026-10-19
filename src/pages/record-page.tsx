@@ -1395,6 +1395,17 @@ const SCRIPT = String.raw`
             }
           }
 
+          if (type === "response.reasoning_text.delta" && payload.delta != null) {
+            const oi = payload.output_index;
+            const item = outputItems.get(oi);
+            if (item && item.type === "reasoning") {
+              const ci = payload.content_index ?? 0;
+              if (!Array.isArray(item.content)) item.content = [];
+              while (item.content.length <= ci) item.content.push({ type: "reasoning_text", text: "" });
+              item.content[ci].text += payload.delta;
+            }
+          }
+
           if (type === "response.function_call_arguments.delta" && payload.delta != null) {
             const oi = payload.output_index;
             var fcaKey = "tool_" + oi;

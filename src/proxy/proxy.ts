@@ -1,6 +1,8 @@
 import type { ModelConfig } from "../core/config.js";
 import { SSEParser, type StreamFormat } from "../converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "../converters/shared.js";
+import { decodeReasoningCarrier, isReasoningCarrier } from "../converters/shared.js";
+import { applyReasoningHistoryRules, shouldDropUnsignedThinking } from "./reasoning-history.js";
 import {
   denormalizeToOpenAIChatRequest,
   denormalizeToOpenAIResponsesRequest,
@@ -21,10 +23,11 @@ import {
 import { runInNewContext } from "node:vm";
 import { randomUUID } from "node:crypto";
 import { Agent, ProxyAgent, fetch as undiciFetch, type Dispatcher, type RequestInit as UndiciRequestInit } from "undici";
+import { resolveEnvProxy } from "../core/env-proxy.js";
 import { extractErrorCauses } from "../core/error-details.js";
 import { getClientIp, getClientRequestHeaders } from "../core/request-context.js";
 import { getCachedSubscriptionCredential, ensureSubscriptionCredential, SUBSCRIPTION_URL } from "../subscriptions/openai-subscription.js";
-import { getCurrentCodexVersion } from "../subscriptions/codex-version.js";
+import { CODEX_RELEASES_URL, getCurrentCodexVersion } from "../subscriptions/codex-version.js";
 import { CLAUDE_CODE_DEFAULT_HEADERS, CLAUDE_CODE_PLATFORM_HEADERS, CODEX_CLI_ORIGINATOR, CODEX_CLI_VERSION, buildCodexCliUserAgent } from "../subscriptions/subscription-client-compat.js";
 import { addClaudeBillingBlock } from "../subscriptions/claude-billing.js";
 import { applyClaudeSubscriptionSessionIdentity, hasClaudeMetadataUserId, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../subscriptions/claude-subscription-body.js";
@@ -127,7 +130,7 @@ function denormalizeRequest(config: ModelConfig, normalized: NormalizedRequest):
       return denormalizeToOpenAIResponsesRequest(normalized);
     case "anthropic":
       return denormalizeToAnthropicRequest(normalized, {
-        ignoreInvalidHistory: config.ignore_invalid_history ?? true,
+        ignoreInvalidHistory: shouldDropUnsignedThinking(config),
         defaultMaxOutputTokens: config.claude_subscription_provider ? CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS : undefined,
       });
   }
@@ -354,10 +357,31 @@ export async function aggregateCodexResponsesStream(body: ReadableStream<Uint8Ar
   return result;
 }
 
+/**
+ * A Responses upstream cannot verify nanollm's private carrier. Restore its
+ * plaintext as reasoning content instead of discarding the entire history item.
+ */
+function restoreNanollmReasoningCarriers(config: ModelConfig, body: unknown): unknown {
+  if (config.provider !== "openai-responses" || !isPlainObject(body) || !Array.isArray(body.input)) return body;
+  let changed = false;
+  const input = body.input.flatMap((item) => {
+    if (!isPlainObject(item) || item.type !== "reasoning" || !isReasoningCarrier(item.encrypted_content)) return [item];
+    changed = true;
+    const carried = decodeReasoningCarrier(item.encrypted_content);
+    if (carried) return carried.thinking
+      ? [{ type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: carried.thinking }] }]
+      : [];
+    // A malformed private carrier is still not a native encrypted payload.
+    const { encrypted_content: _carrier, ...readable } = item;
+    return [readable];
+  });
+  return changed ? { ...body, input } : body;
+}
+
 function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unknown>, stream: boolean): unknown {
   return stripOpenAIResponsesUnstoredItemIds(
     config,
-    applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream }),
+    applyReasoningHistoryRules(config, restoreNanollmReasoningCarriers(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream }))),
   );
 }
 
@@ -569,14 +593,15 @@ function getForwardHeaders(config: ModelConfig, body: unknown, options?: Upstrea
   );
   if (config.claude_subscription_provider) applyClaudeSubscriptionHeaders(headers, isPlainObject(body) && body.stream === true);
   if (config.subscription_provider) {
-    applyCodexSubscriptionIdentityHeaders(headers, getCurrentCodexVersion(resolveProxyUrl(config)));
+    applyCodexSubscriptionIdentityHeaders(headers, getCurrentCodexVersion(resolveProxyUrl(config, CODEX_RELEASES_URL)));
     applyCodexSubscriptionHeaders(headers, body);
   }
   return mergeHeaders(headers, config.headers);
 }
 
-export function resolveProxyUrl(config: ModelConfig): string | undefined {
-  return config.proxy || config.provider_proxy || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+/** Model proxy, then custom provider proxy, then the environment proxy unless `NO_PROXY` lists the target host. */
+export function resolveProxyUrl(config: ModelConfig, targetUrl = getUpstreamURL(config)): string | undefined {
+  return config.proxy || config.provider_proxy || resolveEnvProxy(targetUrl);
 }
 
 const upstreamAgents = {
@@ -659,7 +684,7 @@ async function upstreamFetchToUrl(
   options?: UpstreamRequestOptions,
   recordedRequestBody: unknown = typeof body === "string" ? body : "[binary body]",
 ): Promise<{ response: Response; timing: UpstreamTiming }> {
-  const proxyUrl = resolveProxyUrl(config);
+  const proxyUrl = resolveProxyUrl(config, url);
   const timeoutMs = config.ttfb_timeout;
   const abortController = timeoutMs !== undefined ? new AbortController() : undefined;
   let timeoutHandle: NodeJS.Timeout | undefined;
@@ -928,7 +953,7 @@ function getRawForwardHeaders(
     headers[key] = value;
   }
   const forwardHeaders = mergeHeaders(headers, getAuthHeaders(config), options?.userAgent ? { "User-Agent": options.userAgent } : undefined);
-  if (config.subscription_provider) applyCodexSubscriptionIdentityHeaders(forwardHeaders, getCurrentCodexVersion(resolveProxyUrl(config)));
+  if (config.subscription_provider) applyCodexSubscriptionIdentityHeaders(forwardHeaders, getCurrentCodexVersion(resolveProxyUrl(config, CODEX_RELEASES_URL)));
   return mergeHeaders(forwardHeaders, config.headers);
 }
 
@@ -1035,7 +1060,7 @@ export async function forwardRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
+  const body = applyReasoningHistoryRules(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
   const { response, timing } = await upstreamFetch(config, body, false, options,
     normalized.sourceFormat === "openai-chat" || normalized.sourceFormat === "openai-responses" ? normalized.promptCacheKey : undefined);
   const json = await readNonStreamUpstreamJson(config, response, options);
@@ -1052,7 +1077,7 @@ export async function forwardStreamRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
+  const body = applyReasoningHistoryRules(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
   const { response, timing } = await upstreamFetch(config, body, true, options,
     normalized.sourceFormat === "openai-chat" || normalized.sourceFormat === "openai-responses" ? normalized.promptCacheKey : undefined);
   if (!response.body) throw new Error("Upstream returned no streaming body");

@@ -85,7 +85,7 @@ const zh = {
   subscriptionNote: "Base URL 和 API key 由订阅登录自动管理。请先保存供应商及代理配置，再点击登录。",
   apiKeyPlaceholderEnv: "支持直接填 key 或环境变量占位符",
   apiKeyPlaceholder: "支持直接填 key 或 ${ENV_VAR}",
-  providerProxyHelper: "可选。引用该供应商的模型调用上游时使用的 HTTP proxy；优先级：模型 proxy > 供应商 proxy > HTTPS_PROXY/HTTP_PROXY。订阅（OpenAI / Claude）登录、凭证刷新和用量查询也使用此代理；修改后请先保存配置。",
+  providerProxyHelper: "可选。引用该供应商的模型调用上游时使用的 HTTP proxy；优先级：模型 proxy > 供应商 proxy > HTTPS_PROXY/HTTP_PROXY（NO_PROXY 中的主机直连）。订阅（OpenAI / Claude）登录、凭证刷新和用量查询也使用此代理；修改后请先保存配置。",
   claudeUsage: "Claude 订阅用量",
   windowFiveHour: "5 小时窗口",
   windowSevenDay: "7 天窗口",
@@ -168,7 +168,7 @@ const zh = {
   customProviderLabel: "custom_provider（引用上方供应商连接配置）",
   addProviderFirst: "请先添加供应商。",
   upstreamModelPlaceholder: "上游真实模型名",
-  modelProxyHelper: "可选。该模型调用上游时使用的 HTTP proxy，优先级最高；留空则依次回退到供应商 proxy、HTTPS_PROXY/HTTP_PROXY。",
+  modelProxyHelper: "可选。该模型调用上游时使用的 HTTP proxy，优先级最高；留空则依次回退到供应商 proxy、HTTPS_PROXY/HTTP_PROXY（NO_PROXY 中的主机直连）。",
   modelAuthTokenHelper: "可选。客户端用这个 token（Authorization: Bearer 或 x-api-key）只能以该模型名访问它；管理员 token 始终可用。支持 ${ENV_VAR}。",
   groupAuthTokenHelper: "可选。客户端用这个 token 只能以分组名访问该分组（会按顺序回退到所有成员），不能直接访问成员模型；管理员 token 始终可用。支持 ${ENV_VAR}。",
   authTokenPlaceholder: "留空则仅管理员 token 可访问",
@@ -294,7 +294,7 @@ const MESSAGES: Record<Lang, typeof zh> = {
     subscriptionNote: "Base URL and API key are managed by the subscription sign-in. Save the provider and its proxy first, then click Sign in.",
     apiKeyPlaceholderEnv: "A key or an environment variable placeholder",
     apiKeyPlaceholder: "A key or ${ENV_VAR}",
-    providerProxyHelper: "Optional. HTTP proxy used when models that reference this provider call the upstream. Priority: model proxy > provider proxy > HTTPS_PROXY/HTTP_PROXY. Subscription (OpenAI / Claude) sign-in, credential refresh and usage checks also use this proxy; save the config after changing it.",
+    providerProxyHelper: "Optional. HTTP proxy used when models that reference this provider call the upstream. Priority: model proxy > provider proxy > HTTPS_PROXY/HTTP_PROXY (hosts in NO_PROXY connect directly). Subscription (OpenAI / Claude) sign-in, credential refresh and usage checks also use this proxy; save the config after changing it.",
     claudeUsage: "Claude subscription usage",
     windowFiveHour: "5-hour window",
     windowSevenDay: "7-day window",
@@ -377,7 +377,7 @@ const MESSAGES: Record<Lang, typeof zh> = {
     customProviderLabel: "custom_provider (uses a provider above)",
     addProviderFirst: "Add a provider first.",
     upstreamModelPlaceholder: "Upstream model name",
-    modelProxyHelper: "Optional. HTTP proxy for this model's upstream calls, with the highest priority; if empty, falls back to the provider proxy, then HTTPS_PROXY/HTTP_PROXY.",
+    modelProxyHelper: "Optional. HTTP proxy for this model's upstream calls, with the highest priority; if empty, falls back to the provider proxy, then HTTPS_PROXY/HTTP_PROXY (hosts in NO_PROXY connect directly).",
     modelAuthTokenHelper: "Optional. Clients sending this token (Authorization: Bearer or x-api-key) can use this model by its name only; the admin token always works. Supports ${ENV_VAR}.",
     groupAuthTokenHelper: "Optional. Clients sending this token can use this group by its name only (falling back through all members), not the member models directly; the admin token always works. Supports ${ENV_VAR}.",
     authTokenPlaceholder: "Empty = admin token only",
@@ -1033,6 +1033,35 @@ const SCRIPT = /* js */ String.raw`
       let draggedCard = null;
       // Provider names whose grouped model card is expanded; groups are collapsed by default.
       const expandedModelGroups = new Set();
+      // Sign-in status lookups per subscription provider ("type:name"), kept across renders so that expanding or
+      // collapsing any card does not query every subscription provider again. Cleared when the saved config reloads.
+      const subscriptionStatusCache = new Map();
+
+      function subscriptionStatusKey(provider) {
+        return provider.provider + ":" + provider.name;
+      }
+
+      function loadSubscriptionStatus(provider) {
+        const key = subscriptionStatusKey(provider);
+        const cached = subscriptionStatusCache.get(key);
+        if (cached && !(cached.expiresAt && cached.expiresAt <= Date.now())) return cached.request;
+        const entry = { expiresAt: null, request: null };
+        entry.request = fetch("/admin/providers/" + encodeURIComponent(provider.name) + "/device-login/status", { cache: "no-store" })
+          .then((response) => {
+            if (!response.ok) throw new Error(T.statusUnknown);
+            return response.json();
+          })
+          .then((value) => {
+            entry.expiresAt = value.authenticated ? value.expiresAt : null;
+            return value;
+          });
+        // Forget failed lookups so the next render retries instead of replaying the error.
+        entry.request.catch(() => {
+          if (subscriptionStatusCache.get(key) === entry) subscriptionStatusCache.delete(key);
+        });
+        subscriptionStatusCache.set(key, entry);
+        return entry.request;
+      }
 
       function nextId(prefix) {
         localIdCounter += 1;
@@ -1555,7 +1584,10 @@ const SCRIPT = /* js */ String.raw`
           actions.className = "card-actions";
           if (SUBSCRIPTION_PROVIDERS.includes(provider.provider)) {
             const isClaude = provider.provider === "claude-subscription";
-            const markAuthenticated = () => { status.textContent = T.signedIn; status.className = "success"; loginButton.textContent = T.signInAgain; usageButton.hidden = false; };
+            const markAuthenticated = () => {
+              // The next render re-reads the new credential's expiry from the server.
+              subscriptionStatusCache.delete(subscriptionStatusKey(provider));
+              status.textContent = T.signedIn; status.className = "success"; loginButton.textContent = T.signInAgain; usageButton.hidden = false; };
             const status = document.createElement("span");
             status.className = "meta";
             status.textContent = T.checkingSignIn;
@@ -1632,8 +1664,7 @@ const SCRIPT = /* js */ String.raw`
               finally { usageButton.disabled = false; usageButton.textContent = T.checkUsage; }
             });
             usageButton.hidden = true;
-            fetch("/admin/providers/" + encodeURIComponent(provider.name) + "/device-login/status")
-              .then((response) => response.json())
+            loadSubscriptionStatus(provider)
               .then((value) => {
                 status.textContent = value.authenticated ? T.signedIn : T.notSignedIn;
                 status.className = value.authenticated ? "success" : "meta";
@@ -2935,6 +2966,7 @@ const SCRIPT = /* js */ String.raw`
         }
         currentSnapshot = payload;
         formState = hydrateForm(payload.form);
+        subscriptionStatusCache.clear();
         markDirty(false);
         renderAll();
         return payload;
@@ -2984,6 +3016,7 @@ const SCRIPT = /* js */ String.raw`
               currentSnapshot = payload.currentSnapshot;
               if (response.status === 409) {
                 formState = hydrateForm(payload.currentSnapshot.form);
+                subscriptionStatusCache.clear();
               }
               renderAll();
             }
@@ -2997,6 +3030,7 @@ const SCRIPT = /* js */ String.raw`
 
           currentSnapshot = payload.snapshot;
           formState = hydrateForm(payload.snapshot.form);
+          subscriptionStatusCache.clear();
           markDirty(false);
           renderAll();
           if (payload.requiresRestartFields.length > 0) {

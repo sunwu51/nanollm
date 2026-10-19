@@ -1,7 +1,7 @@
 import type { OpenAIChatStreamChunk as ChatCompletionChunk } from "./shared.js";
 import type { ResponseStreamEvent } from "openai/resources/responses/responses";
 import type { RawMessageStreamEvent } from "@anthropic-ai/sdk/resources/messages/messages";
-import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, normalizeUsage, qualifyOpenAIResponsesToolName, sanitizeAnthropicToolId, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput, type NormalizedUsage } from "./shared.js";
+import { decodeReasoningCarrier, denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, encodeReasoningCarrier, encodeRedactedReasoningCarrier, isReasoningCarrier, normalizeUsage, qualifyOpenAIResponsesToolName, sanitizeAnthropicToolId, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput, type NormalizedUsage } from "./shared.js";
 import { isResponsesCustomToolName, } from "../core/request-context.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -10,9 +10,10 @@ export type StreamFormat = "openai-chat" | "openai-responses" | "anthropic" | "o
 
 export type NormalizedStreamEvent =
   | { type: "start"; id: string; model: string; createdAt: number }
-  | { type: "content_start"; index: number; contentType: "text" | "refusal" | "thinking" | "redacted_thinking" }
+  | { type: "content_start"; index: number; contentType: "text" | "refusal" | "thinking" | "redacted_thinking"; data?: string; origin?: "anthropic" | "openai-responses"; reasoningId?: string }
   | { type: "content_delta"; index: number; delta: string }
   | { type: "signature_delta"; index: number; delta: string }
+  | { type: "reasoning_metadata"; index: number; id?: string; encryptedContent: string }
   | { type: "content_done"; index: number }
   | { type: "tool_start"; index: number; id: string; name: string; kind: "function" | "custom" }
   | { type: "tool_delta"; index: number; delta: string }
@@ -264,9 +265,22 @@ export class ResponsesStreamParser implements StreamParser {
   private blockTypes = new Map<string, "text" | "refusal" | "thinking">();
   private nextIndex = 0;
   private seenToolCall = false;
+  private reasoningSources = new Map<number, "summary" | "content">();
+  private openThinkingBlocks = new Map<string, number>();
+  private thinkingTexts = new Map<string, string>();
+  private thinkingBlockOffsets = new Map<string, number>();
+  private firstThinkingBlocks = new Map<number, number>();
+  private reasoningItems = new Map<number, any>();
+  private reasoningItemIndexes = new Map<string, number>();
+  private emittedReasoningMetadata = new Set<number>();
+  private ended = false;
 
   parse(event: ResponseStreamEvent): NormalizedStreamEvent[] {
     const out: NormalizedStreamEvent[] = [];
+    if (this.ended) return out;
+    if (event.type.startsWith("response.reasoning_") && "item_id" in event && "output_index" in event) {
+      this.reasoningItemIndexes.set(event.item_id, event.output_index);
+    }
 
     switch (event.type) {
       case "response.created": {
@@ -280,6 +294,11 @@ export class ResponsesStreamParser implements StreamParser {
 
       case "response.output_item.added": {
         const item = event.item;
+        if (item.type === "reasoning") {
+          this.rememberReasoningItem(event.output_index, item, false);
+          break;
+        }
+        this.finishReasoningItems(out);
         if (item.type === "function_call" || item.type === "custom_tool_call") {
           this.seenToolCall = true;
           const idx = this.nextIndex++;
@@ -300,11 +319,13 @@ export class ResponsesStreamParser implements StreamParser {
         const key = `${event.output_index}_${event.content_index}`;
         const partType = event.part?.type;
         if (partType === "output_text") {
+          this.finishReasoningItems(out);
           const idx = this.nextIndex++;
           this.blockMapping.set(key, idx);
           this.blockTypes.set(key, "text");
           out.push({ type: "content_start", index: idx, contentType: "text" });
         } else if (partType === "refusal") {
+          this.finishReasoningItems(out);
           const idx = this.nextIndex++;
           this.blockMapping.set(key, idx);
           this.blockTypes.set(key, "refusal");
@@ -337,6 +358,7 @@ export class ResponsesStreamParser implements StreamParser {
       case "response.custom_tool_call_input.delta": {
         const key = `tool_${event.output_index}`;
         if (!this.blockMapping.has(key)) {
+          this.finishReasoningItems(out);
           const idx = this.nextIndex++;
           this.blockMapping.set(key, idx);
           this.seenToolCall = true;
@@ -348,32 +370,45 @@ export class ResponsesStreamParser implements StreamParser {
       }
 
       case "response.reasoning_summary_text.delta": {
-        const key = `thinking_${event.output_index}_${event.summary_index}`;
-        if (!this.blockMapping.has(key)) {
-          const idx = this.nextIndex++;
-          this.blockMapping.set(key, idx);
-          this.blockTypes.set(key, "thinking");
-          out.push({ type: "content_start", index: idx, contentType: "thinking" });
-        }
-        const idx = this.blockMapping.get(key)!;
-        out.push({ type: "content_delta", index: idx, delta: event.delta });
+        this.pushThinkingDelta(out, event.output_index, "summary", event.summary_index, event.delta);
         break;
       }
 
       case "response.reasoning_summary_part.added":
+        break;
+
       case "response.reasoning_summary_part.done": {
-        const key = `thinking_${event.output_index}_${event.summary_index}`;
-        const idx = this.blockMapping.get(key);
-        if (idx != null && event.type === "response.reasoning_summary_part.done") {
-          out.push({ type: "content_done", index: idx });
+        this.replayThinkingText(out, event.output_index, "summary", event.summary_index, event.part?.text);
+        break;
+      }
+
+      case "response.reasoning_summary_text.done": {
+        this.replayThinkingText(out, event.output_index, "summary", event.summary_index, event.text);
+        break;
+      }
+
+      // Raw reasoning (gpt-oss and compatible backends) streams as reasoning_text
+      // instead of a summary. It is plaintext, unlike encrypted_content.
+      case "response.reasoning_text.delta": {
+        this.pushThinkingDelta(out, event.output_index, "content", event.content_index, event.delta);
+        break;
+      }
+
+      case "response.reasoning_text.done": {
+        this.replayThinkingText(out, event.output_index, "content", event.content_index, event.text);
+        break;
+      }
+
+      case "response.output_item.done": {
+        if (event.item.type === "reasoning") {
+          const item = this.rememberReasoningItem(event.output_index, event.item, true);
+          this.finishReasoningItem(out, event.output_index, item);
         }
         break;
       }
 
       case "response.output_text.done":
       case "response.refusal.done":
-      case "response.reasoning_summary_text.done":
-      case "response.output_item.done":
         break;
 
       case "response.content_part.done": {
@@ -391,23 +426,30 @@ export class ResponsesStreamParser implements StreamParser {
         break;
       }
 
-      case "response.completed": {
+      case "response.completed":
+      case "response.incomplete": {
         const r = event.response;
+        this.finishResponseReasoning(out, r);
         // Some providers return an empty output array in response.completed even when
         // tool calls were streamed earlier via response.output_item.added events.
         // Fall back to seenToolCall to avoid incorrectly emitting finishReason "stop".
         const hasToolCalls = this.seenToolCall || r.output?.some((item: any) => item.type === "function_call" || item.type === "custom_tool_call");
-        const finishReason = r.status === "incomplete" ? "length" : hasToolCalls ? "tool_calls" : "stop";
+        const finishReason = event.type === "response.incomplete" || r.status === "incomplete" ? "length" : hasToolCalls ? "tool_calls" : "stop";
+        this.ended = true;
         out.push({ type: "end", finishReason, usage: normalizeUsage(r.usage) });
         break;
       }
 
       case "response.failed": {
+        this.finishResponseReasoning(out, event.response);
+        this.ended = true;
         out.push({ type: "end", finishReason: "error" });
         break;
       }
 
       case "error": {
+        this.closeThinkingBlocks(out);
+        this.ended = true;
         out.push({ type: "end", finishReason: "error" });
         break;
       }
@@ -417,7 +459,144 @@ export class ResponsesStreamParser implements StreamParser {
   }
 
   finish(): NormalizedStreamEvent[] {
-    return [];
+    const out: NormalizedStreamEvent[] = [];
+    if (!this.ended) this.finishReasoningItems(out);
+    this.ended = true;
+    return out;
+  }
+
+  // An upstream may stream both a summary and raw reasoning text for the same
+  // item; the first source seen wins so the client gets a single copy.
+  private pushThinkingDelta(out: NormalizedStreamEvent[], outputIndex: number, source: "summary" | "content", partIndex: number, delta: string) {
+    if (!delta) return;
+    const chosen = this.reasoningSources.get(outputIndex);
+    if (chosen && chosen !== source) return;
+    this.reasoningSources.set(outputIndex, source);
+    const key = `${source === "summary" ? "thinking" : "reasoning"}_${outputIndex}_${partIndex}`;
+    const idx = this.startThinkingBlock(out, outputIndex, source, partIndex);
+    this.thinkingTexts.set(key, (this.thinkingTexts.get(key) ?? "") + delta);
+    out.push({ type: "content_delta", index: idx, delta });
+  }
+
+  private startThinkingBlock(out: NormalizedStreamEvent[], outputIndex: number, source: "summary" | "content", partIndex: number) {
+    const key = `${source === "summary" ? "thinking" : "reasoning"}_${outputIndex}_${partIndex}`;
+    for (const openKey of this.openThinkingBlocks.keys()) {
+      if (openKey !== key) this.closeThinkingBlock(out, openKey);
+    }
+    let idx = this.blockMapping.get(key);
+    if (idx == null || !this.openThinkingBlocks.has(key)) {
+      idx = this.nextIndex++;
+      this.blockMapping.set(key, idx);
+      this.blockTypes.set(key, "thinking");
+      this.openThinkingBlocks.set(key, outputIndex);
+      this.thinkingBlockOffsets.set(key, this.thinkingTexts.get(key)?.length ?? 0);
+      if (!this.firstThinkingBlocks.has(outputIndex)) this.firstThinkingBlocks.set(outputIndex, idx);
+      const reasoningId = this.reasoningItems.get(outputIndex)?.id ?? [...this.reasoningItemIndexes].find(([, index]) => index === outputIndex)?.[0];
+      out.push({ type: "content_start", index: idx, contentType: "thinking", ...(reasoningId ? { reasoningId } : {}) });
+    }
+    return idx;
+  }
+
+  private replayThinkingText(out: NormalizedStreamEvent[], outputIndex: number, source: "summary" | "content", partIndex: number, value: unknown) {
+    if (typeof value !== "string" || !value) return;
+    const key = `${source === "summary" ? "thinking" : "reasoning"}_${outputIndex}_${partIndex}`;
+    const emitted = this.thinkingTexts.get(key) ?? "";
+    // Text already sent downstream cannot be replaced. Only append a verified tail.
+    if (value.startsWith(emitted)) this.pushThinkingDelta(out, outputIndex, source, partIndex, value.slice(emitted.length));
+  }
+
+  private closeThinkingBlock(out: NormalizedStreamEvent[], key: string) {
+    const idx = this.blockMapping.get(key);
+    if (idx == null || !this.openThinkingBlocks.delete(key)) return;
+    out.push({ type: "content_done", index: idx });
+  }
+
+  private closeThinkingBlocks(out: NormalizedStreamEvent[], outputIndex?: number) {
+    for (const [key, index] of this.openThinkingBlocks) {
+      if (outputIndex === undefined || index === outputIndex) this.closeThinkingBlock(out, key);
+    }
+  }
+
+  private rememberReasoningItem(outputIndex: number, item: any, terminal: boolean) {
+    if (typeof item.id === "string") this.reasoningItemIndexes.set(item.id, outputIndex);
+    const previous = this.reasoningItems.get(outputIndex);
+    const snapshot = { ...previous, ...item };
+    // Added-item encryption may be incomplete; only terminal events can supply it.
+    if (!terminal || !item.encrypted_content) snapshot.encrypted_content = previous?.encrypted_content;
+    for (const field of ["content", "summary"] as const) {
+      const parts = [...(Array.isArray(previous?.[field]) ? previous[field] : [])];
+      if (Array.isArray(item[field])) item[field].forEach((part: any, partIndex: number) => {
+        const oldText = parts[partIndex]?.text;
+        const newText = part?.text;
+        parts[partIndex] = typeof oldText === "string" && typeof newText === "string" && oldText.startsWith(newText)
+          ? { ...part, text: oldText }
+          : part;
+      });
+      snapshot[field] = parts;
+    }
+    this.reasoningItems.set(outputIndex, snapshot);
+    return snapshot;
+  }
+
+  private finishReasoningItems(out: NormalizedStreamEvent[]) {
+    for (const [outputIndex, item] of [...this.reasoningItems].sort(([a], [b]) => a - b)) {
+      this.finishReasoningItem(out, outputIndex, item);
+    }
+    this.closeThinkingBlocks(out);
+  }
+
+  private finishResponseReasoning(out: NormalizedStreamEvent[], response: { output?: any[] }) {
+    response.output?.forEach((item, outputIndex) => {
+      if (item.type !== "reasoning") return;
+      const index = this.reasoningItemIndexes.get(item.id) ?? outputIndex;
+      this.rememberReasoningItem(index, item, true);
+    });
+    this.finishReasoningItems(out);
+  }
+
+  // Close blocks whose done events never arrived, and replay reasoning that was
+  // only sent as the finished item (content first, like the non-stream path).
+  private finishReasoningItem(out: NormalizedStreamEvent[], outputIndex: number, item: any) {
+    const carried = decodeReasoningCarrier(item.encrypted_content);
+    if (carried?.redactedThinking !== undefined) {
+      if (!this.emittedReasoningMetadata.has(outputIndex)) {
+        const index = this.nextIndex++;
+        out.push({ type: "content_start", index, contentType: "redacted_thinking", data: carried.redactedThinking, origin: "anthropic" });
+        out.push({ type: "content_done", index });
+        this.emittedReasoningMetadata.add(outputIndex);
+      }
+      this.closeThinkingBlocks(out, outputIndex);
+      return;
+    }
+    const hasContent = item.content?.some((part: any) => typeof part?.text === "string" && part.text);
+    const source = this.reasoningSources.get(outputIndex) ?? (hasContent ? "content" : "summary");
+    const key = `${source === "summary" ? "thinking" : "reasoning"}_${outputIndex}_0`;
+    let parts: any[] = (source === "content" ? item.content : item.summary) ?? [];
+    if (carried && (!this.reasoningSources.has(outputIndex) || !parts.length || (parts.length === 1 && carried.thinking.startsWith(this.thinkingTexts.get(key) ?? "")))) {
+      parts = [{ text: carried.thinking }];
+    }
+    parts.forEach((part, partIndex) => {
+      this.replayThinkingText(out, outputIndex, source, partIndex, part?.text);
+    });
+    if (carried?.signature && carried.thinking === "" && !this.firstThinkingBlocks.has(outputIndex)) {
+      this.reasoningSources.set(outputIndex, source);
+      this.startThinkingBlock(out, outputIndex, source, 0);
+      this.thinkingTexts.set(key, "");
+    }
+    const firstIndex = this.firstThinkingBlocks.get(outputIndex);
+    if (carried?.signature && this.openThinkingBlocks.has(key) && this.thinkingBlockOffsets.get(key) === 0 && this.thinkingTexts.get(key) === carried.thinking) {
+      out.push({ type: "signature_delta", index: this.blockMapping.get(key)!, delta: carried.signature });
+    } else if (!carried && !isReasoningCarrier(item.encrypted_content) && typeof item.encrypted_content === "string" && item.encrypted_content && !this.emittedReasoningMetadata.has(outputIndex)) {
+      if (firstIndex !== undefined) {
+        out.push({ type: "reasoning_metadata", index: firstIndex, id: item.id, encryptedContent: item.encrypted_content });
+      } else {
+        const index = this.nextIndex++;
+        out.push({ type: "content_start", index, contentType: "redacted_thinking", data: item.encrypted_content, origin: "openai-responses", reasoningId: item.id });
+        out.push({ type: "content_done", index });
+      }
+      this.emittedReasoningMetadata.add(outputIndex);
+    }
+    this.closeThinkingBlocks(out, outputIndex);
   }
 }
 
@@ -445,11 +624,10 @@ export class AnthropicStreamParser implements StreamParser {
           out.push({ type: "content_start", index: idx, contentType: "text" });
         } else if (block.type === "thinking") {
           out.push({ type: "content_start", index: idx, contentType: "thinking" });
+          if (block.thinking) out.push({ type: "content_delta", index: idx, delta: block.thinking });
+          if (block.signature) out.push({ type: "signature_delta", index: idx, delta: block.signature });
         } else if (block.type === "redacted_thinking") {
-          out.push({ type: "content_start", index: idx, contentType: "redacted_thinking" });
-          if (block.data) {
-            out.push({ type: "content_delta", index: idx, delta: block.data });
-          }
+          out.push({ type: "content_start", index: idx, contentType: "redacted_thinking", data: block.data, origin: "anthropic" });
         } else if (block.type === "tool_use" || block.type === "server_tool_use") {
           out.push({ type: "tool_start", index: idx, id: block.id, name: block.name, kind: "function" });
         }
@@ -609,9 +787,13 @@ export class ResponsesStreamEmitter implements StreamEmitter {
   private blockToMapping = new Map<number, { outputIndex: number; contentIndex?: number; summaryIndex?: number }>();
   private blockTypes = new Map<number, string>();
   private accumulated = new Map<number, string>();
+  private signatures = new Map<number, string>();
+  private encryptedReasoning = new Map<number, string>();
+  private redactedOrigins = new Map<number, "anthropic" | "openai-responses">();
   private toolCallInfo = new Map<number, { id: string; name: string; custom: boolean; wrapped: boolean }>();
   private wrappedToolDecodedLengths = new Map<number, number>();
   private itemIds = new Map<number, string>();
+  private reasoningIds = new Set<string>();
   // Accumulate completed content parts and output items for done/completed events
   private messageContentParts: Record<string, unknown>[] = [];
   private completedOutputItems = new Map<number, Record<string, unknown>>();
@@ -655,14 +837,19 @@ export class ResponsesStreamEmitter implements StreamEmitter {
 
       case "content_start": {
         this.blockTypes.set(event.index, event.contentType);
-        this.accumulated.set(event.index, "");
+        this.accumulated.set(event.index, event.contentType === "redacted_thinking" ? event.data ?? "" : "");
 
-        if (event.contentType === "thinking") {
+        if (event.contentType === "thinking" || event.contentType === "redacted_thinking") {
           const oi = this.outputIndex++;
-          const itemId = this.makeItemId(oi, "rs");
+          let itemId = event.reasoningId ?? `rs_${oi}`;
+          let suffix = 0;
+          while (this.reasoningIds.has(itemId)) itemId = `rs_${oi}_${++suffix}`;
+          this.reasoningIds.add(itemId);
+          this.itemIds.set(oi, itemId);
           this.blockToMapping.set(event.index, { outputIndex: oi, summaryIndex: 0 });
+          if (event.contentType === "redacted_thinking") this.redactedOrigins.set(event.index, event.origin ?? "anthropic");
           out.push({ type: "response.output_item.added", output_index: oi, item: { id: itemId, type: "reasoning", status: "in_progress", summary: [] }, sequence_number: this.nextSeq() });
-          out.push({ type: "response.reasoning_summary_part.added", item_id: itemId, output_index: oi, summary_index: 0, part: { type: "summary_text", text: "" }, sequence_number: this.nextSeq() });
+          if (event.contentType === "thinking") out.push({ type: "response.reasoning_summary_part.added", item_id: itemId, output_index: oi, summary_index: 0, part: { type: "summary_text", text: "" }, sequence_number: this.nextSeq() });
         } else if (event.contentType === "text" || event.contentType === "refusal") {
           if (this.messageOutputIndex == null) {
             this.messageOutputIndex = this.outputIndex++;
@@ -701,6 +888,19 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         break;
       }
 
+      case "signature_delta": {
+        if (this.blockTypes.get(event.index) === "thinking") this.signatures.set(event.index, (this.signatures.get(event.index) ?? "") + event.delta);
+        break;
+      }
+
+      case "reasoning_metadata": {
+        this.encryptedReasoning.set(event.index, event.encryptedContent);
+        const mapping = this.blockToMapping.get(event.index);
+        const completed = mapping ? this.completedOutputItems.get(mapping.outputIndex) : undefined;
+        if (completed) completed.encrypted_content = event.encryptedContent;
+        break;
+      }
+
       case "content_done": {
         const ct = this.blockTypes.get(event.index);
         const mapping = this.blockToMapping.get(event.index);
@@ -721,10 +921,17 @@ export class ResponsesStreamEmitter implements StreamEmitter {
           out.push({ type: "response.refusal.done", item_id: itemId, output_index: mapping.outputIndex, content_index: mapping.contentIndex, refusal: acc, sequence_number: this.nextSeq() });
           out.push({ type: "response.content_part.done", item_id: itemId, output_index: mapping.outputIndex, content_index: mapping.contentIndex, part, sequence_number: this.nextSeq() });
         } else if (ct === "thinking") {
-          const reasoningItem = { id: itemId, type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: acc }] };
+          const reasoningItem = { id: itemId, type: "reasoning", status: "completed", summary: [{ type: "summary_text", text: acc }], encrypted_content: this.encryptedReasoning.get(event.index) ?? encodeReasoningCarrier(acc, this.signatures.get(event.index)) };
           this.completedOutputItems.set(mapping.outputIndex, reasoningItem);
           out.push({ type: "response.reasoning_summary_text.done", item_id: itemId, output_index: mapping.outputIndex, summary_index: mapping.summaryIndex ?? 0, text: acc, sequence_number: this.nextSeq() });
           out.push({ type: "response.reasoning_summary_part.done", item_id: itemId, output_index: mapping.outputIndex, summary_index: mapping.summaryIndex ?? 0, part: { type: "summary_text", text: acc }, sequence_number: this.nextSeq() });
+          out.push({ type: "response.output_item.done", output_index: mapping.outputIndex, item: reasoningItem, sequence_number: this.nextSeq() });
+        } else if (ct === "redacted_thinking") {
+          const reasoningItem = {
+            id: itemId, type: "reasoning", status: "completed", summary: [],
+            encrypted_content: this.redactedOrigins.get(event.index) === "openai-responses" ? acc : encodeRedactedReasoningCarrier(acc),
+          };
+          this.completedOutputItems.set(mapping.outputIndex, reasoningItem);
           out.push({ type: "response.output_item.done", output_index: mapping.outputIndex, item: reasoningItem, sequence_number: this.nextSeq() });
         }
         break;
@@ -909,6 +1116,7 @@ export class AnthropicStreamEmitter implements StreamEmitter {
   private blockIndex = 0;
   private normalizedToAnthropicIndex = new Map<number, number>();
   private toolKinds = new Map<number, "function" | "custom">();
+  private redactedData = new Map<number, string>();
 
   private encodeCustomToolDelta(delta: string): string {
     return JSON.stringify(delta).slice(1, -1);
@@ -945,6 +1153,8 @@ export class AnthropicStreamEmitter implements StreamEmitter {
       }
 
       case "content_start": {
+        // Responses ciphertext is not a Claude redacted_thinking payload.
+        if (event.contentType === "redacted_thinking" && event.origin === "openai-responses") break;
         const idx = this.getBlockIndex(event.index);
         this.blockTypes.set(event.index, event.contentType);
 
@@ -953,7 +1163,9 @@ export class AnthropicStreamEmitter implements StreamEmitter {
         } else if (event.contentType === "thinking") {
           out.push({ type: "content_block_start", index: idx, content_block: { type: "thinking", thinking: "", signature: "" } });
         } else if (event.contentType === "redacted_thinking") {
-          out.push({ type: "content_block_start", index: idx, content_block: { type: "redacted_thinking", data: "" } });
+          // Redacted data has no delta event in Anthropic; emit the complete
+          // payload at block stop, including data received at normalized start.
+          this.redactedData.set(event.index, event.data ?? "");
         } else if (event.contentType === "refusal") {
           out.push({ type: "content_block_start", index: idx, content_block: { type: "text", text: "", citations: null } });
         }
@@ -968,7 +1180,7 @@ export class AnthropicStreamEmitter implements StreamEmitter {
         if (ct === "thinking") {
           out.push({ type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: event.delta } });
         } else if (ct === "redacted_thinking") {
-          // redacted_thinking data is set at block start, no incremental delta
+          this.redactedData.set(event.index, (this.redactedData.get(event.index) ?? "") + event.delta);
         } else {
           out.push({ type: "content_block_delta", index: idx, delta: { type: "text_delta", text: event.delta } });
         }
@@ -985,6 +1197,10 @@ export class AnthropicStreamEmitter implements StreamEmitter {
       case "content_done": {
         const idx = this.normalizedToAnthropicIndex.get(event.index);
         if (idx == null) break;
+        if (this.blockTypes.get(event.index) === "redacted_thinking") {
+          out.push({ type: "content_block_start", index: idx, content_block: { type: "redacted_thinking", data: this.redactedData.get(event.index) ?? "" } });
+          this.redactedData.delete(event.index);
+        }
         out.push({ type: "content_block_stop", index: idx });
         break;
       }
