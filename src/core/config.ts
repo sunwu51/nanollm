@@ -27,8 +27,13 @@ export interface ModelConfig {
   body_expression?: string;
   response_expression?: string;
   ignore_invalid_history?: boolean;
+  reasoning_profile?: ReasoningProfile;
   auth_token?: string;
 }
+
+/** How replayed thinking is adapted to the upstream (see proxy/reasoning-history). */
+export type ReasoningProfile = "auto" | "claude" | "deepseek" | "none";
+const REASONING_PROFILES: readonly ReasoningProfile[] = ["auto", "claude", "deepseek", "none"];
 
 export type SubscriptionProviderType = "openai-subscription" | "claude-subscription";
 export const CLAUDE_SUBSCRIPTION_BASE_URL = "https://api.anthropic.com/v1";
@@ -133,6 +138,13 @@ function normalizeAuthToken(value: unknown): string | undefined {
   return value === undefined || value === null ? undefined : normalizeOptionalString(resolveEnvVars(String(value)));
 }
 
+function normalizeReasoningProfile(value: unknown, fieldName: string): ReasoningProfile {
+  if (value === undefined || value === null || value === "") return "auto";
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : value;
+  if (REASONING_PROFILES.includes(normalized as ReasoningProfile)) return normalized as ReasoningProfile;
+  throw new Error(`'${fieldName}' must be one of ${REASONING_PROFILES.join(", ")}`);
+}
+
 function normalizeBoolean(value: unknown, fieldName: string, defaultValue: boolean): boolean {
   if (value === undefined || value === null || value === "") return defaultValue;
   if (typeof value === "boolean") return value;
@@ -190,6 +202,7 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
   const image = model.image === undefined ? true : !!model.image;
   const allow_h2 = normalizeBoolean(model.allow_h2, `models.${model.name || "<unknown>"}.allow_h2`, false);
   const ignore_invalid_history = normalizeBoolean(model.ignore_invalid_history, `models.${model.name || "<unknown>"}.ignore_invalid_history`, true);
+  const reasoning_profile = normalizeReasoningProfile(model.reasoning_profile, `models.${model.name || "<unknown>"}.reasoning_profile`);
   const proxy = normalizeProxyUrl(model.proxy, `models.${model.name || "<unknown>"}.proxy`);
   const auth_token = normalizeAuthToken(model.auth_token);
 
@@ -198,6 +211,7 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
     image,
     allow_h2,
     ignore_invalid_history,
+    reasoning_profile,
     proxy,
     ...(ttfb_timeout !== undefined ? { ttfb_timeout } : {}),
     ...(headers ? { headers } : {}),

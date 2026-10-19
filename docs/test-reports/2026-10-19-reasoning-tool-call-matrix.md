@@ -241,6 +241,43 @@ Possible fixes, for DeepSeek models only:
 | 6 | Foreign (DeepSeek) signature sent to Claude → 400 | Open, confirmed live |
 | 7 | DeepSeek requires a thinking field for tool calls it didn't issue | New, open |
 
+## Fix for issues 6 and 7: `reasoning_profile` (2026-10-20)
+
+**Change:** `src/proxy/reasoning-history.ts` runs on the final upstream body, for both converted requests and same-format passthrough. The per-model `reasoning_profile` (default `auto`) chooses the rules:
+- **claude**, toward Claude (detected from the host or model name): drop thinking whose signature isn't Claude's.
+- **deepseek**, toward DeepSeek: give tool calls DeepSeek didn't issue an empty thinking placeholder, and keep unsigned thinking. Tool calls DeepSeek issued itself are left alone.
+
+**Why own tool calls are skipped:** an explicit placeholder replaces the reasoning DeepSeek stores for its own turns. Measured on Chat: `prompt_tokens` was 462 with `reasoning_content` missing (stored reasoning restored) and 378 with `reasoning_content: ""`. DeepSeek's Responses endpoint also needs non-empty `reasoning_text`: `""` and summary-only items are rejected, `" "` is accepted.
+
+**Code tested:** `HEAD` 291708d plus this change.
+
+- **Matrix:** 30 of 30 still pass round 2.
+- **Cross-provider (17 combinations, non-stream):** "Before" is commit 291708d, "after" is with the fix.
+
+| Client | Round 1 → Round 2 | Before | After | Thinking nanollm sent upstream in R2 (after) |
+|---|---|---|---|---|
+| Responses | `claude-haiku` → `gpt-luna` | 200 | 200 | `reasoning{content: 266}` |
+| Responses | `ds-anthropic` → `gpt-luna` | 200 | 200 | `reasoning{content: 529}` |
+| Responses | `ds-responses` → `gpt-luna` | 200 | 200 | `reasoning{content: 153, encrypted_content: DeepSeek UUID}` |
+| Responses | `gpt-luna` → `claude-haiku` | 200 | 200 | `[tool_use]` |
+| Responses | `ds-anthropic` → `claude-haiku` | **400** invalid signature | 200 | `[text, tool_use]`: DeepSeek-signed thinking dropped |
+| Responses | `gpt-luna` → `ds-responses` | 200 | 200 | `reasoning{content: 401, summary: 401, encrypted_content: GPT}` |
+| Responses | `gpt-luna` → `ds-anthropic` | **400** `content[].thinking` | 200 | `[thinking("", signature ""), tool_use]` |
+| Responses | `claude-haiku` → `ds-responses` | 200 | 200 | `reasoning{content: 262}` |
+| Anthropic | `ds-anthropic` → `claude-haiku` | **400** invalid signature | 200 | `[text, tool_use]`: DeepSeek-signed thinking dropped (passthrough) |
+| Anthropic | `claude-haiku` → `ds-anthropic` | 200 | 200 | `[thinking(Claude signature), tool_use]` |
+| Anthropic | `gpt-luna` → `ds-anthropic` | **400** `content[].thinking` | 200 | `[thinking("", signature ""), tool_use]` |
+| Anthropic | `gpt-luna` → `claude-haiku` | 200 | 200 | `[tool_use]` |
+| Chat | `ds-anthropic` → `claude-haiku` | 200 | 200 | `[tool_use]` |
+| Chat | `gpt-luna` → `ds-chat` | **400** `reasoning_content` | 200 | `reasoning_content: ""` (passthrough) |
+| Chat | `claude-haiku` → `ds-chat` | 200 | 200 | `reasoning_content` 243 chars |
+| Chat | `gpt-luna` → `ds-anthropic` | **400** `content[].thinking` | 200 | `[thinking("", signature ""), tool_use]` |
+| Chat | `gpt-luna` → `ds-responses` | **400** `reasoning_text` | 200 | `reasoning{content: " "}` placeholder |
+
+**Totals:** 7 of 17 failed before, 0 of 17 after. Claude → DeepSeek passed even before, because Claude's thinking is present (only DeepSeek's own check matters there, and DeepSeek ignores the foreign signature).
+
+**Issue status:** 6 and 7 fixed. Still open: 2 (timeout default) and 5 (GPT reasoning behind Chat/Anthropic clients).
+
 ## Reproduce
 
 The harness lives outside the repo, in `%TEMP%\nanollm-it\harness`:

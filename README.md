@@ -161,6 +161,7 @@ models:
     api_key: ${YOUR_KEY3_FROM_ENV_VAR}
     model: claude-sonnet-4-6
     ignore_invalid_history: true # optional, default true; drop thinking blocks with an empty signature when converting to Anthropic
+    reasoning_profile: auto # optional, auto | claude | deepseek | none; adapts reasoning in history from other models
 
   - name: gpt-image-1
     # OpenAI image API (images/generations, images/edits)
@@ -384,6 +385,27 @@ models:
     api_key: YOUR_KEY
     model: claude-sonnet-4-6
     ignore_invalid_history: false
+```
+
+### Reasoning in history from other models
+
+History can contain turns produced by another model, for example after a fallback group switched members or a client changed models mid-conversation. Providers treat such reasoning differently, so `models[*].reasoning_profile` adapts the final upstream request, both converted and same-format passthrough:
+
+| `reasoning_profile` | Applied to | Behavior |
+|---|---|---|
+| `auto` (default) | | `deepseek` when the `base_url` host is `deepseek.com` or the model name contains `deepseek`; `claude` when the host is `api.anthropic.com`, the model name contains `claude`, or the model is a Claude subscription; otherwise `none` |
+| `claude` | `provider: anthropic` | Claude verifies thinking signatures and rejects ones it did not issue (`Invalid signature in thinking block`). Thinking blocks whose signature is not Claude's, such as a DeepSeek UUID, are dropped. |
+| `deepseek` | all three protocols | DeepSeek rejects a tool call it did not issue unless that turn carries thinking (`... must be passed back to the API`). Such turns get an empty placeholder: `reasoning_content: ""` (Chat), an empty `thinking` block (Anthropic), or a `reasoning` item with `reasoning_text` (Responses; summary-only reasoning is copied into `content`). Tool calls DeepSeek issued itself (ids like `call_00_…`) are left alone, because DeepSeek restores their stored reasoning and an explicit placeholder would replace it. Unsigned thinking is kept for Anthropic upstreams regardless of `ignore_invalid_history`, since DeepSeek does not verify signatures. |
+| `none` | | No changes. |
+
+```yaml
+models:
+  - name: my-deepseek-proxy
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY
+    model: ds-v4
+    reasoning_profile: deepseek # the name and host do not reveal DeepSeek, so set it explicitly
 ```
 
 ### OpenAI image API

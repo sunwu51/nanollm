@@ -42,6 +42,7 @@ import { extractUpstreamModelIds, fetchUpstreamModels } from "../src/proxy/upstr
 import { ConfigManager } from "../src/core/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/proxy/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/core/http-log.js";
+import { applyReasoningHistoryRules, resolveReasoningProfile } from "../src/proxy/reasoning-history.js";
 import { aggregateCodexResponsesStream, applyClaudeSubscriptionHeaders, applyCodexSubscriptionHeaders, applyCodexSubscriptionIdentityHeaders, forwardRequest, mergeHeaders, sanitizeCodexSubscriptionBody, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy/proxy.js";
 import { cacheResponseItems, resolveItemReferences, shouldCacheResponseItems } from "../src/proxy/response-cache.js";
 import { buildNonStreamResponse, RESPONSE_COMPRESSION_THRESHOLD_BYTES } from "../src/core/response-compression.js";
@@ -5327,6 +5328,157 @@ models:
     } finally {
       rmSync(dirname(configPath), { recursive: true, force: true });
     }
+  });
+});
+
+const CLAUDE_SIGNATURE = "CAQSmwgKEAgSGAI4AUIIdGhpbmtpbmc" + "A".repeat(120);
+const DEEPSEEK_SIGNATURE = "f37fde2f-9706-4e2b-9458-0cb452963217";
+const reasoningModel = (fields: Record<string, unknown>) => ({ name: "m", provider: "anthropic", base_url: "https://example.com/v1", api_key: "k", model: "m", ...fields }) as any;
+
+run("reasoning profile is detected from base_url and model name, and can be overridden", () => {
+  assert.equal(resolveReasoningProfile(reasoningModel({ base_url: "https://api.deepseek.com/anthropic/v1", model: "deepseek-flash" })), "deepseek");
+  assert.equal(resolveReasoningProfile(reasoningModel({ provider: "openai-chat", base_url: "https://ai-gateway.vercel.sh/v1", model: "deepseek/deepseek-v4-pro" })), "deepseek");
+  assert.equal(resolveReasoningProfile(reasoningModel({ base_url: "https://ai-gateway.vercel.sh/v1", model: "anthropic/claude-haiku-5.5" })), "claude");
+  assert.equal(resolveReasoningProfile(reasoningModel({ model: "us.anthropic.claude-sonnet-4-6-v1:0" })), "claude");
+  assert.equal(resolveReasoningProfile(reasoningModel({ base_url: "https://api.anthropic.com/v1", model: "some-alias" })), "claude");
+  assert.equal(resolveReasoningProfile(reasoningModel({ claude_subscription_provider: "claude", model: "opus" })), "claude");
+  assert.equal(resolveReasoningProfile(reasoningModel({ model: "glm-5.1" })), "none");
+  assert.equal(resolveReasoningProfile(reasoningModel({ model: "claude-sonnet-4-6", reasoning_profile: "none" })), "none");
+  assert.equal(resolveReasoningProfile(reasoningModel({ model: "my-proxy-model", reasoning_profile: "deepseek" })), "deepseek");
+});
+
+run("claude upstream drops thinking signed by another provider and keeps its own", () => {
+  const body = applyReasoningHistoryRules(reasoningModel({ model: "claude-haiku-5.5" }), {
+    messages: [
+      { role: "user", content: "q" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "ds", signature: DEEPSEEK_SIGNATURE }, { type: "tool_use", id: "call_00_x", name: "f", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_00_x", content: "ok" }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "", signature: CLAUDE_SIGNATURE }, { type: "tool_use", id: "toolu_1", name: "f", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "only thinking", signature: DEEPSEEK_SIGNATURE }] },
+    ],
+  }) as any;
+  assert.deepEqual(body.messages[1].content.map((block: any) => block.type), ["tool_use"]);
+  assert.deepEqual(body.messages[3].content.map((block: any) => block.type), ["thinking", "tool_use"]);
+  // Never leave an assistant message with no content.
+  assert.deepEqual(body.messages[5].content.map((block: any) => block.type), ["thinking"]);
+});
+
+run("claude upstream keeps empty signatures only when ignore_invalid_history is false", () => {
+  const body = { messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "plain", signature: "" }, { type: "text", text: "a" }] }] };
+  assert.deepEqual((applyReasoningHistoryRules(reasoningModel({ model: "claude-x" }), body) as any).messages[0].content.map((b: any) => b.type), ["text"]);
+  assert.deepEqual((applyReasoningHistoryRules(reasoningModel({ model: "claude-x", ignore_invalid_history: false }), body) as any).messages[0].content.map((b: any) => b.type), ["thinking", "text"]);
+});
+
+run("deepseek chat upstream adds reasoning_content only to tool calls it did not issue", () => {
+  const foreign = [{ id: "call_py4dAYEz1Nc06PP3nGgg3mH8", type: "function", function: { name: "f", arguments: "{}" } }];
+  const own = [{ id: "call_00_zVK3qJPAEMBZCufVC96A3787", type: "function", function: { name: "f", arguments: "{}" } }];
+  const body = applyReasoningHistoryRules(reasoningModel({ provider: "openai-chat", model: "deepseek-flash" }), {
+    messages: [
+      { role: "assistant", content: null, tool_calls: foreign },
+      { role: "assistant", content: null, tool_calls: own },
+      { role: "assistant", content: null, reasoning_content: "kept", tool_calls: foreign },
+      { role: "assistant", content: "no tools" },
+    ],
+  }) as any;
+  assert.equal(body.messages[0].reasoning_content, "");
+  // An explicit "" would replace the reasoning DeepSeek stores for its own turns.
+  assert.equal("reasoning_content" in body.messages[1], false);
+  assert.equal(body.messages[2].reasoning_content, "kept");
+  assert.equal("reasoning_content" in body.messages[3], false);
+});
+
+run("deepseek anthropic upstream adds an empty thinking block to foreign tool calls", () => {
+  const body = applyReasoningHistoryRules(reasoningModel({ base_url: "https://api.deepseek.com/anthropic/v1", model: "deepseek-flash" }), {
+    messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_01abc", name: "f", input: {} }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_00_yKbN7Gs3GyYFsX4v1eGM9190", name: "f", input: {} }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: CLAUDE_SIGNATURE }, { type: "tool_use", id: "toolu_02", name: "f", input: {} }] },
+    ],
+  }) as any;
+  assert.deepEqual(body.messages[0].content[0], { type: "thinking", thinking: "", signature: "" });
+  assert.deepEqual(body.messages[1].content.map((b: any) => b.type), ["tool_use"]);
+  assert.deepEqual(body.messages[2].content.map((b: any) => b.type), ["thinking", "tool_use"]);
+});
+
+run("deepseek responses upstream needs reasoning_text before foreign function calls", () => {
+  const call = (call_id: string) => ({ type: "function_call", call_id, name: "f", arguments: "{}" });
+  const output = (call_id: string) => ({ type: "function_call_output", call_id, output: "ok" });
+  const body = applyReasoningHistoryRules(reasoningModel({ provider: "openai-responses", base_url: "https://api.deepseek.com", model: "deepseek-flash" }), {
+    input: [
+      { role: "user", content: "q" },
+      call("call_gpt_1"), output("call_gpt_1"),
+      { type: "reasoning", summary: [{ type: "summary_text", text: "gpt summary" }], encrypted_content: "gAAAA" }, call("call_gpt_2"), output("call_gpt_2"),
+      { type: "reasoning", summary: [], encrypted_content: "gAAAA" }, call("call_gpt_3"), call("call_gpt_4"), output("call_gpt_3"), output("call_gpt_4"),
+      call("call_00_5dJHq7VwrGX4vxgRIKpX6610"), output("call_00_5dJHq7VwrGX4vxgRIKpX6610"),
+    ],
+  }) as any;
+  const types = body.input.map((item: any) => item.type ?? "message");
+  assert.deepEqual(types, [
+    "message",
+    "reasoning", "function_call", "function_call_output",
+    "reasoning", "function_call", "function_call_output",
+    "reasoning", "reasoning", "function_call", "function_call", "function_call_output", "function_call_output",
+    "function_call", "function_call_output",
+  ]);
+  assert.deepEqual(body.input[1].content, [{ type: "reasoning_text", text: " " }]);
+  // Summary-only reasoning is copied into content; DeepSeek rejects summaries alone.
+  assert.deepEqual(body.input[4].content, [{ type: "reasoning_text", text: "gpt summary" }]);
+  // Opaque-only reasoning has no text, so one placeholder covers the turn's parallel calls.
+  assert.deepEqual(body.input[8].content, [{ type: "reasoning_text", text: " " }]);
+});
+
+run("reasoning rules leave other upstreams untouched", () => {
+  const body = { messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t", signature: DEEPSEEK_SIGNATURE }, { type: "tool_use", id: "x", name: "f", input: {} }] }] };
+  assert.equal(applyReasoningHistoryRules(reasoningModel({ model: "glm-5.1" }), body), body);
+});
+
+run("config rejects an unknown reasoning_profile", () => {
+  assert.throws(() => parseConfigText(`
+models:
+  - name: m
+    provider: anthropic
+    base_url: https://example.com/v1
+    api_key: k
+    model: m
+    reasoning_profile: lenient
+`), /reasoning_profile' must be one of auto, claude, deepseek, none/);
+});
+
+await runAsync("deepseek converted and passthrough requests repair foreign tool-call history", async () => {
+  const bodies: any[] = [];
+  await withHTTPServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on("end", () => {
+      bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(req.url?.endsWith("/messages")
+        ? { id: "msg_1", type: "message", role: "assistant", model: "deepseek-flash", content: [{ type: "text", text: "ok", citations: null }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } }
+        : { id: "chatcmpl_1", object: "chat.completion", created: 1, model: "deepseek-flash", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+    });
+  }, async (baseURL) => {
+    const base = { base_url: baseURL, api_key: "k", model: "deepseek-flash" };
+    // Converted: unsigned thinking is kept for DeepSeek even though ignore_invalid_history defaults to true.
+    await forwardRequest({ ...base, name: "ds", provider: "anthropic", ignore_invalid_history: true } as any, normalizeOpenAIChatRequest({
+      model: "ds",
+      messages: [
+        { role: "user", content: "q" },
+        { role: "assistant", content: null, reasoning_content: "plain thinking", tool_calls: [{ id: "call_py4dAYEz", type: "function", function: { name: "f", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_py4dAYEz", content: "ok" },
+      ],
+    } as any));
+    assert.deepEqual(bodies[0].messages[1].content.map((b: any) => [b.type, b.signature]), [["thinking", ""], ["tool_use", undefined]]);
+    // Passthrough: a GPT tool call in Chat history gets reasoning_content "".
+    await passthroughRequest({ ...base, name: "ds", provider: "openai-chat" } as any, {
+      model: "ds",
+      messages: [
+        { role: "user", content: "q" },
+        { role: "assistant", content: null, tool_calls: [{ id: "call_py4dAYEz", type: "function", function: { name: "f", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "call_py4dAYEz", content: "ok" },
+      ],
+    });
+    assert.equal(bodies[1].messages[1].reasoning_content, "");
   });
 });
 

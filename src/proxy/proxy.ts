@@ -2,6 +2,7 @@ import type { ModelConfig } from "../core/config.js";
 import { SSEParser, type StreamFormat } from "../converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "../converters/shared.js";
 import { decodeReasoningCarrier, isReasoningCarrier } from "../converters/shared.js";
+import { applyReasoningHistoryRules, shouldDropUnsignedThinking } from "./reasoning-history.js";
 import {
   denormalizeToOpenAIChatRequest,
   denormalizeToOpenAIResponsesRequest,
@@ -129,7 +130,7 @@ function denormalizeRequest(config: ModelConfig, normalized: NormalizedRequest):
       return denormalizeToOpenAIResponsesRequest(normalized);
     case "anthropic":
       return denormalizeToAnthropicRequest(normalized, {
-        ignoreInvalidHistory: config.ignore_invalid_history ?? true,
+        ignoreInvalidHistory: shouldDropUnsignedThinking(config),
         defaultMaxOutputTokens: config.claude_subscription_provider ? CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS : undefined,
       });
   }
@@ -380,7 +381,7 @@ function restoreNanollmReasoningCarriers(config: ModelConfig, body: unknown): un
 function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unknown>, stream: boolean): unknown {
   return stripOpenAIResponsesUnstoredItemIds(
     config,
-    restoreNanollmReasoningCarriers(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream })),
+    applyReasoningHistoryRules(config, restoreNanollmReasoningCarriers(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream }))),
   );
 }
 
@@ -1059,7 +1060,7 @@ export async function forwardRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
+  const body = applyReasoningHistoryRules(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
   const { response, timing } = await upstreamFetch(config, body, false, options,
     normalized.sourceFormat === "openai-chat" || normalized.sourceFormat === "openai-responses" ? normalized.promptCacheKey : undefined);
   const json = await readNonStreamUpstreamJson(config, response, options);
@@ -1076,7 +1077,7 @@ export async function forwardStreamRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized)));
+  const body = applyReasoningHistoryRules(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
   const { response, timing } = await upstreamFetch(config, body, true, options,
     normalized.sourceFormat === "openai-chat" || normalized.sourceFormat === "openai-responses" ? normalized.promptCacheKey : undefined);
   if (!response.body) throw new Error("Upstream returned no streaming body");
