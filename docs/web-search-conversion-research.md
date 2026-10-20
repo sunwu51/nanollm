@@ -601,3 +601,20 @@ Findings:
 
 ### Remaining
 - Phase 4: proxy `pause_turn` auto-continue; strip native Claude thinking after a rewritten history (prefix binding, `docs/claude-thinking-rules.md` §2.4).
+
+### Phase 4: proxy (done 2026-10-21, uncommitted)
+
+Code: `src/proxy/pause-turn.ts` and `src/proxy/thinking-binding.ts` (new), `proxy.ts` (wiring), tests `tests/pause-turn.ts` and `tests/thinking-binding.ts` (registered in the `node --test` list). Reference: `docs/converters.md` "Proxy handling around web search".
+
+Done: `pause_turn` resumed in the proxy for converted requests (non-stream merge, stream splice, limit of 5, same-format untouched); rejected thinking binding retried once without thinking for converted requests and for same-format requests whose history nanollm rewrote.
+
+Verification and limits:
+1. Mock-upstream tests cover both (continuation body, merged usage, spliced block numbering, the limit, failed continuation, retry in stream and non-stream, no retry for other errors, same-format error kept).
+2. Live regression: normal search streams and non-streams through the new wrappers still work. A real `pause_turn` could not be provoked (a 12-topic, 12-search prompt finished in one round, also when asked directly), so the pause handling is only verified against the mock, which streams realistic SSE.
+3. Prefix binding is not enforced on the test account (Sonnet 5.5 replayed a thinking block unchanged after the system prompt, first message, tool list and same-turn text were each changed), so the retry is verified against the mock only. The design is reactive for that reason: proactive stripping would cost cache hits on every converted search conversation.
+4. A retry shows up as a second attempt in the request record under the same attempt index (the first error is overwritten by the retry's response).
+
+### Remaining
+- Carrier size: about 27–34 KB per search added to every later request of the conversation. Compression (gzip before base64) is the obvious cheap change; not done.
+- Native OpenAI history rules with real reasoning items next to searches (open question 1) still need a channel that returns them.
+- Codex history behavior (open question 6).

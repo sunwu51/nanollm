@@ -4,6 +4,8 @@ import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "../
 import { decodeReasoningCarrier, isReasoningCarrier } from "../converters/shared.js";
 import { applyReasoningHistoryRules, shouldDropUnsignedThinking } from "./reasoning-history.js";
 import { degradeSynthesizedAnthropicWebSearch, degradeSynthesizedResponsesWebSearch } from "../converters/web-search.js";
+import { isThinkingBindingError, stripThinkingBlocks } from "./thinking-binding.js";
+import { continuePausedAnthropicStream, isPausedTurn, MAX_PAUSE_TURN_CONTINUATIONS, mergePausedResponses, withContinuation } from "./pause-turn.js";
 import {
   denormalizeToOpenAIChatRequest,
   denormalizeToOpenAIResponsesRequest,
@@ -1040,6 +1042,34 @@ export async function passthroughAlphaSearchRequest(
   return { body: responseBody, responseText, headers: response.headers, status: response.status, timing };
 }
 
+/**
+ * A Claude upstream rejects a replayed thinking block whose conversation prefix changed (see
+ * thinking-binding). For history nanollm rewrote, retry once without any thinking blocks.
+ * Returns the body that was finally sent, so a later round of the same turn builds on it.
+ */
+async function upstreamFetchRetryingThinking(
+  config: ModelConfig,
+  body: unknown,
+  stream: boolean,
+  options: UpstreamRequestOptions | undefined,
+  cacheKey: string | undefined,
+  enabled: boolean,
+): Promise<{ response: Response; timing: UpstreamTiming; body: unknown }> {
+  try {
+    return { ...(await upstreamFetch(config, body, stream, options, cacheKey)), body };
+  } catch (error) {
+    const stripped = enabled && config.provider === "anthropic" && isThinkingBindingError(error) ? stripThinkingBlocks(body) : undefined;
+    if (!stripped) throw error;
+    console.warn(`[THINKING BINDING] ${config.name}: replayed thinking was rejected as bound to a different conversation; retrying without thinking blocks`);
+    return { ...(await upstreamFetch(config, stripped, stream, options, cacheKey)), body: stripped };
+  }
+}
+
+/** Whether nanollm itself rewrote a same-format Anthropic request's history (see degradeSynthesizedWebSearchHistory). */
+function rewroteAnthropicHistory(config: ModelConfig, rawBody: Record<string, unknown>): boolean {
+  return config.provider === "anthropic" && Array.isArray(rawBody.messages) && degradeSynthesizedAnthropicWebSearch(rawBody.messages) !== undefined;
+}
+
 // ─── Passthrough (same format, no conversion) ───────────────────────────────
 
 export async function passthroughRequest(
@@ -1048,7 +1078,7 @@ export async function passthroughRequest(
   options?: UpstreamRequestOptions,
 ): Promise<{ json: unknown; timing: UpstreamTiming; usage?: NormalizedUsage }> {
   const body = preparePassthroughBody(config, rawBody, false);
-  const { response, timing } = await upstreamFetch(config, body, false, options);
+  const { response, timing } = await upstreamFetchRetryingThinking(config, body, false, options, undefined, rewroteAnthropicHistory(config, rawBody));
   const json = await readNonStreamUpstreamJson(config, response, options);
   const usage = normalizeUsage((json as Record<string, unknown>)?.usage as Record<string, unknown> | undefined);
   return { json, timing, usage };
@@ -1060,7 +1090,7 @@ export async function passthroughStreamRequest(
   options?: UpstreamRequestOptions,
 ): Promise<{ body: ReadableStream<Uint8Array>; headers: Headers; timing: UpstreamTiming }> {
   const body = preparePassthroughBody(config, rawBody, true);
-  const { response, timing } = await upstreamFetch(config, body, true, options);
+  const { response, timing } = await upstreamFetchRetryingThinking(config, body, true, options, undefined, rewroteAnthropicHistory(config, rawBody));
   if (!response.body) throw new Error("Upstream returned no streaming body");
   const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0, config, headers: response.headers });
   return { body: validatedBody, headers: response.headers, timing };
@@ -1077,10 +1107,21 @@ export async function forwardRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = applyReasoningHistoryRules(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
-  const { response, timing } = await upstreamFetch(config, body, false, options,
-    normalized.sourceFormat === "openai-chat" || normalized.sourceFormat === "openai-responses" ? normalized.promptCacheKey : undefined);
-  const json = await readNonStreamUpstreamJson(config, response, options);
+  const converted = applyReasoningHistoryRules(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
+  const cacheKey = normalized.sourceFormat === "openai-chat" || normalized.sourceFormat === "openai-responses" ? normalized.promptCacheKey : undefined;
+  // A converted request's history was rebuilt by nanollm, so a rejected thinking binding is retried.
+  const { response, timing, body } = await upstreamFetchRetryingThinking(config, converted, false, options, cacheKey, normalized.sourceFormat !== "anthropic");
+  let json = await readNonStreamUpstreamJson(config, response, options);
+  // Claude pauses a long server-tool turn; only an Anthropic client knows to resume it, so it is resumed here.
+  if (config.provider === "anthropic" && normalized.sourceFormat !== "anthropic" && isPausedTurn(json)) {
+    const rounds: Record<string, any>[] = [json as Record<string, any>];
+    while (isPausedTurn(json) && rounds.length <= MAX_PAUSE_TURN_CONTINUATIONS) {
+      const next = await upstreamFetch(config, withContinuation(body, rounds.flatMap((round) => round.content)), false, options, cacheKey);
+      json = await readNonStreamUpstreamJson(config, next.response, options);
+      rounds.push(json as Record<string, any>);
+    }
+    json = mergePausedResponses(rounds);
+  }
   const normalizedResponse = normalizeUpstreamResponse(config.provider, json);
   return { normalizedResponse, timing, usage: normalizedResponse.usage };
 }
@@ -1094,10 +1135,17 @@ export async function forwardStreamRequest(
   normalized.model = config.model;
   normalized.image = config.image ?? true;
 
-  const body = applyReasoningHistoryRules(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
-  const { response, timing } = await upstreamFetch(config, body, true, options,
-    normalized.sourceFormat === "openai-chat" || normalized.sourceFormat === "openai-responses" ? normalized.promptCacheKey : undefined);
+  const converted = applyReasoningHistoryRules(config, applyModelBodyTransforms(config, applyOpenAIDefaults(config.provider, denormalizeRequest(config, normalized))));
+  const cacheKey = normalized.sourceFormat === "openai-chat" || normalized.sourceFormat === "openai-responses" ? normalized.promptCacheKey : undefined;
+  const { response, timing, body } = await upstreamFetchRetryingThinking(config, converted, true, options, cacheKey, normalized.sourceFormat !== "anthropic");
   if (!response.body) throw new Error("Upstream returned no streaming body");
   const validatedBody = await validateStreamContent(response.body, { attemptIndex: options?.attemptIndex ?? 0, config, headers: response.headers });
-  return { body: validatedBody, upstreamFormat: config.provider, timing };
+  if (config.provider !== "anthropic" || normalized.sourceFormat === "anthropic") return { body: validatedBody, upstreamFormat: config.provider, timing };
+  // A paused server-tool turn is resumed inside the same stream (see pause-turn).
+  const resumed = continuePausedAnthropicStream(validatedBody, async (content) => {
+    const next = await upstreamFetch(config, withContinuation(body, content), true, options, cacheKey);
+    if (!next.response.body) throw new Error("Upstream returned no streaming body");
+    return validateStreamContent(next.response.body, { attemptIndex: options?.attemptIndex ?? 0, config, headers: next.response.headers });
+  });
+  return { body: resumed, upstreamFormat: config.provider, timing };
 }
