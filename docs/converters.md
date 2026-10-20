@@ -199,8 +199,8 @@ Anthropic content blocks that may still error outside `_tool_result` handling in
 | Source response | Behavior |
 | --- | --- |
 | OpenAI Chat | Text/refusal, tool calls, and `thinking`/`reasoning`/`reasoning_content` are normalized. Other provider-specific fields are ignored. |
-| OpenAI Responses | `message`, `function_call`, `custom_tool_call`, and `reasoning` output items are normalized. MCP namespace tool calls are folded to qualified names during normalization, including streamed output items, and split back when denormalizing to Responses. Other output item types are currently ignored, not errored. |
-| Anthropic Messages | `text`, `thinking`, `redacted_thinking`, `tool_use`, and `server_tool_use` are normalized. Other response content blocks are currently ignored, not errored. |
+| OpenAI Responses | `message` (with `url_citation` annotations), `web_search_call`, `function_call`, `custom_tool_call`, and `reasoning` output items are normalized. A blank acknowledgement message (whitespace-only text) ahead of other output is dropped. MCP namespace tool calls are folded to qualified names during normalization, including streamed output items, and split back when denormalizing to Responses. Other output item types are currently ignored, not errored. |
+| Anthropic Messages | `text` (with web search `citations`), `thinking`, `redacted_thinking`, `tool_use`, `server_tool_use`, and web search `server_tool_use` / `web_search_tool_result` pairs are normalized. Other response content blocks are currently ignored, not errored. |
 
 ## Web Search
 
@@ -218,3 +218,10 @@ Native web search converts between Responses and Anthropic in `src/converters/we
 | Synthesized ids | Searches nanollm shows across protocols carry recognizable ids: a Responses search shown to an Anthropic client is `srvtoolu_nanollm_<ws id>` (action in `input`, marker `encrypted_content`); an Anthropic search shown to a Responses client is `ws_nanollm_<srvtoolu id>`, with the original blocks in a reasoning item whose `encrypted_content` starts with `nanollm.websearch.v1:`. Converted requests restore them to their origin protocol. |
 | Same-format passthrough | `proxy` degrades synthesized searches the upstream would reject: Responses carrier items and `ws_nanollm_` calls become `web_search_history` function calls; Anthropic `srvtoolu_nanollm_` pairs become text notes and marker citations are removed. |
 
+### Web search in responses
+
+| Direction | Behavior |
+| --- | --- |
+| Claude response → Responses client | Parts are emitted in order (`thinking`, search, `thinking`, text) only when the response contains a search; other responses keep the original grouping. Each search becomes a `web_search_call` (`id` `ws_nanollm_<srvtoolu id>`, `action.sources` from the results, `failed` on a search error) followed by a reasoning item whose `encrypted_content` (`nanollm.websearch.v1:`) carries the original `server_tool_use` / `web_search_tool_result` blocks; clients send it back verbatim and a later request restores the blocks. A search with no result yet (a client tool was called in the same turn) is only carried, with no visible item; the result then appears once in the next response. Text around a search becomes separate `message` items. A cited text block gets a `url_citation` annotation covering the whole block. |
+| GPT response → Anthropic client | Each `web_search_call` becomes a `server_tool_use` (`id` `srvtoolu_nanollm_<ws id>`, `input` = `{query, action}`) plus a `web_search_tool_result` with marker `encrypted_content`, `[]` for page actions, and an error result for a failed search. A `url_citation` range cuts the text into blocks (Unicode code points); each cited block carries a `web_search_result_location` with its own words as `cited_text`. `usage.server_tool_use.web_search_requests` counts finished `search` actions. A later request rebuilds the original `web_search_call` from `input.action`. |
+| Chat clients | Searches are invisible; only the answer text is returned. |

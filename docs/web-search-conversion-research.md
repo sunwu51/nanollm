@@ -561,11 +561,28 @@ Done: tool mapping both ways, forced choice → `auto`, `include` sources for Re
 Verified live through a local nanollm in front of the real upstreams: tools convert and both models search; Claude history → GPT, GPT history → Claude, and both synthesized-passthrough cases return 200 with correct follow-up answers.
 
 Findings during the live run:
-1. **Interim guard.** Forwarding the search tool to Claude made it return `server_tool_use`, which the unchanged response converter showed to Responses clients as a fake `function_call web_search` (a client would try to run it). Until phase 2, native web search blocks in Claude responses and streams are skipped (`responses.ts`, `AnthropicStreamParser`). Remove the guard when phase 2 lands.
+1. **Interim guard.** Forwarding the search tool to Claude made it return `server_tool_use`, which the unchanged response converter showed to Responses clients as a fake `function_call web_search` (a client would try to run it). Phase 1 skipped native web search blocks in Claude responses and streams. Phase 2 replaced the non-stream guard with real conversion; the stream guard (`AnthropicStreamParser`) stays until phase 3.
 2. **`ttfb_timeout`.** The default first-byte timeout (5 s) fails non-streaming search requests (the upstream needs 6–12 s before the first byte). Models that search need a larger `ttfb_timeout`; worth a README note once search conversion ships.
 3. Phase 1 alone never produces the carrier or the `*_nanollm_` ids (those come from response conversion), so the carrier restore paths are covered by unit tests with hand-built input only.
 
 ### Remaining
-- Phase 2: non-stream responses both ways (carrier, ids, usage `web_search_requests`, `pause_turn`).
 - Phase 3: stream parsers and emitters (including message-item split around searches).
 - Phase 4: proxy `pause_turn` auto-continue; strip native Claude thinking after a rewritten history (prefix binding, `docs/claude-thinking-rules.md` §2.4).
+
+### Phase 2: non-stream responses (done 2026-10-21, uncommitted)
+
+Code: `responses.ts` (normalize both ways, ordered Responses output), `web-search.ts` (response-side helpers, shared search index), `tests/web-search.ts`. Reference: `docs/converters.md` "Web search in responses".
+
+Done: Claude → Responses (web_search_call + carrier, ordered output, text split into messages around searches, annotations, pending-result handling); GPT → Anthropic (server_tool_use + result with markers, citation ranges cut into cited blocks by code points, `web_search_requests` usage); a blank acknowledgement message is dropped; Chat clients see only text.
+
+Verified live through a local nanollm in front of the real upstreams, including the round trips:
+- Claude search → Responses client → back to Claude: the carrier restores the original encrypted blocks and Claude accepts them (any change would be a 400).
+- Same with the carrier dropped by the client: degrades to a note, correct answer.
+- Claude search → Responses client → GPT: function call.
+- GPT search → Anthropic client → back to GPT: the native web_search_call is rebuilt.
+- GPT search → Anthropic client → Claude: note.
+
+Notes:
+1. A Claude search shown to a Responses client adds a carrier of roughly the size of the results (about 27 KB for one search of nine results) to every later request in the conversation. If this proves heavy on Turso-backed deployments, store carriers in the request records only by reference or compress them.
+2. `pause_turn` still reaches a Responses client as a normal completed response (status `completed`, no continuation). Phase 4 resumes it inside the proxy.
+3. `NormalizedUsage` has no `webSearchRequests`; the Anthropic count is derived from the parts.

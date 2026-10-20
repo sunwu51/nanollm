@@ -37,6 +37,9 @@ import {
   wrapResponsesCustomToolInput,
 } from "./shared.js";
 import {
+  attachAnthropicWebSearchResult,
+  startAnthropicWebSearch,
+  type AnthropicSearchIndex,
   anthropicWebSearchBlocks,
   collectCitationTitles,
   collectCitedSnippets,
@@ -354,7 +357,7 @@ export function denormalizeToOpenAIResponsesRequest(request: NormalizedRequest):
     instructions: instructionLines.length > 0 ? instructionLines.join("\n") : undefined,
     input: request.messages.slice(index).flatMap((message) => denormalizeOpenAIResponsesMessage(message, request.sourceFormat === "openai-responses", webSearchContext)) as any,
     // Without sources a converted search result would have no URLs.
-    include: hasWebSearchTool ? ["web_search_call.action.sources"] : undefined,
+    ...(hasWebSearchTool ? { include: ["web_search_call.action.sources" as const] } : {}),
     max_output_tokens: request.maxOutputTokens,
     // metadata: request.metadata ?? undefined,
     service_tier: normalizeOpenAIResponsesServiceTier(request.serviceTier),
@@ -680,26 +683,6 @@ function normalizeAnthropicSystem(system: any): NormalizedMessage {
   return typeof system === "string" ? { role: "system", parts: [text(system)] } : { role: "system", parts: system.map((block: any) => text(block.text)) };
 }
 
-/** Web searches seen so far in a request, so a result in a later message can complete its search. */
-type AnthropicSearchIndex = Map<string, { part: NormalizedWebSearch; serverToolUse: any }>;
-
-/**
- * Attach a web_search_tool_result to its search. Within the same message the search gets both native
- * blocks. A result from a later message completes the earlier search's readable fields and, when it
- * sits in an assistant message, keeps its own block in place as a continuation for native replay.
- */
-function attachAnthropicWebSearchResult(result: any, searches: AnthropicSearchIndex, sameMessageIds: Set<string>): NormalizedWebSearch | undefined {
-  const entry = searches.get(result.tool_use_id);
-  if (!entry) return normalizeAnthropicWebSearch(undefined, result);
-  const completed = normalizeAnthropicWebSearch(entry.serverToolUse, result);
-  if (sameMessageIds.has(result.tool_use_id)) {
-    Object.assign(entry.part, completed);
-    return undefined;
-  }
-  Object.assign(entry.part, { status: completed.status, sources: completed.sources, errorCode: completed.errorCode });
-  return { ...completed, native: { blocks: [result] }, continuation: true };
-}
-
 function normalizeAnthropicMessage(message: MessageParam, searches: AnthropicSearchIndex): NormalizedMessage[] {
   // Compatible Messages providers may also send system messages in the messages array.
   const role = message.role as string;
@@ -720,10 +703,7 @@ function normalizeAnthropicMessage(message: MessageParam, searches: AnthropicSea
       else if (block.type === "thinking") parts.push({ type: "thinking", thinking: block.thinking, signature: block.signature });
       else if (block.type === "redacted_thinking") parts.push({ type: "redacted_thinking", data: block.data, origin: "anthropic" });
       else if (block.type === "server_tool_use" && block.name === WEB_SEARCH_TOOL_NAME) {
-        const part = normalizeAnthropicWebSearch(block, undefined);
-        searches.set(block.id, { part, serverToolUse: block });
-        sameMessageIds.add(block.id);
-        parts.push(part);
+        parts.push(startAnthropicWebSearch(block, searches, sameMessageIds));
       }
       else if (block.type === "web_search_tool_result") {
         const continuation = attachAnthropicWebSearchResult(block, searches, sameMessageIds);

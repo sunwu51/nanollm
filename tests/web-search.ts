@@ -5,6 +5,8 @@ import {
   anthropicMessageToResponsesResponse,
   createStreamConverter,
   responsesRequestToAnthropicMessageRequest,
+  responsesResponseToAnthropicMessage,
+  responsesResponseToChatCompletion,
 } from "../src/converters/index.js";
 import { denormalizeToAnthropicRequest, denormalizeToOpenAIResponsesRequest, normalizeAnthropicRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import {
@@ -12,6 +14,7 @@ import {
   degradeSynthesizedAnthropicWebSearch,
   degradeSynthesizedResponsesWebSearch,
   encodeWebSearchCarrier,
+  splitTextByCitations,
   WEB_SEARCH_MARKER,
 } from "../src/converters/web-search.js";
 
@@ -304,7 +307,8 @@ export function runWebSearchTests(run: (name: string, fn: () => void) => void): 
     assert.equal(degradeSynthesizedAnthropicWebSearch([{ role: "assistant", content: realSearch }]), undefined);
   });
 
-  run("native web search blocks in a claude response are not shown to a responses client as a function call", () => {
+  run("a claude search in a response becomes a web_search_call plus a carrier, and the text keeps its citations", () => {
+    const blocks = claudeSearch();
     const response = anthropicMessageToResponsesResponse({
       id: "msg_1",
       type: "message",
@@ -312,20 +316,175 @@ export function runWebSearchTests(run: (name: string, fn: () => void) => void): 
       model: "claude",
       stop_reason: "end_turn",
       stop_sequence: null,
-      content: [...claudeSearch(), citedText("Halzen won.", "https://nobelprize.org/2026", "quote")],
+      content: [
+        { type: "thinking", thinking: "", signature: "SIG_1" },
+        { type: "text", text: "Let me search." },
+        ...blocks,
+        citedText("Halzen won.", "https://nobelprize.org/2026", "quote"),
+      ],
       usage: { input_tokens: 1, output_tokens: 1 },
     } as any);
     const output = response.output as Json[];
-    assert.deepEqual(output.map((item) => item.type), ["message"]);
-    assert.equal(output[0].content[0].text, "Halzen won.");
+    assert.deepEqual(output.map((item) => item.type), ["reasoning", "message", "web_search_call", "reasoning", "message"]);
+    assert.equal(output[1].content[0].text, "Let me search.");
+    assert.deepEqual(output[2], {
+      id: "ws_nanollm_srvtoolu_01abc",
+      type: "web_search_call",
+      status: "completed",
+      action: {
+        type: "search",
+        query: "2026 Nobel physics",
+        queries: ["2026 Nobel physics"],
+        sources: [{ type: "url", url: "https://nobelprize.org/2026" }, { type: "url", url: "https://news.example/halzen" }],
+      },
+    });
+    assert.deepEqual(decodeWebSearchCarrier(output[3].encrypted_content), blocks);
+    assert.deepEqual(output[4].content, [{
+      type: "output_text",
+      text: "Halzen won.",
+      annotations: [{ type: "url_citation", url: "https://nobelprize.org/2026", title: "Nobel Prize 2026", start_index: 0, end_index: 11 }],
+    }]);
+  });
 
-    // A client tool that happens to be called web_search still arrives as tool_use.
-    const clientCall = anthropicMessageToResponsesResponse({
-      id: "msg_2", type: "message", role: "assistant", model: "claude", stop_reason: "tool_use", stop_sequence: null,
-      content: [{ type: "tool_use", id: "toolu_1", name: "web_search", input: { query: "q" } }],
+  run("a claude search with a pending result is carried but not shown, and the result later appears once", () => {
+    const [serverToolUse, result] = claudeSearch();
+    const pending = anthropicMessageToResponsesResponse({
+      id: "msg_1", type: "message", role: "assistant", model: "claude", stop_reason: "tool_use", stop_sequence: null,
+      content: [serverToolUse, { type: "tool_use", id: "toolu_1", name: "run", input: {} }],
       usage: { input_tokens: 1, output_tokens: 1 },
     } as any);
-    assert.equal((clientCall.output as Json[])[0].type, "function_call");
+    const pendingOutput = pending.output as Json[];
+    assert.deepEqual(pendingOutput.map((item) => item.type), ["reasoning", "function_call"]);
+    assert.deepEqual(decodeWebSearchCarrier(pendingOutput[0].encrypted_content), [serverToolUse]);
+
+    const resumed = anthropicMessageToResponsesResponse({
+      id: "msg_2", type: "message", role: "assistant", model: "claude", stop_reason: "end_turn", stop_sequence: null,
+      content: [result, { type: "text", text: "Done." }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    } as any);
+    const resumedOutput = resumed.output as Json[];
+    assert.deepEqual(resumedOutput.map((item) => item.type), ["web_search_call", "reasoning", "message"]);
+    assert.equal(resumedOutput[0].id, "ws_nanollm_srvtoolu_01abc");
+    assert.deepEqual(decodeWebSearchCarrier(resumedOutput[1].encrypted_content), [result]);
+  });
+
+  run("a failed claude search is shown as a failed web_search_call", () => {
+    const response = anthropicMessageToResponsesResponse({
+      id: "msg_1", type: "message", role: "assistant", model: "claude", stop_reason: "end_turn", stop_sequence: null,
+      content: [
+        claudeSearch()[0],
+        { type: "web_search_tool_result", tool_use_id: "srvtoolu_01abc", content: { type: "web_search_tool_result_error", error_code: "max_uses_exceeded" } },
+        { type: "text", text: "Sorry." },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    } as any);
+    const output = response.output as Json[];
+    assert.equal(output[0].status, "failed");
+    assert.equal(output[0].action.sources, undefined);
+  });
+
+  run("a claude search round-trips through a responses client back to claude unchanged", () => {
+    const blocks = claudeSearch();
+    const text = citedText("Halzen won.", "https://nobelprize.org/2026", "quote");
+    const response = anthropicMessageToResponsesResponse({
+      id: "msg_1", type: "message", role: "assistant", model: "claude", stop_reason: "end_turn", stop_sequence: null,
+      content: [{ type: "thinking", thinking: "", signature: "SIG_1" }, ...blocks, text],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    } as any);
+    // What a Responses client keeps and sends back verbatim, minus its drops of annotations.
+    const echoed = (response.output as Json[]).map((item) => item.type === "message" ? { ...item, content: item.content.map((part: Json) => ({ ...part, annotations: [] })) } : item);
+    const replay = responsesRequestToAnthropicMessageRequest({
+      model: "gpt",
+      input: [{ role: "user", content: "Who won?" }, ...echoed, { role: "user", content: "Source?" }],
+    } as any);
+    assert.deepEqual(replay.messages[1].content, [
+      { type: "thinking", thinking: "", signature: "SIG_1" },
+      ...blocks,
+      { type: "text", text: "Halzen won.", citations: null },
+    ]);
+  });
+
+  run("a gpt search in a response becomes server_tool_use plus a result, and citation ranges split the text", () => {
+    const text = "Francis Halzen won. ([nsf.gov](https://www.nsf.gov/nobel))";
+    const response = responsesResponseToAnthropicMessage({
+      id: "resp_1",
+      object: "response",
+      created_at: 1,
+      model: "gpt",
+      status: "completed",
+      output: [
+        { id: "msg_ack_1", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: " ", annotations: [] }] },
+        gptSearch("ws_0552abc"),
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text, annotations: [{ type: "url_citation", url: "https://www.nsf.gov/nobel", title: "NSF: 2026 Nobel", start_index: 20, end_index: text.length }] }],
+        },
+      ],
+      usage: { input_tokens: 5, output_tokens: 7, total_tokens: 12 },
+    } as any);
+    const content = response.content as Json[];
+    assert.deepEqual(content.map((block) => block.type), ["server_tool_use", "web_search_tool_result", "text", "text"]);
+    assert.deepEqual(content[0], {
+      type: "server_tool_use",
+      id: "srvtoolu_nanollm_ws_0552abc",
+      name: "web_search",
+      input: { query: "nobel 2026 physics", action: { type: "search", query: "nobel 2026 physics", queries: ["nobel 2026 physics"] } },
+    });
+    assert.deepEqual(content[1].content, [
+      { type: "web_search_result", url: "https://www.nsf.gov/nobel", title: "NSF: 2026 Nobel", encrypted_content: WEB_SEARCH_MARKER, page_age: null },
+      { type: "web_search_result", url: "https://kva.se/2026", title: "https://kva.se/2026", encrypted_content: WEB_SEARCH_MARKER, page_age: null },
+    ]);
+    assert.deepEqual(content[2], { type: "text", text: "Francis Halzen won. ", citations: null });
+    assert.equal(content[3].text, "([nsf.gov](https://www.nsf.gov/nobel))");
+    assert.deepEqual(content[3].citations, [{ type: "web_search_result_location", url: "https://www.nsf.gov/nobel", title: "NSF: 2026 Nobel", cited_text: "([nsf.gov](https://www.nsf.gov/nobel))", encrypted_index: WEB_SEARCH_MARKER }]);
+    assert.deepEqual((response.usage as Json).server_tool_use, { web_search_requests: 1, web_fetch_requests: 0 });
+  });
+
+  run("citation ranges count code points, overlap and clamp to the text", () => {
+    const text = "\u{1F52D}\u{1F30C} abc def";
+    const blocks = splitTextByCitations(text, [
+      { url: "https://a.example", title: "A", startIndex: 0, endIndex: 6 },
+      { url: "https://b.example", title: "B", startIndex: 3, endIndex: 99 },
+    ]) as Json[];
+    assert.deepEqual(blocks.map((block) => block.text), ["\u{1F52D}\u{1F30C} ", "abc", " def"]);
+    assert.deepEqual(blocks.map((block) => block.citations?.map((citation: Json) => citation.title) ?? null), [["A"], ["A", "B"], ["B"]]);
+    assert.deepEqual(splitTextByCitations("plain", undefined), [{ type: "text", text: "plain", citations: null }]);
+  });
+
+  run("a gpt search shown to an anthropic client comes back as the same web_search_call", () => {
+    const response = responsesResponseToAnthropicMessage({
+      id: "resp_1", object: "response", created_at: 1, model: "gpt", status: "completed",
+      output: [gptSearch("ws_0552abc"), gptAnswer()],
+      usage: { input_tokens: 5, output_tokens: 7, total_tokens: 12 },
+    } as any);
+    // The client echoes the assistant turn; the request converter rebuilds the native item.
+    const replay = anthropicMessageRequestToResponsesRequest({
+      model: "claude",
+      max_tokens: 100,
+      messages: [{ role: "user", content: "Who won?" }, { role: "assistant", content: response.content }, { role: "user", content: "Source?" }],
+    } as any);
+    const input = replay.input as Json[];
+    assert.deepEqual(input[1], gptSearch("ws_0552abc"));
+  });
+
+  run("a gpt search shown to a chat client leaves just the answer text", () => {
+    const chat = responsesResponseToChatCompletion({
+      id: "resp_1", object: "response", created_at: 1, model: "gpt", status: "completed",
+      output: [gptSearch("ws_0552abc"), gptAnswer()],
+      usage: { input_tokens: 5, output_tokens: 7, total_tokens: 12 },
+    } as any);
+    assert.equal(chat.choices[0].message.tool_calls, null);
+    assert.match(String((chat.choices[0].message.content as Json[])[0].text), /^Francis Halzen won\./);
+  });
+
+  run("a blank acknowledgement message ahead of other output is dropped", () => {
+    const blank = { id: "msg_ack", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: " ", annotations: [] }] };
+    const alone = responsesResponseToAnthropicMessage({ id: "r", object: "response", created_at: 1, model: "gpt", status: "completed", output: [blank] } as any);
+    assert.equal((alone.content as Json[]).length, 1);
+    const withOther = responsesResponseToAnthropicMessage({ id: "r", object: "response", created_at: 1, model: "gpt", status: "completed", output: [blank, gptAnswer()] } as any);
+    // The answer's citation splits it in two; the blank message adds nothing.
+    assert.deepEqual((withOther.content as Json[]).map((block) => block.text), ["Francis Halzen won. ", "([nsf.gov](https://www.nsf.gov/nobel))"]);
   });
 
   run("native web search blocks in a claude stream are skipped, not turned into function calls", () => {

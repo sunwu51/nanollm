@@ -214,11 +214,40 @@ export function normalizeWebSearchCarrier(value: unknown): NormalizedWebSearch[]
       const index = byId.get(block.tool_use_id);
       const serverToolUse = index === undefined ? undefined : (searches[index].native as { blocks: unknown[] }).blocks[0];
       const search = normalizeAnthropicWebSearch(serverToolUse, block);
-      if (index === undefined) searches.push(search);
+      if (index === undefined) searches.push({ ...search, continuation: true });
       else searches[index] = search;
     }
   }
   return searches;
+}
+
+/** Web searches seen so far in a request or response, so a later result block can complete its search. */
+export type AnthropicSearchIndex = Map<string, { part: NormalizedWebSearch; serverToolUse: any }>;
+
+/** A new search part from a server_tool_use block, registered so its result can find it. */
+export function startAnthropicWebSearch(serverToolUse: any, searches: AnthropicSearchIndex, currentIds: Set<string>): NormalizedWebSearch {
+  const part = normalizeAnthropicWebSearch(serverToolUse, undefined);
+  searches.set(serverToolUse.id, { part, serverToolUse });
+  currentIds.add(serverToolUse.id);
+  return part;
+}
+
+/**
+ * Attach a web_search_tool_result to its search. Within the same message the search gets both native
+ * blocks. A result from a later message completes the earlier search's readable fields and keeps its
+ * own block in place as a continuation, so a native replay restores the original block order. A result
+ * whose search was never seen is a continuation too (stateless: the earlier turn belongs to the client).
+ */
+export function attachAnthropicWebSearchResult(result: any, searches: AnthropicSearchIndex, currentIds: Set<string>): NormalizedWebSearch | undefined {
+  const entry = searches.get(result.tool_use_id);
+  if (!entry) return { ...normalizeAnthropicWebSearch(undefined, result), continuation: true };
+  const completed = normalizeAnthropicWebSearch(entry.serverToolUse, result);
+  if (currentIds.has(result.tool_use_id)) {
+    Object.assign(entry.part, completed);
+    return undefined;
+  }
+  Object.assign(entry.part, { status: completed.status, sources: completed.sources, errorCode: completed.errorCode });
+  return { ...completed, native: { blocks: [result] }, continuation: true };
 }
 
 export function normalizeAnthropicCitations(citations: unknown): NormalizedCitation[] | undefined {
@@ -347,6 +376,120 @@ export function webSearchFunctionCallItems(search: NormalizedWebSearch, snippets
     { type: "function_call", call_id: search.id, name: WEB_SEARCH_HISTORY_TOOL_NAME, arguments: JSON.stringify({ query: webSearchQueryText(search.action) }) },
     { type: "function_call_output", call_id: search.id, output: webSearchResultText(search, snippets, titles) },
   ];
+}
+
+// ─── Responses (response side) ──────────────────────────────────────────────
+
+let carrierCounter = 0;
+
+/**
+ * Output items for an Anthropic search shown to a Responses client: a visible web_search_call and a
+ * reasoning item whose encrypted_content carries the original blocks (clients send that back verbatim).
+ * A search with no result yet (a client tool was called in the same turn) is only carried: showing a
+ * finished search that hasn't run would be false, and its result arrives in the next response.
+ */
+export function anthropicSearchToResponsesItems(search: NormalizedWebSearch): Record<string, unknown>[] {
+  const items: Record<string, unknown>[] = [];
+  if (search.status !== "in_progress") {
+    items.push({
+      id: toResponsesWebSearchId(search.id),
+      type: "web_search_call",
+      status: search.status === "failed" ? "failed" : "completed",
+      action: denormalizeResponsesAction(search.action, search.sources),
+    });
+  }
+  const blocks = anthropicWebSearchBlocks(search);
+  if (blocks) items.push({ id: `rs_ws_${++carrierCounter}`, type: "reasoning", status: "completed", summary: [], encrypted_content: encodeWebSearchCarrier(blocks) });
+  return items;
+}
+
+/** The Responses output items for a search, whichever protocol ran it. */
+export function webSearchToResponsesItems(search: NormalizedWebSearch): Record<string, unknown>[] {
+  const native = responsesWebSearchItem(search);
+  return native ? [native] : anthropicSearchToResponsesItems(search);
+}
+
+/** Annotations for a text part: Responses ranges as they are, Anthropic block citations covering the whole part. */
+export function responsesAnnotations(text: string, citations: NormalizedCitation[] | undefined): Record<string, unknown>[] {
+  const length = Array.from(text).length;
+  return (citations ?? []).map((citation) => ({
+    type: "url_citation",
+    url: citation.url,
+    title: citation.title ?? "",
+    start_index: citation.startIndex ?? 0,
+    end_index: citation.endIndex ?? length,
+  }));
+}
+
+// ─── Anthropic (response side) ──────────────────────────────────────────────
+
+/**
+ * Blocks for a Responses search shown to an Anthropic client. The action rides in `input` (clients
+ * echo it back verbatim) and results carry markers, so a later request can rebuild the web_search_call.
+ */
+export function responsesSearchToAnthropicBlocks(search: NormalizedWebSearch, titles: Map<string, string>): Record<string, unknown>[] {
+  const id = toAnthropicWebSearchId(search.id);
+  const content = search.status === "failed"
+    ? { type: "web_search_tool_result_error", error_code: "unavailable" }
+    : search.sources.map((source) => ({
+        type: "web_search_result",
+        url: source.url,
+        title: source.title || titles.get(source.url) || source.url,
+        encrypted_content: WEB_SEARCH_MARKER,
+        page_age: source.pageAge ?? null,
+      }));
+  return [
+    { type: "server_tool_use", id, name: WEB_SEARCH_TOOL_NAME, input: { query: webSearchQueryText(search.action), action: denormalizeResponsesAction(search.action) } },
+    { type: "web_search_tool_result", tool_use_id: id, content },
+  ];
+}
+
+/** Blocks for a search in an Anthropic response: the original ones, or the Responses search rebuilt. */
+export function webSearchToAnthropicBlocks(search: NormalizedWebSearch, titles: Map<string, string>): Record<string, unknown>[] {
+  if (search.origin === "anthropic") return (anthropicWebSearchBlocks(search) as Record<string, unknown>[] | undefined) ?? [{ type: "text", text: webSearchNoteText(search, titles), citations: null }];
+  return responsesSearchToAnthropicBlocks(search, titles);
+}
+
+/**
+ * Cut a text part into blocks at its citation ranges (Unicode code points): each cited stretch becomes
+ * a block carrying the citations that cover it, with the stretch itself as cited_text.
+ */
+export function splitTextByCitations(text: string, citations: NormalizedCitation[] | undefined): Record<string, unknown>[] {
+  const ranged = (citations ?? []).filter((citation) => citation.startIndex !== undefined && citation.endIndex !== undefined && citation.endIndex > citation.startIndex);
+  if (ranged.length === 0) return text === "" ? [] : [{ type: "text", text, citations: null }];
+
+  const chars = Array.from(text);
+  const bounds = [...new Set([0, chars.length, ...ranged.flatMap((citation) => [citation.startIndex!, citation.endIndex!])])]
+    .map((bound) => Math.min(Math.max(bound, 0), chars.length))
+    .sort((a, b) => a - b);
+
+  const blocks: Record<string, unknown>[] = [];
+  for (let i = 0; i < bounds.length - 1; i += 1) {
+    const [start, end] = [bounds[i], bounds[i + 1]];
+    if (end <= start) continue;
+    const segment = chars.slice(start, end).join("");
+    const covering = ranged.filter((citation) => citation.startIndex! <= start && citation.endIndex! >= end);
+    blocks.push(covering.length === 0
+      ? { type: "text", text: segment, citations: null }
+      : {
+          type: "text",
+          text: segment,
+          citations: covering.map((citation) => ({
+            type: "web_search_result_location",
+            url: citation.url,
+            title: citation.title ?? null,
+            // Only the answer's own words are known, not a quote from the source.
+            cited_text: Array.from(segment).slice(0, 150).join(""),
+            encrypted_index: WEB_SEARCH_MARKER,
+          })),
+        });
+  }
+  return blocks;
+}
+
+/** Searches that actually ran, for usage.server_tool_use.web_search_requests. */
+export function countWebSearchRequests(parts: NormalizedPart[]): number {
+  return parts.filter((part) => part.type === "web_search" && part.action.type === "search" && part.status !== "in_progress" && !part.continuation).length;
 }
 
 // ─── Same-format passthrough ────────────────────────────────────────────────
