@@ -1,3 +1,4 @@
+import { brotliCompressSync, brotliDecompressSync, constants as zlibConstants } from "node:zlib";
 import type {
   NormalizedCitation,
   NormalizedPart,
@@ -42,16 +43,46 @@ export function isWebSearchCarrier(value: unknown): value is string {
   return typeof value === "string" && value.startsWith(CARRIER_PREFIX);
 }
 
+// The blocks are mostly Anthropic's encrypted_content (about 4 KB per result, incompressible), and
+// base64 of JSON that already holds base64 expands it twice. Compressing removes that expansion and
+// takes about 28% off a real nine-result search. Brotli quality 5 is what request records use
+// (storage/record), and costs about 1 ms here; the default quality 11 takes about 33 ms per carrier.
+/** A carrier comes from the client, so a decompressed one is capped. */
+const MAX_CARRIER_BYTES = 32 * 1024 * 1024;
+
 /** Encode original Anthropic search blocks for a Responses reasoning item's encrypted_content. */
 export function encodeWebSearchCarrier(blocks: unknown[]): string {
-  return CARRIER_PREFIX + Buffer.from(JSON.stringify({ blocks }), "utf8").toString("base64");
+  const json = Buffer.from(JSON.stringify({ blocks }), "utf8");
+  const compressed = brotliCompressSync(json, {
+    params: {
+      [zlibConstants.BROTLI_PARAM_MODE]: zlibConstants.BROTLI_MODE_TEXT,
+      [zlibConstants.BROTLI_PARAM_QUALITY]: 5,
+      [zlibConstants.BROTLI_PARAM_SIZE_HINT]: json.length,
+    },
+  });
+  return CARRIER_PREFIX + compressed.toString("base64");
 }
 
+function parseCarrierBlocks(json: Buffer): unknown[] | undefined {
+  const parsed = JSON.parse(json.toString("utf8"));
+  return Array.isArray(parsed?.blocks) ? parsed.blocks : undefined;
+}
+
+/** Accepts the compressed form and the plain base64 JSON form written before compression. */
 export function decodeWebSearchCarrier(value: unknown): unknown[] | undefined {
   if (!isWebSearchCarrier(value)) return undefined;
+  const bytes = Buffer.from(value.slice(CARRIER_PREFIX.length), "base64");
   try {
-    const parsed = JSON.parse(Buffer.from(value.slice(CARRIER_PREFIX.length), "base64").toString("utf8"));
-    return Array.isArray(parsed?.blocks) ? parsed.blocks : undefined;
+    // Plain JSON always starts with "{"; brotli has no magic bytes, so a stream that merely begins with
+    // that byte still falls through to decompression when it does not parse as JSON.
+    if (bytes[0] === 0x7b) {
+      try {
+        return parseCarrierBlocks(bytes);
+      } catch {
+        // Not plain JSON after all.
+      }
+    }
+    return parseCarrierBlocks(brotliDecompressSync(bytes, { maxOutputLength: MAX_CARRIER_BYTES }));
   } catch {
     return undefined;
   }

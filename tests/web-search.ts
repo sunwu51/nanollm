@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { brotliCompressSync } from "node:zlib";
 import {
   anthropicMessageRequestToChatParams,
   anthropicMessageRequestToResponsesRequest,
@@ -99,6 +101,27 @@ export function runWebSearchTests(run: (name: string, fn: () => void) => void): 
     const blocks = claudeSearch();
     assert.deepEqual(decodeWebSearchCarrier(encodeWebSearchCarrier(blocks)), blocks);
     assert.equal(decodeWebSearchCarrier("nanollm.reasoning.v1:abc"), undefined);
+  });
+
+  run("web search carrier is brotli-compressed, still reads the older plain form, and caps what it unpacks", () => {
+    // Search results are mostly encrypted_content: random bytes, as base64 text.
+    const results = Array.from({ length: 9 }, (_, index) => ({
+      type: "web_search_result", url: `https://example.com/${index}`, title: `Result ${index}`, page_age: null,
+      encrypted_content: randomBytes(879).toString("base64"),
+    }));
+    const blocks = [claudeSearch()[0], { type: "web_search_tool_result", tool_use_id: "srvtoolu_01abc", content: results }];
+    const carrier = encodeWebSearchCarrier(blocks);
+    const plain = `nanollm.websearch.v1:${Buffer.from(JSON.stringify({ blocks }), "utf8").toString("base64")}`;
+    // base64 of JSON that already holds base64 expands twice; compressing takes that back (about 28% on real searches).
+    assert.ok(carrier.length < plain.length * 0.85, `${carrier.length} vs ${plain.length}`);
+    assert.deepEqual(decodeWebSearchCarrier(carrier), blocks);
+    assert.deepEqual(decodeWebSearchCarrier(plain), blocks);
+    // The carrier comes from the client: a decompression bomb or garbage is ignored, not unpacked.
+    assert.equal(decodeWebSearchCarrier(`nanollm.websearch.v1:${brotliCompressSync(Buffer.alloc(40 * 1024 * 1024)).toString("base64")}`), undefined);
+    assert.equal(decodeWebSearchCarrier("nanollm.websearch.v1:H4sIAAAAAAAAA-not-compressed"), undefined);
+    assert.equal(decodeWebSearchCarrier("nanollm.websearch.v1:bm90LWpzb24="), undefined);
+    // A compressed stream whose first byte happens to be "{" is still decompressed, not mistaken for JSON.
+    assert.deepEqual(decodeWebSearchCarrier(`nanollm.websearch.v1:${brotliCompressSync(Buffer.from(JSON.stringify({ blocks: [{ type: "text", text: "{" }] }))).toString("base64")}`), [{ type: "text", text: "{" }]);
   });
 
   run("responses web_search tool becomes anthropic basic web search; a forced choice becomes auto", () => {

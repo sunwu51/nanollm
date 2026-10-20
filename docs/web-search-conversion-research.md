@@ -582,7 +582,7 @@ Verified live through a local nanollm in front of the real upstreams, including 
 - GPT search → Anthropic client → Claude: note.
 
 Notes:
-1. A Claude search shown to a Responses client adds a carrier of roughly the size of the results (about 27 KB for one search of nine results) to every later request in the conversation. If this proves heavy on Turso-backed deployments, store carriers in the request records only by reference or compress them.
+1. A Claude search shown to a Responses client adds a carrier of roughly the size of the results (about 27 KB for one search of nine results) to every later request in the conversation. Compressed in phase 4 follow-up, see below.
 2. `pause_turn` still reaches a Responses client as a normal completed response (status `completed`, no continuation). Phase 4 resumes it inside the proxy.
 3. `NormalizedUsage` has no `webSearchRequests`; the Anthropic count is derived from the parts.
 
@@ -615,6 +615,21 @@ Verification and limits:
 4. A retry shows up as a second attempt in the request record under the same attempt index (the first error is overwritten by the retry's response).
 
 ### Remaining
-- Carrier size: about 27–34 KB per search added to every later request of the conversation. Compression (gzip before base64) is the obvious cheap change; not done.
 - Native OpenAI history rules with real reasoning items next to searches (open question 1) still need a channel that returns them.
 - Codex history behavior (open question 6).
+
+### Carrier compression (done 2026-10-21, uncommitted)
+
+The carrier is mostly Anthropic's `encrypted_content`, which is encrypted (7.7 bits per byte) and travels as base64 inside JSON that is then base64-encoded again. Measured on a real nine-result search (37 KB of `encrypted_content`):
+
+| Carrier form | Size |
+| --- | --- |
+| base64 of JSON (before) | 52.9 KB |
+| base64 of gzip | 38.1 KB (-28%) |
+| base64 of brotli (now, quality 5) | about the same, 0.4% under gzip |
+
+The floor is about the raw encrypted size plus one base64 expansion, about 37 KB, so any codec reaches it (gzip first, brotli 0.4% under it); pruning results to save more makes Claude correct itself (§10.3). Brotli quality 5 was chosen to match request records (`storage/record`, which also uses it): it costs about 1.1 ms against 0.7 ms for gzip, while Node's default quality 11 takes about 33 ms of synchronous work per carrier. gzip was picked first by mistake of process (compared against the slow default without checking the repo's convention) and replaced before it was ever committed. Live through nanollm: the carrier of a fresh search was 25,353 characters against 34,841 for the old form (-27%), and replaying it to Claude returned 200 with the correct source (the restored blocks are accepted).
+
+The decoder treats a payload starting with `{` as the plain form and decompresses anything else, so no prefix change was needed and older carriers keep working. The decompressed size is capped at 32 MB because the carrier comes from the client (a decompression bomb is ignored, tested).
+
+Left: a conversation still grows by one carrier per search. Past a certain number of searches, carriers of old turns could be dropped (degrading those searches to notes), but that changes Claude's view of its earlier answers, so it is not done.
