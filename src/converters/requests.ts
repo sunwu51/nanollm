@@ -1114,7 +1114,8 @@ function denormalizeAnthropicUserParts(allParts: NormalizedMessage["parts"]): an
 function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserveThinking: boolean, ignoreInvalidHistory: boolean, citationTitles: Map<string, string>): ContentBlockParam[] {
   const blocks = message.parts.flatMap<ContentBlockParam>((part) => {
     // Citations are dropped: Anthropic accepts text without them, and only the issuing account can verify encrypted_index.
-    if (part.type === "text" || part.type === "refusal") return part.text === "" ? [] : [{ type: "text", text: part.text, citations: null }];
+    // Claude rejects empty and whitespace-only text blocks (a blank acknowledgement message, for one).
+    if (part.type === "text" || part.type === "refusal") return part.text.trim() === "" ? [] : [{ type: "text", text: part.text, citations: null }];
     if (part.type === "web_search") {
       const native = anthropicWebSearchBlocks(part) as ContentBlockParam[] | undefined;
       if (native) return native;

@@ -58,6 +58,42 @@ function gptAnswer(): Json {
   };
 }
 
+
+type StreamEvent = Record<string, any>;
+
+function convertStream(from: "anthropic" | "openai-responses", to: "anthropic" | "openai-responses" | "openai-chat", events: StreamEvent[]): StreamEvent[] {
+  const converter = createStreamConverter(from, to);
+  return [...events.flatMap((event) => converter.push(event)), ...converter.flush()] as StreamEvent[];
+}
+
+/** A Claude stream with thinking, text, a search (query in fragments), and a cited answer. */
+function claudeSearchStream(blocks: Json[]): StreamEvent[] {
+  const [serverToolUse, result] = blocks;
+  const query = JSON.stringify(serverToolUse.input);
+  return [
+    { type: "message_start", message: { id: "msg_1", model: "claude", role: "assistant", content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
+    { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "SIG_1" } },
+    { type: "content_block_stop", index: 0 },
+    { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Let me search." } },
+    { type: "content_block_stop", index: 1 },
+    { type: "content_block_start", index: 2, content_block: { type: "server_tool_use", id: serverToolUse.id, name: "web_search", input: {} } },
+    { type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: query.slice(0, 9) } },
+    { type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: query.slice(9) } },
+    { type: "content_block_stop", index: 2 },
+    { type: "content_block_start", index: 3, content_block: result },
+    { type: "content_block_stop", index: 3 },
+    { type: "content_block_start", index: 4, content_block: { type: "text", text: "", citations: [] } },
+    { type: "content_block_delta", index: 4, delta: { type: "citations_delta", citation: { type: "web_search_result_location", url: "https://nobelprize.org/2026", title: "Nobel Prize 2026", cited_text: "quote", encrypted_index: "IDX_1" } } },
+    { type: "content_block_delta", index: 4, delta: { type: "text_delta", text: "Halzen " } },
+    { type: "content_block_delta", index: 4, delta: { type: "text_delta", text: "won." } },
+    { type: "content_block_stop", index: 4 },
+    { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 9, server_tool_use: { web_search_requests: 1 } } },
+    { type: "message_stop" },
+  ];
+}
+
 export function runWebSearchTests(run: (name: string, fn: () => void) => void): void {
   run("web search carrier round-trips the original Anthropic blocks", () => {
     const blocks = claudeSearch();
@@ -487,25 +523,174 @@ export function runWebSearchTests(run: (name: string, fn: () => void) => void): 
     assert.deepEqual((withOther.content as Json[]).map((block) => block.text), ["Francis Halzen won. ", "([nsf.gov](https://www.nsf.gov/nobel))"]);
   });
 
-  run("native web search blocks in a claude stream are skipped, not turned into function calls", () => {
-    const converter = createStreamConverter("anthropic", "openai-responses");
+  run("a claude search stream becomes ordered responses items with a carrier, annotations and message splits", () => {
+    const blocks = claudeSearch();
+    const events = claudeSearchStream(blocks);
+    const out = convertStream("anthropic", "openai-responses", events);
+
+    const added = out.filter((event) => event.type === "response.output_item.added").map((event) => `${event.output_index}:${event.item.type}`);
+    assert.deepEqual(added, ["0:reasoning", "1:message", "2:web_search_call", "3:reasoning", "4:message"]);
+    // The text before the search is closed before the search starts.
+    const types = out.map((event) => event.type);
+    assert.ok(types.indexOf("response.output_item.done") < types.indexOf("response.web_search_call.in_progress"));
+    for (const type of ["response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed"]) {
+      assert.equal(out.filter((event) => event.type === type).length, 1, type);
+    }
+    assert.equal(out.some((event) => event.item?.type === "function_call"), false);
+
+    const annotation = out.find((event) => event.type === "response.output_text.annotation.added");
+    assert.deepEqual(annotation?.annotation, { type: "url_citation", url: "https://nobelprize.org/2026", title: "Nobel Prize 2026", start_index: 0, end_index: 11 });
+    assert.ok(types.indexOf("response.output_text.annotation.added") < types.lastIndexOf("response.output_text.done"));
+
+    const completed = out.find((event) => event.type === "response.completed");
+    const output = completed?.response.output as Json[];
+    assert.deepEqual(output.map((item) => item.type), ["reasoning", "message", "web_search_call", "reasoning", "message"]);
+    assert.equal(output[1].content[0].text, "Let me search.");
+    assert.deepEqual(output[2].action.sources, [{ type: "url", url: "https://nobelprize.org/2026" }, { type: "url", url: "https://news.example/halzen" }]);
+    assert.deepEqual(decodeWebSearchCarrier(output[3].encrypted_content), blocks);
+    assert.deepEqual(output[4].content[0].annotations, [annotation?.annotation]);
+  });
+
+  run("a streamed claude search matches the non-stream conversion item for item", () => {
+    const blocks = claudeSearch();
+    const streamed = convertStream("anthropic", "openai-responses", claudeSearchStream(blocks)).find((event) => event.type === "response.completed")?.response.output as Json[];
+    const whole = anthropicMessageToResponsesResponse({
+      id: "msg_1", type: "message", role: "assistant", model: "claude", stop_reason: "end_turn", stop_sequence: null,
+      content: [{ type: "thinking", thinking: "", signature: "SIG_1" }, { type: "text", text: "Let me search." }, ...blocks, citedText("Halzen won.", "https://nobelprize.org/2026", "quote")],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    } as any).output as Json[];
+    assert.deepEqual(streamed.map((item) => item.type), whole.map((item) => item.type));
+    assert.deepEqual(streamed[2], whole[2]);
+    assert.deepEqual(decodeWebSearchCarrier(streamed[3].encrypted_content), decodeWebSearchCarrier(whole[3].encrypted_content));
+  });
+
+  run("a claude search stream round-trips through a responses client back to claude unchanged", () => {
+    const blocks = claudeSearch();
+    const output = convertStream("anthropic", "openai-responses", claudeSearchStream(blocks)).find((event) => event.type === "response.completed")?.response.output as Json[];
+    const echoed = output.map((item) => item.type === "message" ? { ...item, content: item.content.map((part: Json) => ({ ...part, annotations: [] })) } : item);
+    const replay = responsesRequestToAnthropicMessageRequest({ model: "gpt", input: [{ role: "user", content: "Who won?" }, ...echoed, { role: "user", content: "Source?" }] } as any);
+    assert.deepEqual(replay.messages[1].content, [
+      { type: "thinking", thinking: "", signature: "SIG_1" },
+      { type: "text", text: "Let me search.", citations: null },
+      ...blocks,
+      { type: "text", text: "Halzen won.", citations: null },
+    ]);
+  });
+
+  run("a claude search pending behind a client tool call streams as incomplete and is carried", () => {
+    const [serverToolUse] = claudeSearch();
     const events = [
       { type: "message_start", message: { id: "msg_1", model: "claude", role: "assistant", content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
-      { type: "content_block_start", index: 0, content_block: { type: "server_tool_use", id: "srvtoolu_01abc", name: "web_search", input: {} } },
-      { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{\"query\":\"nobel\"}" } },
+      { type: "content_block_start", index: 0, content_block: { type: "server_tool_use", id: serverToolUse.id, name: "web_search", input: {} } },
+      { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(serverToolUse.input) } },
       { type: "content_block_stop", index: 0 },
-      { type: "content_block_start", index: 1, content_block: { type: "web_search_tool_result", tool_use_id: "srvtoolu_01abc", content: claudeSearch()[1].content } },
+      { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_1", name: "run", input: {} } },
+      { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{}" } },
       { type: "content_block_stop", index: 1 },
-      { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
-      { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "Halzen won." } },
-      { type: "content_block_stop", index: 2 },
+      { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 3 } },
+      { type: "message_stop" },
+    ];
+    const out = convertStream("anthropic", "openai-responses", events);
+    const output = out.find((event) => event.type === "response.completed")?.response.output as Json[];
+    assert.deepEqual(output.map((item) => item.type), ["web_search_call", "reasoning", "function_call"]);
+    assert.equal(output[0].status, "incomplete");
+    assert.deepEqual(decodeWebSearchCarrier(output[1].encrypted_content), [serverToolUse]);
+    assert.equal(out.some((event) => event.type === "response.web_search_call.completed"), false);
+  });
+
+  run("a result arriving in a later claude stream is shown once and carried", () => {
+    const [, result] = claudeSearch();
+    const events = [
+      { type: "message_start", message: { id: "msg_2", model: "claude", role: "assistant", content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
+      { type: "content_block_start", index: 0, content_block: result },
+      { type: "content_block_stop", index: 0 },
+      { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Done." } },
+      { type: "content_block_stop", index: 1 },
       { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } },
       { type: "message_stop" },
     ];
-    const out = [...events.flatMap((event) => converter.push(event as never)), ...converter.flush()] as Json[];
-    assert.equal(out.some((event) => event.type?.includes("function_call") || event.item?.type === "function_call"), false);
-    assert.equal(out.filter((event) => event.type === "response.output_text.delta").map((event) => event.delta).join(""), "Halzen won.");
-    const completed = out.find((event) => event.type === "response.completed");
-    assert.deepEqual(completed?.response.output.map((item: Json) => item.type), ["message"]);
+    const output = convertStream("anthropic", "openai-responses", events).find((event) => event.type === "response.completed")?.response.output as Json[];
+    assert.deepEqual(output.map((item) => item.type), ["web_search_call", "reasoning", "message"]);
+    assert.equal(output[0].id, "ws_nanollm_srvtoolu_01abc");
+    assert.deepEqual(decodeWebSearchCarrier(output[1].encrypted_content), [result]);
+  });
+
+  run("a gpt search stream shows the call at once, fills its input later, and puts the citation on the open block", () => {
+    const converter = createStreamConverter("openai-responses", "anthropic");
+    const push = (event: Json) => converter.push(event) as Json[];
+    const text = "Francis Halzen won. ([nsf.gov](https://www.nsf.gov/nobel))";
+    const search = gptSearch("ws_0552abc");
+
+    push({ type: "response.created", response: { id: "resp_1", model: "gpt", created_at: 1, status: "in_progress", output: [] } });
+    const started = push({ type: "response.output_item.added", output_index: 0, item: { id: "ws_0552abc", type: "web_search_call", status: "in_progress" } });
+    // The call is visible before the query is known.
+    assert.deepEqual(started, [{ type: "content_block_start", index: 0, content_block: { type: "server_tool_use", id: "srvtoolu_nanollm_ws_0552abc", name: "web_search", input: {} } }]);
+    assert.deepEqual(push({ type: "response.web_search_call.searching", output_index: 0, item_id: "ws_0552abc" }), []);
+
+    const finished = push({ type: "response.output_item.done", output_index: 0, item: search });
+    assert.deepEqual(finished.map((event) => event.type), ["content_block_delta", "content_block_stop", "content_block_start", "content_block_stop"]);
+    assert.deepEqual(JSON.parse(finished[0].delta.partial_json), { query: "nobel 2026 physics", action: { type: "search", query: "nobel 2026 physics", queries: ["nobel 2026 physics"] } });
+    assert.equal(finished[2].content_block.type, "web_search_tool_result");
+    assert.equal(finished[2].content_block.tool_use_id, "srvtoolu_nanollm_ws_0552abc");
+    assert.deepEqual(finished[2].content_block.content.map((entry: Json) => entry.url), ["https://www.nsf.gov/nobel", "https://kva.se/2026"]);
+
+    push({ type: "response.output_item.added", output_index: 1, item: { id: "msg_1", type: "message", role: "assistant", status: "in_progress", content: [] } });
+    push({ type: "response.content_part.added", output_index: 1, content_index: 0, item_id: "msg_1", part: { type: "output_text", text: "", annotations: [] } });
+    push({ type: "response.output_text.delta", output_index: 1, content_index: 0, item_id: "msg_1", delta: text });
+    const cited = push({ type: "response.output_text.annotation.added", output_index: 1, content_index: 0, item_id: "msg_1", annotation_index: 0, annotation: { type: "url_citation", url: "https://www.nsf.gov/nobel", title: "NSF: 2026 Nobel", start_index: 20, end_index: Array.from(text).length } });
+    assert.deepEqual(cited, [{
+      type: "content_block_delta",
+      // Block 0 is the call, block 1 its result, block 2 the answer text.
+      index: 2,
+      delta: { type: "citations_delta", citation: { type: "web_search_result_location", url: "https://www.nsf.gov/nobel", title: "NSF: 2026 Nobel", cited_text: "([nsf.gov](https://www.nsf.gov/nobel))", encrypted_index: WEB_SEARCH_MARKER } },
+    }]);
+    push({ type: "response.content_part.done", output_index: 1, content_index: 0, item_id: "msg_1", part: { type: "output_text", text, annotations: [] } });
+    const end = push({ type: "response.completed", response: { id: "resp_1", model: "gpt", created_at: 1, status: "completed", output: [search], usage: { input_tokens: 5, output_tokens: 7, total_tokens: 12 } } });
+    assert.deepEqual(end.find((event) => event.type === "message_delta")?.usage.server_tool_use, { web_search_requests: 1, web_fetch_requests: 0 });
+  });
+
+  run("a gpt search stream whose done event never arrives is finished from the completed response", () => {
+    const search = gptSearch("ws_0552abc");
+    const out = convertStream("openai-responses", "anthropic", [
+      { type: "response.created", response: { id: "resp_1", model: "gpt", created_at: 1, status: "in_progress", output: [] } },
+      { type: "response.output_item.added", output_index: 0, item: { id: "ws_0552abc", type: "web_search_call", status: "in_progress" } },
+      { type: "response.completed", response: { id: "resp_1", model: "gpt", created_at: 1, status: "completed", output: [search], usage: { input_tokens: 5, output_tokens: 7, total_tokens: 12 } } },
+    ]);
+    assert.deepEqual(out.filter((event) => event.type?.startsWith("content_block")).map((event) => event.type), ["content_block_start", "content_block_delta", "content_block_stop", "content_block_start", "content_block_stop"]);
+  });
+
+  run("a gpt search stream converts to chat without any search output", () => {
+    const text = "Francis Halzen won.";
+    const out = convertStream("openai-responses", "openai-chat", [
+      { type: "response.created", response: { id: "resp_1", model: "gpt", created_at: 1, status: "in_progress", output: [] } },
+      { type: "response.output_item.added", output_index: 0, item: { id: "ws_1", type: "web_search_call", status: "in_progress" } },
+      { type: "response.output_item.done", output_index: 0, item: gptSearch("ws_1") },
+      { type: "response.output_item.added", output_index: 1, item: { id: "msg_1", type: "message", role: "assistant", status: "in_progress", content: [] } },
+      { type: "response.content_part.added", output_index: 1, content_index: 0, item_id: "msg_1", part: { type: "output_text", text: "", annotations: [] } },
+      { type: "response.output_text.delta", output_index: 1, content_index: 0, item_id: "msg_1", delta: text },
+      { type: "response.output_text.annotation.added", output_index: 1, content_index: 0, item_id: "msg_1", annotation_index: 0, annotation: { type: "url_citation", url: "https://x.example", title: "X", start_index: 0, end_index: 5 } },
+      { type: "response.content_part.done", output_index: 1, content_index: 0, item_id: "msg_1", part: { type: "output_text", text, annotations: [] } },
+      { type: "response.completed", response: { id: "resp_1", model: "gpt", created_at: 1, status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+    ]);
+    const content = out.flatMap((chunk) => chunk.choices ?? []).map((choice: Json) => choice.delta?.content ?? "").join("");
+    assert.equal(content, text);
+    assert.equal(out.some((chunk) => chunk.choices?.some((choice: Json) => choice.delta?.tool_calls)), false);
+  });
+
+  run("a blank assistant text block is dropped when converting history to anthropic", () => {
+    const result = responsesRequestToAnthropicMessageRequest({
+      model: "gpt",
+      input: [
+        { role: "user", content: "Who won?" },
+        { id: "msg_ack_1", type: "message", role: "assistant", content: [{ type: "output_text", text: " ", annotations: [] }] },
+        gptSearch("ws_0552abc"),
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "Halzen won.", annotations: [] }] },
+        { role: "user", content: "Source?" },
+      ],
+    } as any);
+    const blocks = result.messages[1].content as Json[];
+    assert.equal(blocks.some((block) => block.type === "text" && block.text.trim() === ""), false);
+    assert.equal(blocks.at(-1)?.text, "Halzen won.");
   });
 }

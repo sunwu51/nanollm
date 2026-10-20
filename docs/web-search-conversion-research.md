@@ -561,12 +561,11 @@ Done: tool mapping both ways, forced choice → `auto`, `include` sources for Re
 Verified live through a local nanollm in front of the real upstreams: tools convert and both models search; Claude history → GPT, GPT history → Claude, and both synthesized-passthrough cases return 200 with correct follow-up answers.
 
 Findings during the live run:
-1. **Interim guard.** Forwarding the search tool to Claude made it return `server_tool_use`, which the unchanged response converter showed to Responses clients as a fake `function_call web_search` (a client would try to run it). Phase 1 skipped native web search blocks in Claude responses and streams. Phase 2 replaced the non-stream guard with real conversion; the stream guard (`AnthropicStreamParser`) stays until phase 3.
+1. **Interim guard.** Forwarding the search tool to Claude made it return `server_tool_use`, which the unchanged response converter showed to Responses clients as a fake `function_call web_search` (a client would try to run it). Phase 1 skipped native web search blocks in Claude responses and streams. Phase 2 replaced the non-stream guard with real conversion and phase 3 the stream guard.
 2. **`ttfb_timeout`.** The default first-byte timeout (5 s) fails non-streaming search requests (the upstream needs 6–12 s before the first byte). Models that search need a larger `ttfb_timeout`; worth a README note once search conversion ships.
 3. Phase 1 alone never produces the carrier or the `*_nanollm_` ids (those come from response conversion), so the carrier restore paths are covered by unit tests with hand-built input only.
 
 ### Remaining
-- Phase 3: stream parsers and emitters (including message-item split around searches).
 - Phase 4: proxy `pause_turn` auto-continue; strip native Claude thinking after a rewritten history (prefix binding, `docs/claude-thinking-rules.md` §2.4).
 
 ### Phase 2: non-stream responses (done 2026-10-21, uncommitted)
@@ -586,3 +585,19 @@ Notes:
 1. A Claude search shown to a Responses client adds a carrier of roughly the size of the results (about 27 KB for one search of nine results) to every later request in the conversation. If this proves heavy on Turso-backed deployments, store carriers in the request records only by reference or compress them.
 2. `pause_turn` still reaches a Responses client as a normal completed response (status `completed`, no continuation). Phase 4 resumes it inside the proxy.
 3. `NormalizedUsage` has no `webSearchRequests`; the Anthropic count is derived from the parts.
+
+### Phase 3: streams (done 2026-10-21, uncommitted)
+
+Code: `streams.ts` (new normalized events `web_search_start` / `web_search_done` / `citation`; both parsers and the Responses and Anthropic emitters), `requests.ts` (blank text dropped), `tests/web-search.ts`. Reference: `docs/converters.md` "Web search in streams".
+
+Done: Claude stream → Responses (call shown when its query is known, result completes it, carrier item, message split around searches, annotations before `output_text.done`, pending search closed in order); GPT stream → Anthropic (call shown at once, input filled in at done, result block, citation on the open block, usage); streamed output matches the non-stream conversion item for item (tested); `response.completed` finishes searches whose done event is missing.
+
+Verified live through a local nanollm in front of the real upstreams (streaming both ways): both stream shapes are right (Anthropic client against GPT: two `server_tool_use` + result pairs, citation on the text block, `web_search_requests` 1; Responses client against Claude: web_search_call + carrier + message). The streamed Claude output replayed back to Claude: the carrier (about 34 KB, reassembled from the stream) was accepted. Streamed output also replayed to GPT, and the streamed GPT output to GPT and Claude: all 200 with correct answers.
+
+Findings:
+1. Test caught an ordering bug in the first design: a search pending behind a client tool call was only closed at the end of the stream, so its carrier landed after the client's `function_call`. Replayed to Claude that would reorder `server_tool_use` and `tool_use`. It is now closed as soon as any non-search block starts.
+2. A stream cannot know a search will stay pending when it announces it, so it ends `incomplete` where the non-stream path shows nothing. The carrier holds the real state either way and replay ignores the visible copy.
+3. Citations from a GPT stream can't split the Anthropic text block (they arrive after the text), so streamed Anthropic output has coarser citations than the non-stream path.
+
+### Remaining
+- Phase 4: proxy `pause_turn` auto-continue; strip native Claude thinking after a rewritten history (prefix binding, `docs/claude-thinking-rules.md` §2.4).
