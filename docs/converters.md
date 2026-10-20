@@ -15,7 +15,7 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | `model` | `model` | `model` | `model` | Forwarded and overwritten by configured upstream model before provider calls. |
 | `maxOutputTokens` | `max_completion_tokens`, fallback `max_tokens` | `max_output_tokens` | `max_tokens` | Denormalizing to Chat always uses `max_completion_tokens`. |
 | `messages` | `messages[]` | `instructions` + `input` | `system` + `messages[]` | System/developer messages become Anthropic `system`; Responses leading system/developer messages become `instructions`. |
-| `tools` | `tools[]`, legacy `functions[]` | `tools[]` | `tools[]` | Only function-style normalized tools survive all protocols. Responses MCP namespace tools are flattened to qualified function-style names like `mcp__server__tool`; unsupported hosted/server tools and non-MCP namespaces are dropped while normalizing tools. |
+| `tools` | `tools[]`, legacy `functions[]` | `tools[]` | `tools[]` | Function-style tools survive all protocols; native web search maps between Responses and Anthropic (see Web Search). Responses MCP namespace tools are flattened to qualified function-style names like `mcp__server__tool`; other hosted/server tools and non-MCP namespaces are dropped while normalizing tools. |
 | `toolChoice` | `tool_choice`, legacy `function_call` | `tool_choice` | `tool_choice` | Unsupported named choices are filtered out if the named tool was dropped. |
 | `metadata` | `metadata` | `metadata` | `metadata.user_id` only | Anthropic denormalization keeps a string `user_id` and drops every other metadata key. |
 | `serviceTier` | `service_tier` | `service_tier` | `service_tier` | Mapped per target; see Service Tier Mapping. Values with no counterpart are omitted. |
@@ -46,10 +46,12 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | assistant text | `content` text | `message.content[].output_text` | assistant `text` block | Refusals are preserved as `refusal` where supported. |
 | assistant thinking | `thinking`, `reasoning`, `reasoning_content` vendor fields | Native Responses `reasoning` items are read; synthetic Chat/Anthropic thinking is not emitted in Responses create requests | Anthropic `thinking` block | Chat input/output reads and writes all three vendor thinking fields. |
 | redacted thinking | Not emitted to Chat | Ignored when denormalizing request messages | Anthropic `redacted_thinking` block | Preserved only when source/target can represent it. |
-| function tool call | `tool_calls[].function` | `function_call` | assistant `tool_use` | Anthropic `server_tool_use` also normalizes to this shape. |
+| function tool call | `tool_calls[].function` | `function_call` | assistant `tool_use` | Anthropic `server_tool_use` for tools other than web search also normalizes to this shape. |
+| web search | Text note in assistant content | `web_search_call` | `server_tool_use` + `web_search_tool_result` | A `web_search` part kept in order among the assistant parts. See Web Search. |
+| web citations | Not emitted | `output_text.annotations[]` `url_citation` | text `citations[]` `web_search_result_location` | Optional `citations` on text parts. Ranges replay to Responses; Anthropic citations are never replayed (text without them is accepted). |
 | Responses custom tool call | Wrapped into function-style schema/call | `custom_tool_call` when source was Responses custom | Anthropic `tool_use` | Custom input is wrapped/unwrapped to fit function arguments. |
 | tool result | Chat `tool` message | `function_call_output` | user `tool_result` block | Legacy Chat `function` role maps to/from tool result fallback. |
-| server tool result | Not distinct | Not distinct | `*_tool_result` blocks normalize to normal tool result | Result content is degraded to text or images. |
+| server tool result | Not distinct | Not distinct | `*_tool_result` blocks normalize to normal tool result | Result content is degraded to text or images. `web_search_tool_result` instead completes its `web_search` part. |
 
 ## Tool Mapping
 
@@ -61,10 +63,12 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | OpenAI Responses `type=function` | Preserved as function-style tool. `defer_loading` is ignored during normalization. | Emits provider-native function tool without `defer_loading`. |
 | OpenAI Responses `type=custom` | Converted to function-style tool with generated schema; tool name is marked as Responses custom. | Back to Responses `custom` only when target is Responses and name was marked; otherwise function-style. |
 | OpenAI Responses `type=namespace` tools | Only MCP namespaces are flattened to function-style tools named `mcp__server__tool`. Child function `defer_loading` flags are ignored during normalization. Other namespaces are dropped. | When target is Responses, qualified MCP tool names are grouped back under `type=namespace` tools. Namespace descriptions and lazy-loading metadata are not preserved. |
-| OpenAI Responses hosted/server tools | Dropped. | Not emitted. |
+| OpenAI Responses `web_search` / `web_search_2025_08_26` / `web_search_preview*` | `kind=web_search` with domains, user location, context size and `external_web_access`. | Anthropic `web_search_20250305`; Responses `web_search` (plus `include: ["web_search_call.action.sources"]`); dropped for Chat. See Web Search. |
+| Other OpenAI Responses hosted/server tools | Dropped. | Not emitted. |
 | Anthropic tool with `input_schema` and no non-function `type` | Preserved as normal function tool. | Emits ordinary Anthropic client tool. |
 | Anthropic function tool with `defer_loading=true` | Preserved as a normal function; `defer_loading` is lost. | Emits ordinary Anthropic tool without `defer_loading`. |
-| Anthropic server tools such as web search, web fetch, code execution, tool search | Dropped because they do not have `input_schema`. | Not emitted from normalized tools. |
+| Anthropic `web_search_*` tool named `web_search` | `kind=web_search` with domains, user location and `max_uses`. | See the Responses row above. |
+| Other Anthropic server tools such as web fetch, code execution, tool search | Dropped because they do not have `input_schema`. | Not emitted from normalized tools. |
 
 ## Special Handling Rules
 
@@ -76,7 +80,7 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | Anthropic tool result adjacency | Anthropic expects tool results to follow the assistant tool use that requested them. | When converting non-Anthropic sources to Anthropic, pending tool results are reordered immediately after the assistant tool call when matching IDs are found later. |
 | Anthropic legacy function result | Chat legacy `function` role may use a function name instead of tool call ID. | Pending IDs include both `toolCall.id` and `toolCall.name` when the ID ends with `:legacy`. The emitted `tool_result.tool_use_id` is `<name>:legacy` (sanitized) so it matches the `tool_use`. |
 | Anthropic tool ids | Anthropic requires `tool_use.id` / `tool_use_id` to match `^[a-zA-Z0-9_-]+$`. | Requests and responses converted to Anthropic replace any other character with `_` (e.g. `get_weather:legacy` becomes `get_weather_legacy`, `functions.read:0` becomes `functions_read_0`). |
-| Anthropic `server_tool_use` | It is a server-side tool call in Anthropic, but normalized as a normal function call. | It denormalizes to regular `tool_use`, not `server_tool_use`, so server-tool semantics are lost. |
+| Anthropic `server_tool_use` | It is a server-side tool call in Anthropic. Web search becomes a `web_search` part; other server tools are normalized as a normal function call. | Non-search server tools denormalize to regular `tool_use`, not `server_tool_use`, so server-tool semantics are lost. |
 | Anthropic `*_tool_result` | Server tool results have provider-specific block types. | Any block with type ending in `_tool_result` is accepted and normalized to a normal tool result. Known web/tool-search contents are degraded to text; a `web_fetch_result` keeps the page text for text documents and only the URL otherwise. |
 | Anthropic tool search result | `tool_search_tool_result` contains `tool_references`. | It normalizes to a normal tool result whose text is a newline-separated list of `tool_name` values. |
 | Anthropic adaptive thinking | New Anthropic thinking uses `thinking.type=adaptive` plus `output_config.effort`. | Normalization reads this first. Denormalization uses this form for every effort except `none`, which emits `thinking.type=disabled` with no effort; `minimal` is sent as `low` because Anthropic has no lower level. |
@@ -197,3 +201,20 @@ Anthropic content blocks that may still error outside `_tool_result` handling in
 | OpenAI Chat | Text/refusal, tool calls, and `thinking`/`reasoning`/`reasoning_content` are normalized. Other provider-specific fields are ignored. |
 | OpenAI Responses | `message`, `function_call`, `custom_tool_call`, and `reasoning` output items are normalized. MCP namespace tool calls are folded to qualified names during normalization, including streamed output items, and split back when denormalizing to Responses. Other output item types are currently ignored, not errored. |
 | Anthropic Messages | `text`, `thinking`, `redacted_thinking`, `tool_use`, and `server_tool_use` are normalized. Other response content blocks are currently ignored, not errored. |
+
+## Web Search
+
+Native web search converts between Responses and Anthropic in `src/converters/web-search.ts`. Background and live-test results: `docs/web-search-conversion-research.md`. Each side's search history holds state only its own upstream can verify, so a search is replayed exactly only to the protocol that ran it; elsewhere it degrades.
+
+| Topic | Behavior |
+| --- | --- |
+| Tool | Responses `web_search*` ↔ Anthropic `web_search_20250305` (basic search; 2026 versions default to dynamic filtering, whose code-execution blocks have no Responses counterpart). Domains and user location map; Anthropic rejects allowed + blocked together, so allowed wins. `max_uses` is dropped toward Responses (`max_tool_calls` also counts page actions). `external_web_access: false` drops the tool for Anthropic (no cache-only mode). Responses requests get `include: ["web_search_call.action.sources"]`. Chat drops the tool. |
+| Forced choice | A forced web search choice becomes `auto`: forcing makes GPT loop until `max_messages`, and Opus 5.5 / Sonnet 5.5 / Fable 5.1 reject forced choices. Chat gets no choice. |
+| Normalized part | `{ type: "web_search", id, origin, action, status, sources, errorCode?, native? }` inside assistant `parts`, so its order relative to reasoning and text is kept. `native` holds the original Anthropic blocks or Responses item. |
+| Anthropic history → Anthropic | Native blocks verbatim (result blocks stay where they were, including a result that arrives after a client tool call). |
+| Anthropic history → Responses | `function_call` named `web_search_history` + `function_call_output` listing title, URL, page age and the `cited_text` quotes from the turn's citations. Text before the search becomes its own message item. |
+| Responses history → Responses | The native `web_search_call` item. |
+| Responses history → Anthropic / Chat, Anthropic history → Chat | A text note in the assistant's voice: query, a retention line ("full page contents were retrieved and read…; only source metadata is kept…") and sources, with titles taken from citations. Claude disowns earlier answers when history shows a search without readable results; the note in its own voice avoids that. |
+| Synthesized ids | Searches nanollm shows across protocols carry recognizable ids: a Responses search shown to an Anthropic client is `srvtoolu_nanollm_<ws id>` (action in `input`, marker `encrypted_content`); an Anthropic search shown to a Responses client is `ws_nanollm_<srvtoolu id>`, with the original blocks in a reasoning item whose `encrypted_content` starts with `nanollm.websearch.v1:`. Converted requests restore them to their origin protocol. |
+| Same-format passthrough | `proxy` degrades synthesized searches the upstream would reject: Responses carrier items and `ws_nanollm_` calls become `web_search_history` function calls; Anthropic `srvtoolu_nanollm_` pairs become text notes and marker citations are removed. |
+

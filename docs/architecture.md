@@ -35,7 +35,7 @@ docs/                Reference docs
 | Module | Files | Responsibility |
 |---|---|---|
 | `core` | `config`, `config-manager`, `auth`, `request-context`, `session-id`, `shutdown`, `startup-error`, `error-details`, `http-log`, `response-compression`, `stream-errors`, `i18n` | YAML config parsing and hot reload, bearer / `x-api-key` auth and per-model access tokens, per-request context, session id derivation, graceful shutdown, error formatting, response compression, page language selection and switch, web UI request language for server messages (`localize`) |
-| `converters` | `shared`, `requests`, `responses`, `streams`, `index` (+ `test`, `testres`) | Normalized types and the three-way protocol conversion. See [converters.md](converters.md) |
+| `converters` | `shared`, `requests`, `responses`, `streams`, `web-search`, `index` (+ `test`, `testres`) | Normalized types and the three-way protocol conversion; `web-search` holds native web search conversion. See [converters.md](converters.md) |
 | `proxy` | `proxy`, `fallback`, `response-cache`, `model-test`, `upstream-models` | Upstream HTTP calls, fallback-group failure tracking and ordering, in-memory cache of Responses API output items (resolves `item_reference`), model test request builder, upstream model listing |
 | `subscriptions` | `openai-subscription`, `claude-subscription`, `claude-subscription-body`, `claude-billing`, `codex-version`, `subscription-client-compat`, `oauth-transport` | OAuth credential storage/refresh, client identity constants, Claude body transform, Rust helper transport |
 | `storage` | `sqlite`, `record`, `status`, `usage` | libsql client with write queue, request records, status buckets, usage by day |

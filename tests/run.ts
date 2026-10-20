@@ -80,6 +80,7 @@ import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeU
 import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch, waitForClientWrites } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
 import { runReasoningStreamTests } from "./reasoning-streams.js";
+import { runWebSearchTests } from "./web-search.js";
 
 function createTestSqliteClient(path: string): Client {
   return createClient({ url: `file:${path}`, intMode: "number", timeout: 5000 });
@@ -129,6 +130,7 @@ function runThrows(name: string, fn: () => void, expectedMessage: string) {
 }
 
 runReasoningStreamTests(run);
+runWebSearchTests(run);
 
 run("extractErrorCauses preserves useful nested transport details and redacts secrets", () => {
   const nested = Object.assign(new Error("HTTP/2 GOAWAY Bearer secret-token"), {
@@ -412,7 +414,7 @@ run("anthropic messages request keeps schema tools including explicit custom typ
   assert.deepEqual((chat as any).tool_choice, { type: "function", function: { name: "get_weather" } });
 });
 
-run("anthropic server tool history is downgraded to function-style chat history", () => {
+run("anthropic web search history becomes a chat text note, even with the result in a user message", () => {
   const result = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -450,14 +452,13 @@ run("anthropic server tool history is downgraded to function-style chat history"
     ],
   } as any);
 
+  // Chat has no web search tool: the search is a note at its position, and the user message that only
+  // held the result leaves no orphan tool message behind.
+  assert.equal(result.messages.length, 1);
   assert.equal(result.messages[0].role, "assistant");
-  assert.equal((result.messages[0].tool_calls?.[0] as any).type, "function");
-  assert.equal((result.messages[0].tool_calls?.[0] as any).function.name, "web_search");
-  assert.equal((result.messages[0].tool_calls?.[0] as any).function.arguments, "{\"query\":\"nanollm\"}");
-  assert.equal(result.messages[1].role, "tool");
-  assert.equal((result.messages[1] as any).tool_call_id, "srv_1");
-  assert.match(String((result.messages[1] as any).content), /nanollm/);
-  assert.match(String((result.messages[1] as any).content), /https:\/\/example\.com\/nanollm/);
+  assert.equal((result.messages[0] as any).tool_calls, null);
+  assert.match(String((result.messages[0] as any).content), /^\[web_search\] query: nanollm/);
+  assert.match(String((result.messages[0] as any).content), /- nanollm — https:\/\/example\.com\/nanollm/);
 });
 
 run("responses tool output becomes anthropic tool_result block", () => {

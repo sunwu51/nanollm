@@ -151,6 +151,11 @@ export function normalizeAnthropicResponse(response: AnthropicMessagesResponse):
       continue;
     }
 
+    // Native web search blocks have no response-side conversion yet: showing the search as a
+    // function call would make a client try to run a function it never declared.
+    if (block.type === "server_tool_use" && block.name === "web_search") continue;
+    if (block.type === "web_search_tool_result") continue;
+
     if (block.type === "tool_use" || block.type === "server_tool_use") {
       toolCalls.push({
         kind: "function",

@@ -604,6 +604,9 @@ export class ResponsesStreamParser implements StreamParser {
 
 export class AnthropicStreamParser implements StreamParser {
   private blockTypes = new Map<number, string>();
+  // Native web search blocks have no stream conversion yet; they are skipped rather than
+  // shown as a function call the client never declared.
+  private skippedBlocks = new Set<number>();
 
   parse(event: RawMessageStreamEvent): NormalizedStreamEvent[] {
     const out: NormalizedStreamEvent[] = [];
@@ -620,7 +623,9 @@ export class AnthropicStreamParser implements StreamParser {
         const idx = event.index;
         this.blockTypes.set(idx, block.type);
 
-        if (block.type === "text") {
+        if ((block.type === "server_tool_use" && block.name === "web_search") || block.type === "web_search_tool_result") {
+          this.skippedBlocks.add(idx);
+        } else if (block.type === "text") {
           out.push({ type: "content_start", index: idx, contentType: "text" });
         } else if (block.type === "thinking") {
           out.push({ type: "content_start", index: idx, contentType: "thinking" });
@@ -638,6 +643,7 @@ export class AnthropicStreamParser implements StreamParser {
         const idx = event.index;
         const delta = event.delta;
 
+        if (this.skippedBlocks.has(idx)) break;
         if (delta.type === "text_delta") {
           out.push({ type: "content_delta", index: idx, delta: delta.text });
         } else if (delta.type === "thinking_delta") {
@@ -653,7 +659,9 @@ export class AnthropicStreamParser implements StreamParser {
       case "content_block_stop": {
         const idx = event.index;
         const blockType = this.blockTypes.get(idx);
-        if (blockType === "tool_use" || blockType === "server_tool_use") {
+        if (this.skippedBlocks.has(idx)) {
+          // fall through to the end of the switch without emitting anything
+        } else if (blockType === "tool_use" || blockType === "server_tool_use") {
           out.push({ type: "tool_done", index: idx });
         } else {
           out.push({ type: "content_done", index: idx });

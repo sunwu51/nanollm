@@ -3,6 +3,7 @@ import { SSEParser, type StreamFormat } from "../converters/streams.js";
 import type { NormalizedRequest, NormalizedResponse, NormalizedUsage } from "../converters/shared.js";
 import { decodeReasoningCarrier, isReasoningCarrier } from "../converters/shared.js";
 import { applyReasoningHistoryRules, shouldDropUnsignedThinking } from "./reasoning-history.js";
+import { degradeSynthesizedAnthropicWebSearch, degradeSynthesizedResponsesWebSearch } from "../converters/web-search.js";
 import {
   denormalizeToOpenAIChatRequest,
   denormalizeToOpenAIResponsesRequest,
@@ -378,11 +379,27 @@ function restoreNanollmReasoningCarriers(config: ModelConfig, body: unknown): un
   return changed ? { ...body, input } : body;
 }
 
+/**
+ * Searches nanollm synthesized while an earlier turn ran on the other protocol carry placeholders
+ * this upstream would reject (fake encrypted_content, ws_nanollm_ ids); same-format requests
+ * skip conversion, so they degrade here.
+ */
+function degradeSynthesizedWebSearchHistory(config: ModelConfig, body: unknown): unknown {
+  if (!isPlainObject(body)) return body;
+  if (config.provider === "openai-responses" && Array.isArray(body.input)) {
+    const input = degradeSynthesizedResponsesWebSearch(body.input);
+    return input ? { ...body, input } : body;
+  }
+  if (config.provider === "anthropic" && Array.isArray(body.messages)) {
+    const messages = degradeSynthesizedAnthropicWebSearch(body.messages);
+    return messages ? { ...body, messages } : body;
+  }
+  return body;
+}
+
 function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unknown>, stream: boolean): unknown {
-  return stripOpenAIResponsesUnstoredItemIds(
-    config,
-    applyReasoningHistoryRules(config, restoreNanollmReasoningCarriers(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream }))),
-  );
+  const body = degradeSynthesizedWebSearchHistory(config, applyModelBodyTransforms(config, { ...rawBody, model: config.model, stream }));
+  return stripOpenAIResponsesUnstoredItemIds(config, applyReasoningHistoryRules(config, restoreNanollmReasoningCarriers(config, body)));
 }
 
 function isJsonContentType(headers: Headers): boolean {
