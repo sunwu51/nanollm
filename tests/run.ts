@@ -2373,6 +2373,124 @@ run("anthropic request tools omit strict field", () => {
   assert.equal(((anthropic.tools?.[0] as any).input_schema ?? {}).additionalProperties, false);
 });
 
+run("anthropic tool input_schema flattens top-level oneOf with $refs", () => {
+  // Mirrors a Codex MCP discriminated-union tool: top-level oneOf over local $defs branches.
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "run" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "automation_update",
+          parameters: {
+            type: "object",
+            properties: {},
+            oneOf: [
+              { $ref: "#/$defs/__view" },
+              { $ref: "#/$defs/__create" },
+            ],
+            $defs: {
+              __view: { type: "object", properties: { mode: { const: "view" }, id: { type: "string" } }, required: ["id", "mode"] },
+              __create: { type: "object", properties: { mode: { const: "create" }, id: { type: "string" }, name: { type: "string" }, prompt: { type: "string" } }, required: ["mode", "name", "prompt"] },
+            },
+          },
+        },
+      },
+    ],
+  } as any);
+
+  const schema = (anthropic.tools?.[0] as any).input_schema;
+  // Top-level combinator is gone, branches' properties merged.
+  assert.equal(schema.oneOf, undefined);
+  assert.equal(schema.type, "object");
+  assert.deepEqual(Object.keys(schema.properties).sort(), ["id", "mode", "name", "prompt"]);
+  // required = intersection of branch required lists.
+  assert.deepEqual(schema.required, ["mode"]);
+  // $defs survive for nested use.
+  assert.ok(schema.$defs);
+});
+
+run("anthropic tool input_schema flattens top-level allOf with required union", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "run" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "combo",
+          parameters: {
+            allOf: [
+              { type: "object", properties: { a: { type: "string" } }, required: ["a"] },
+              { type: "object", properties: { b: { type: "number" } }, required: ["b"] },
+            ],
+          },
+        },
+      },
+    ],
+  } as any);
+
+  const schema = (anthropic.tools?.[0] as any).input_schema;
+  assert.equal(schema.allOf, undefined);
+  assert.deepEqual(Object.keys(schema.properties).sort(), ["a", "b"]);
+  assert.deepEqual(schema.required, ["a", "b"]);
+});
+
+run("anthropic tool input_schema keeps nested oneOf and strips meta keywords", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "run" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "nested",
+          parameters: {
+            $schema: "http://json-schema.org/draft-07/schema#",
+            $id: "https://example.com/nested.json",
+            type: "object",
+            properties: {
+              value: { oneOf: [{ type: "string" }, { type: "number" }] },
+            },
+          },
+        },
+      },
+    ],
+  } as any);
+
+  const schema = (anthropic.tools?.[0] as any).input_schema;
+  // Meta keywords stripped at any depth; nested oneOf is left for Anthropic (only the top level is hard-rejected).
+  assert.equal(schema.$schema, undefined);
+  assert.equal(schema.$id, undefined);
+  assert.deepEqual(schema.properties.value, { oneOf: [{ type: "string" }, { type: "number" }] });
+});
+
+run("anthropic tool input_schema leaves cyclic or unresolvable refs untouched", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "run" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "cyclic",
+          parameters: {
+            type: "object",
+            properties: {},
+            oneOf: [{ $ref: "#/$defs/a" }],
+            $defs: { a: { oneOf: [{ $ref: "#/$defs/a" }] } },
+          },
+        },
+      },
+    ],
+  } as any);
+
+  const schema = (anthropic.tools?.[0] as any).input_schema;
+  // Cannot safely flatten: the original combinator stays so the caller sees the real schema.
+  assert.ok(Array.isArray(schema.oneOf));
+});
+
 run("anthropic disable_parallel_tool_use becomes responses parallel_tool_calls false", () => {
   const responses = anthropicMessageRequestToResponsesRequest({
     model: "claude-sonnet-4-5",

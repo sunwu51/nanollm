@@ -1148,9 +1148,112 @@ function denormalizeAnthropicToolResultParts(allParts: NormalizedMessage["parts"
   });
 }
 
+// Anthropic rejects oneOf/allOf/anyOf at the top level of a tool input_schema (and $schema/$id anywhere).
+// OpenAI accepts them, so Codex-issued tools (e.g. discriminated-union MCP schemas) must be rewritten here.
+// Mirrors LiteLLM's flatten_top_level_schema_combinators: branches merge into one object schema.
+const ANTHROPIC_TOP_LEVEL_COMBINATORS = ["allOf", "anyOf", "oneOf"] as const;
+const ANTHROPIC_META_KEYWORDS = new Set(["$schema", "$id", "$comment", "$vocabulary"]);
+const ANTHROPIC_MAX_FLATTEN_DEPTH = 32;
+
+type JsonSchemaObject = Record<string, any>;
+
+function schemaProperties(schema: JsonSchemaObject): JsonSchemaObject {
+  const properties = schema.properties;
+  return properties && typeof properties === "object" && !Array.isArray(properties) ? properties : {};
+}
+
+function schemaRequiredNames(schema: JsonSchemaObject): Set<string> {
+  const required = schema.required;
+  return Array.isArray(required) ? new Set(required.filter((name): name is string => typeof name === "string")) : new Set();
+}
+
+function isObjectSchema(schema: JsonSchemaObject): boolean {
+  return schema.type === "object" || (schema.type === undefined && typeof schema.properties === "object" && schema.properties !== null);
+}
+
+function resolveLocalSchemaRef(root: JsonSchemaObject, ref: string): JsonSchemaObject | undefined {
+  for (const [prefix, container] of [["#/$defs/", "$defs"], ["#/definitions/", "definitions"]] as const) {
+    if (!ref.startsWith(prefix)) continue;
+    const definitions = root[container];
+    if (!definitions || typeof definitions !== "object" || Array.isArray(definitions)) return undefined;
+    const target = definitions[ref.slice(prefix.length)];
+    return target && typeof target === "object" && !Array.isArray(target) ? target : undefined;
+  }
+  return undefined;
+}
+
+function mergeableAnthropicSchemaBranch(root: JsonSchemaObject, branch: unknown, seenRefs: ReadonlySet<string>, depth: number, expandedRefs: Map<string, JsonSchemaObject | undefined>): JsonSchemaObject | undefined {
+  if (!branch || typeof branch !== "object" || Array.isArray(branch) || depth > ANTHROPIC_MAX_FLATTEN_DEPTH) return undefined;
+  const ref = (branch as JsonSchemaObject).$ref;
+  if (typeof ref !== "string") {
+    const flattened = flattenAnthropicSchemaAgainstRoot(branch as JsonSchemaObject, root, seenRefs, depth, expandedRefs);
+    return ANTHROPIC_TOP_LEVEL_COMBINATORS.some((combinator) => combinator in flattened) ? undefined : flattened;
+  }
+  if (expandedRefs.has(ref)) return expandedRefs.get(ref);
+  if (seenRefs.has(ref)) return undefined;
+  const target = resolveLocalSchemaRef(root, ref);
+  const expanded = target === undefined ? undefined : mergeableAnthropicSchemaBranch(root, target, new Set([...seenRefs, ref]), depth + 1, expandedRefs);
+  expandedRefs.set(ref, expanded);
+  return expanded;
+}
+
+function flattenAnthropicSchemaAgainstRoot(schema: JsonSchemaObject, root: JsonSchemaObject, seenRefs: ReadonlySet<string>, depth: number, expandedRefs: Map<string, JsonSchemaObject | undefined>): JsonSchemaObject {
+  const branchGroups = ANTHROPIC_TOP_LEVEL_COMBINATORS
+    .filter((combinator) => Array.isArray(schema[combinator]))
+    .map((combinator) => [combinator, (schema[combinator] as unknown[]).map((branch) => mergeableAnthropicSchemaBranch(root, branch, seenRefs, depth + 1, expandedRefs))] as const);
+  if (branchGroups.length === 0) return schema;
+  if (branchGroups.some(([, group]) => group.some((branch) => branch === undefined))) return schema;
+
+  const branches = branchGroups.flatMap(([, group]) => group as JsonSchemaObject[]);
+  const objectSchema = isObjectSchema(schema) || (schema.type === undefined && branches.length > 0 && branches.every(isObjectSchema));
+  if (!objectSchema) return schema;
+
+  // Later sources win: reversed branches, then the top-level schema. Mirrors LiteLLM's simple overwrite merge.
+  const mergedProperties: JsonSchemaObject = {};
+  for (const source of [...branches].reverse().concat(schema)) Object.assign(mergedProperties, schemaProperties(source));
+
+  const requiredNames = new Set(schemaRequiredNames(schema));
+  for (const [combinator, group] of branchGroups) {
+    const branchRequired = (group as JsonSchemaObject[]).map(schemaRequiredNames);
+    if (branchRequired.length === 0) continue;
+    const merged = combinator === "allOf"
+      ? branchRequired.reduce((acc, names) => new Set([...acc, ...names]))
+      : branchRequired.reduce((acc, names) => new Set([...acc].filter((name) => names.has(name))));
+    for (const name of merged) requiredNames.add(name);
+  }
+
+  const kept = Object.fromEntries(Object.entries(schema).filter(([key]) => !(ANTHROPIC_TOP_LEVEL_COMBINATORS as readonly string[]).includes(key)));
+  return {
+    ...kept,
+    type: "object",
+    properties: mergedProperties,
+    ...(requiredNames.size > 0 ? { required: [...requiredNames].sort() } : {}),
+  };
+}
+
+function stripAnthropicSchemaMetaKeywords(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripAnthropicSchemaMetaKeywords);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as JsonSchemaObject)
+      .filter(([key]) => !ANTHROPIC_META_KEYWORDS.has(key))
+      .map(([key, entry]) => [key, stripAnthropicSchemaMetaKeywords(entry)]),
+  );
+}
+
+function sanitizeAnthropicInputSchema(inputSchema: Record<string, unknown>): Record<string, unknown> {
+  const normalized = (stripAnthropicSchemaMetaKeywords(inputSchema) ?? {}) as JsonSchemaObject;
+  const flattened = flattenAnthropicSchemaAgainstRoot(normalized, normalized, new Set(), 0, new Map());
+  return {
+    type: "object",
+    ...flattened,
+    properties: typeof flattened.properties === "object" && flattened.properties !== null ? flattened.properties : {},
+  };
+}
+
 function denormalizeAnthropicTool(tool: NormalizedTool): ToolUnion {
   if (tool.kind !== "function") fail("Anthropic request conversion only supports function-style tools");
-  return { name: tool.name, description: tool.description ?? undefined, input_schema: tool.inputSchema as any };
+  return { name: tool.name, description: tool.description ?? undefined, input_schema: sanitizeAnthropicInputSchema(tool.inputSchema) as any };
 }
 
 function denormalizeAnthropicToolChoice(choice: NormalizedToolChoice | undefined, parallelToolCalls: boolean | undefined, hasTools: boolean): MessageCreateParamsBase["tool_choice"] {
