@@ -839,6 +839,10 @@ const STYLE = /* css */ String.raw`
         display: flex;
         gap: 8px;
         align-items: center;
+        flex-wrap: wrap;
+      }
+      .card-actions button {
+        white-space: nowrap;
       }
       .card-title {
         display: flex;
@@ -1007,6 +1011,43 @@ const STYLE = /* css */ String.raw`
         .field.span-2,
         .field.span-3 {
           grid-column: span 1;
+        }
+      }
+      @media (max-width: 640px) {
+        .page {
+          padding: 12px;
+        }
+        .panel {
+          padding: 14px;
+          border-radius: 18px;
+        }
+        .card {
+          padding: 12px;
+        }
+        .card-toggle {
+          min-width: 0;
+          flex-basis: 100%;
+        }
+        .card-actions {
+          flex-basis: 100%;
+        }
+        .card-actions button {
+          padding: 8px 12px;
+          font-size: 13px;
+        }
+        .card-actions .meta {
+          flex-basis: 100%;
+          margin: 0;
+        }
+        .group-body {
+          padding-left: 8px;
+        }
+        .member-row {
+          grid-template-columns: auto minmax(0, 1fr);
+        }
+        .member-actions {
+          grid-column: 1 / -1;
+          justify-content: flex-start;
         }
       }
 `;
