@@ -25,6 +25,7 @@ import {
 } from "../src/converters/index.js";
 import { decodeReasoningCarrier, encodeReasoningCarrier, encodeRedactedReasoningCarrier, UnsupportedContentError } from "../src/converters/shared.js";
 import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, denormalizeToOpenAIResponsesRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { CLAUDE_CODE_SYSTEM_IDENTITY, relocateNonClaudeSystemPrompt } from "../src/subscriptions/claude-system-prompt.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, canAccessModel, extractBearerToken, extractRequestToken, getAccessibleModelNames, isAuthorizedToken, isScopedToken, readAuthCookie } from "../src/core/auth.js";
 import { getRequestAuthToken, webAuth } from "../src/core/web-auth.js";
@@ -5136,6 +5137,38 @@ run("claude subscription fills missing defaults and removes tool_choice without 
   for (const tools of [[], null]) {
     const result = sanitizeClaudeSubscriptionBody({ ...explicit, tools }) as Record<string, unknown>;
     assert.equal("tool_choice" in result, false);
+  }
+});
+
+run("claude subscription relocates a non-Claude system prompt into a system-reminder user block", () => {
+  const billing = { type: "text", text: "x-anthropic-billing-header: cc_version=1.2.3.abc; cc_entrypoint=cli;" };
+  const identity = { type: "text", text: CLAUDE_CODE_SYSTEM_IDENTITY };
+  const cache = { type: "ephemeral" };
+  const original = { model: "m", system: [billing, { type: "text", text: "You are pi." }, { type: "text", text: "Docs: pi.md", cache_control: cache }], messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }] };
+  const snapshot = structuredClone(original);
+  const result = relocateNonClaudeSystemPrompt(original) as any;
+  assert.deepEqual(original, snapshot);
+  assert.deepEqual(result.system, [billing, identity]);
+  assert.deepEqual(result.messages[0].content, [{ type: "text", text: "<system-reminder>\nYou are pi.\n\nDocs: pi.md\n</system-reminder>", cache_control: cache }, { type: "text", text: "hi" }]);
+  assert.equal(result.messages.length, 2);
+
+  const stringSystem = relocateNonClaudeSystemPrompt({ system: "Be brief.", messages: [{ role: "user", content: [{ type: "text", text: "a" }] }] }) as any;
+  assert.deepEqual(stringSystem.system, [identity]);
+  assert.equal(stringSystem.messages[0].content[0].text, "<system-reminder>\nBe brief.\n</system-reminder>");
+
+  const noUser = relocateNonClaudeSystemPrompt({ system: "Be brief.", messages: [] }) as any;
+  assert.deepEqual(noUser.messages, [{ role: "user", content: [{ type: "text", text: "<system-reminder>\nBe brief.\n</system-reminder>" }] }]);
+});
+
+run("claude subscription leaves Claude system prompts and prompt-less requests untouched", () => {
+  const messages = [{ role: "user", content: "hi" }];
+  for (const system of [
+    [{ type: "text", text: "x-anthropic-billing-header: cc_version=1;" }, { type: "text", text: `${CLAUDE_CODE_SYSTEM_IDENTITY} Extra.` }],
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    undefined, "", [{ type: "text", text: "x-anthropic-billing-header: cc_version=1;" }],
+  ]) {
+    const body = { system, messages };
+    assert.equal(relocateNonClaudeSystemPrompt(body), body);
   }
 });
 

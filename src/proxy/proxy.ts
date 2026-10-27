@@ -33,6 +33,7 @@ import { getCachedSubscriptionCredential, ensureSubscriptionCredential, SUBSCRIP
 import { CODEX_RELEASES_URL, getCurrentCodexVersion } from "../subscriptions/codex-version.js";
 import { CLAUDE_CODE_DEFAULT_HEADERS, CLAUDE_CODE_PLATFORM_HEADERS, CODEX_CLI_ORIGINATOR, CODEX_CLI_VERSION, buildCodexCliUserAgent } from "../subscriptions/subscription-client-compat.js";
 import { addClaudeBillingBlock } from "../subscriptions/claude-billing.js";
+import { relocateNonClaudeSystemPrompt } from "../subscriptions/claude-system-prompt.js";
 import { applyClaudeSubscriptionSessionIdentity, hasClaudeMetadataUserId, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../subscriptions/claude-subscription-body.js";
 import {
   CLAUDE_CODE_BETA,
@@ -662,7 +663,7 @@ async function upstreamFetch(
     });
   }
   const upstreamBody = config.claude_subscription_provider
-    ? sanitizeClaudeSubscriptionBody(addClaudeBillingBlock(requestBody, getHeader(headers, "user-agent")))
+    ? sanitizeClaudeSubscriptionBody(relocateNonClaudeSystemPrompt(addClaudeBillingBlock(requestBody, getHeader(headers, "user-agent"))))
     : requestBody;
   return upstreamFetchToUrl(
     config,
