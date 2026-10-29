@@ -1,6 +1,6 @@
 {
   "name": "nanollm",
-  "version": "0.0.38",
+  "version": "0.0.39",
   "description": "Hono server that proxies llm request",
   "main": "./dist/server.js",
   "bin": {
