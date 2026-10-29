@@ -43,7 +43,7 @@ nanollm is a `litellm`-like proxy for LLM APIs. It stays small and runs locally,
 - **Request rewriting**: modify request `headers` and `body` (the body is deep-merged), or use `body_expression` / `response_expression` for dynamic rewriting.
 - **Fallback groups**: if the model you call fails upstream and belongs to a fallback group, the other members of the group are tried.
 - **Subscription providers**: use an OpenAI Codex subscription or a Claude Pro/Max subscription as a provider after logging in from the admin page.
-- **Hot reload and admin page**: `/admin` is a form-based config editor with model connectivity tests and upstream model listing. `models`, `fallback`, `server.ttfb_timeout` and `record.max_size` apply immediately after saving; `server.port` and `server.auth.token` are written back and need a restart.
+- **Hot reload and admin page**: `/admin` is a form-based config editor with model connectivity tests and upstream model listing. `models`, `fallback`, `server.ttfb_timeout`, `record.max_size` and `record.skip_when` apply immediately after saving; `server.port` and `server.auth.token` are written back and need a restart.
 - **Monitoring and usage**: `/status` shows model health and daily token usage; `/record` keeps recent requests and can replay them, which is very useful for debugging.
 - **Scheduled model jobs**: `/jobs` calls several models on a cron schedule, stores the outputs, and supports history comparison and manual review.
 - **Optional persistence**: in-memory by default; `--storage sqlite` uses a local SQLite file or a remote libSQL/quicSQL service.
@@ -98,6 +98,7 @@ server:
 
 record:
   max_size: 100 # optional, default 10
+  skip_when: "model === 'cheap-model'" # optional, matching requests are not recorded
 
 providers:
   # Shared provider: keeps protocol, URL and API key in one place.
@@ -531,7 +532,7 @@ A local configuration page at `http://localhost:3000/admin`.
 - Shortcuts lead to `/status` and `/record` so you can check model health and recent requests after saving.
 - "Discard unsaved changes" drops your edits; "Refresh from server" reloads the file if it was changed externally.
 - Saving converts the form into YAML, validates it and writes the config file atomically.
-- `models`, `fallback`, `server.ttfb_timeout` and `record.max_size` hot-reload for new requests; `server.port` and `server.auth.token` are written back but need a restart.
+- `models`, `fallback`, `server.ttfb_timeout`, `record.max_size` and `record.skip_when` hot-reload for new requests; `server.port` and `server.auth.token` are written back but need a restart.
 - Advanced fields on existing models that are not shown in the form are preserved on save.
 - If you edit `config.yaml` by hand, nanollm detects and loads the change. Invalid content is rejected: the last valid config stays active and the error is shown in the admin page.
 
@@ -548,6 +549,22 @@ By default this data lives in memory and disappears when the process exits. With
 `http://localhost:3000/record` lists sampled requests and is very useful for debugging. By default only the latest 10 requests are kept; change it with `record.max_size`. A recorded request can be replayed (sensitive client headers are not replayed, and provider authentication uses the current config).
 
 Images in requests (`data:image/...;base64,...`) are stored once per content hash. The record page shows image references and sizes, and replay restores the original images, so a multi-turn tool conversation that keeps carrying the same image stores it only once. Copy a `__nanollm_record_image_ref` value and open `GET /record/images/{hash}` to view the original; that endpoint uses the same authentication as `/record`. With `--storage sqlite` the latest `record.max_size` records are persisted.
+
+`record.skip_when` is an optional JS expression evaluated once per client request, before routing. When it returns a truthy value, the request is not recorded at all, so it takes no slot of `record.max_size` and writes nothing to the record table (useful with a remote SQLite such as Turso). `/status` and usage stats still count it. The expression receives:
+
+- `body`: the client request body (read-only)
+- `model`: the requested model or fallback group name (`body.model`)
+- `headers`: the client request headers, including the real `authorization` / `x-api-key` values. Names are case-insensitive: `headers['authorization']` and `headers.Authorization` both match whatever casing the client sent
+- `path`: the request path, e.g. `/v1/messages`
+
+```yaml
+record:
+  skip_when: |
+    model === 'cheap-model' || model === 'batch-group'
+      || headers['authorization']?.endsWith('-nolog')
+```
+
+The expression runs with a 100 ms timeout. If it throws, times out or returns a Promise, the request is recorded and the error is logged. A syntax error is rejected when the config is loaded. On `/admin` the field is in the collapsed Advanced section at the bottom.
 
 ### Scheduled model jobs: `/jobs`
 

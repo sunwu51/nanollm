@@ -43,7 +43,7 @@
 - **请求改写**：可配置修改请求的 `headers` 和 `body`（`body` 支持深度合并），还支持 `body_expression` / `response_expression` 动态表达式。
 - **兜底分组**：设置兜底分组后，调用的模型下游失败时会自动尝试分组内的其他模型。
 - **订阅供应商**：支持 OpenAI Codex 订阅和 Claude Pro/Max 订阅，在管理页登录即可作为模型供应商使用。
-- **热更新与管理页**：`/admin` 提供表单式配置管理（含模型连通性测试、拉取上游模型列表）；`models`、`fallback`、`server.ttfb_timeout`、`record.max_size` 保存后立即生效，`server.port` 和 `server.auth.token` 写回后需重启进程。
+- **热更新与管理页**：`/admin` 提供表单式配置管理（含模型连通性测试、拉取上游模型列表）；`models`、`fallback`、`server.ttfb_timeout`、`record.max_size`、`record.skip_when` 保存后立即生效，`server.port` 和 `server.auth.token` 写回后需重启进程。
 - **监控与用量**：`/status` 展示模型健康状态与按日 token 用量；`/record` 保存最近请求并支持回放，对 debug 很有用。
 - **定时模型任务**：`/jobs` 按 cron 定时调用多个模型，保存作品并支持历史对比与人工审核。
 - **持久化可选**：默认内存存储；`--storage sqlite` 可使用本地 SQLite 文件或远程 libSQL/quicSQL 服务。
@@ -98,6 +98,7 @@ server:
 
 record:
   max_size: 100 # optional, default 10
+  skip_when: "model === 'cheap-model'" # optional，命中的请求不写入采样记录
 
 providers:
   # 普通共享供应商：集中保存协议、地址和 API Key
@@ -549,7 +550,7 @@ fallback:
 - 页面内提供跳转到 `/status`、`/record` 的快捷入口，方便保存后继续查看当前模型状态和最近请求记录。
 - 如果只是想放弃当前改动，可以点击“撤销未保存修改”；如果配置文件已被外部改动，可以点击“从服务端刷新”重新加载最新内容。
 - 点击保存后会先把表单数据转换成 YAML、校验配置，再原子写回配置文件。
-- `models`、`fallback`、`server.ttfb_timeout`、`record.max_size` 会立即热更新到新请求；`server.port` 和 `server.auth.token` 会写回文件，但需要重启进程后才会真正生效。
+- `models`、`fallback`、`server.ttfb_timeout`、`record.max_size`、`record.skip_when` 会立即热更新到新请求；`server.port` 和 `server.auth.token` 会写回文件，但需要重启进程后才会真正生效。
 - 已有模型上未在表单中展开的高级字段会在保存时自动保留。
 - 如果你在外部手动修改 `config.yaml`，服务也会自动检测并加载新配置；若新内容非法，则继续保留上一份有效配置并在管理页显示错误。
 
@@ -566,6 +567,22 @@ fallback:
 `http://localhost:3000/record` 是采样记录页面，可以查看请求记录，对 debug 非常有用（默认只保留最新 10 次请求，可通过 `record.max_size` 配置修改）。记录页支持回放某次请求（客户端的敏感请求头不会被回放，供应商鉴权使用当前配置）。
 
 请求中的 `data:image/...;base64,...` 图片会按内容哈希去重保存；记录页显示图片引用和大小，点击回放时服务会自动还原原始图片。这样多轮工具调用重复携带同一图片时，只保留一份图片数据。可复制记录中的 `__nanollm_record_image_ref` 值，并通过 `GET /record/images/{hash}` 查看原图；该接口使用与 `/record` 相同的鉴权。使用 `--storage sqlite` 时会持久化最近 `record.max_size` 条请求记录。
+
+`record.skip_when` 是可选的 JS 表达式，每个客户端请求在路由前执行一次。返回真值时，该请求完全不写入采样记录，不占用 `record.max_size` 的名额，也不产生记录表写入（适合 Turso 等远程 SQLite）；`/status` 和用量统计仍会照常计入。表达式可用的变量：
+
+- `body`：客户端请求体（只读）
+- `model`：请求的模型或 fallback 分组名（即 `body.model`）
+- `headers`：客户端请求头，包含真实的 `authorization` / `x-api-key` 值。名称不区分大小写：无论客户端传的是什么大小写，`headers['authorization']` 和 `headers.Authorization` 都能取到
+- `path`：请求路径，例如 `/v1/messages`
+
+```yaml
+record:
+  skip_when: |
+    model === 'cheap-model' || model === 'batch-group'
+      || headers['authorization']?.endsWith('-nolog')
+```
+
+表达式超时时间为 100 ms；抛错、超时或返回 Promise 时，该请求照常记录并输出错误日志。语法错误会在加载配置时直接报错。`/admin` 页面最底部的 Advanced 区域（默认折叠）可以编辑此字段。
 
 ### 定时模型任务 `/jobs`
 在 `/admin` 点击 **/jobs**，或打开 `/jobs`，新建任务、选择具体模型、填写一条用户消息及五段 cron。调度时区需要明确指定；页面可预览未来 5 次运行时间。Pelican 和简单回复是可编辑的快捷模板，不是固定的任务类型。

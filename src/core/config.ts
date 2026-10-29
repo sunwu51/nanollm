@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { parse as parseYAML } from "yaml";
 import type { StreamFormat } from "../converters/streams.js";
+import { compileRecordRule } from "./record-rule.js";
 
 export const DEFAULT_RECORD_MAX_SIZE = 10;
 export const DEFAULT_TTFB_TIMEOUT = 5000;
@@ -63,6 +64,8 @@ export interface ServerConfig {
   fallback_auth_tokens?: Record<string, string>;
   record: {
     max_size: number;
+    /** JS expression over the client request; when truthy the request is not recorded. */
+    skip_when?: string;
   };
 }
 
@@ -70,7 +73,7 @@ export type FallbackGroupDocument = string[] | { models?: string[]; auth_token?:
 
 export interface ParsedConfigDocument {
   server?: { port?: number; ttfb_timeout?: number; auth?: { token?: string } };
-  record?: { max_size?: number };
+  record?: { max_size?: number; skip_when?: string };
   models?: Array<Partial<ModelConfig> & Pick<ModelConfig, "name" | "model">>;
   providers?: CustomProviderConfig[];
   fallback?: Record<string, FallbackGroupDocument>;
@@ -166,6 +169,17 @@ function normalizeExpressionAlias(model: ModelConfig, snakeKey: "body_expression
   return value === undefined || value === null || value === "" ? undefined : String(value);
 }
 
+function normalizeRecordRule(value: unknown): string | undefined {
+  const expression = normalizeOptionalString(value);
+  if (!expression) return undefined;
+  try {
+    compileRecordRule(expression);
+  } catch (error) {
+    throw new Error(`'record.skip_when' is not a valid expression: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return expression;
+}
+
 function normalizeProxyUrl(value: unknown, fieldName: string): string | undefined {
   if (value === undefined || value === null || value === "") return undefined;
 
@@ -253,6 +267,7 @@ export function parseSourceConfigDocument(rawText: string): ParsedConfigDocument
 export function materializeConfig(document: ParsedConfigDocument, options?: MaterializeConfigOptions): ServerConfig {
   const defaultTTFBTimeout = options?.ttfb_timeout ?? normalizeTimeout(document.server?.ttfb_timeout, "server.ttfb_timeout") ?? DEFAULT_TTFB_TIMEOUT;
   const recordMaxSize = options?.recordMaxSize ?? (normalizePositiveInteger(document.record?.max_size, "record.max_size") ?? DEFAULT_RECORD_MAX_SIZE);
+  const recordSkipWhen = normalizeRecordRule(document.record?.skip_when);
   const authToken = normalizeOptionalString(options?.authToken ?? document.server?.auth?.token);
   const providers = (document.providers ?? []).map((provider) => {
     const name = String(provider.name || "").trim();
@@ -329,6 +344,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
     ...(Object.keys(fallbackAuthTokens).length > 0 ? { fallback_auth_tokens: fallbackAuthTokens } : {}),
     record: {
       max_size: recordMaxSize,
+      ...(recordSkipWhen ? { skip_when: recordSkipWhen } : {}),
     },
   };
 }

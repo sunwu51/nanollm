@@ -17,6 +17,7 @@ import { localize, resolveLang, runWithLang } from "./src/core/i18n.js";
 import { withWebUIAuth } from "./src/pages/login-page.js";
 import { getModelAuthToken, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
 import { ConfigManager } from "./src/core/config-manager.js";
+import { shouldSkipRecord } from "./src/core/record-rule.js";
 import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy/proxy.js";
 import { forwardRequest, forwardStreamRequest, passthroughAlphaSearchRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, type OpenAIImageOperation } from "./src/proxy/proxy.js";
 import { FallbackFailureTracker, sortFallbackGroupMembers } from "./src/proxy/fallback.js";
@@ -347,6 +348,13 @@ function orange(message: string): string {
 /** Token for in-process calls (jobs, replay, model test): the admin token, else the target's own token. */
 function internalAuthToken(config: ServerConfig, modelName: string | undefined): string | undefined {
   return config.auth?.token ?? (modelName ? getModelAuthToken(config, modelName) : undefined);
+}
+
+/** Starts the record for a client request, unless it matches `record.skip_when`; status and usage are counted either way. */
+function beginClientRecord(c: Context, config: ServerConfig, requestId: string, body: unknown, stream: boolean) {
+  const headers = c.req.raw.headers;
+  if (shouldSkipRecord(config.record.skip_when, { path: c.req.path, headers, body })) return;
+  beginRecordedRequest({ requestId, path: c.req.path, headers, body, stream });
 }
 
 /** Rejects a request whose token can't reach the named model or group; records the rejection if one is being recorded. */
@@ -718,15 +726,7 @@ function createRoute(incomingFormat: StreamFormat) {
     const modelName = extractModel(rawBody);
     const stream = isStreamRequest(rawBody);
     const requestId = getRequestId();
-    if (requestId) {
-      beginRecordedRequest({
-        requestId,
-        path: c.req.path,
-        headers: c.req.raw.headers,
-        body: rawBody,
-        stream,
-      });
-    }
+    if (requestId) beginClientRecord(c, config, requestId, rawBody, stream);
 
     if (!modelName) {
       const response = c.json({ error: "Missing 'model' in request body" }, 400);
@@ -884,7 +884,7 @@ function createAlphaSearchRoute() {
     if (candidateModels.length === 0) return c.json({ error: `Model '${modelName}' not found in config`, available: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)) }, 404);
     const requestId = getRequestId();
     const stream = isStreamRequest(rawBody);
-    if (requestId) beginRecordedRequest({ requestId, path: c.req.path, headers: c.req.raw.headers, body: rawBody, stream });
+    if (requestId) beginClientRecord(c, config, requestId, rawBody, stream);
     let lastError;
     for (const [candidateIndex, modelConfig] of candidateModels.entries()) {
       const started = Date.now();
@@ -926,15 +926,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
     const { bytes, recordedBody } = await readImageRequestBody(c);
     const modelName = extractModel(recordedBody);
     const requestId = getRequestId();
-    if (requestId) {
-      beginRecordedRequest({
-        requestId,
-        path: c.req.path,
-        headers: c.req.raw.headers,
-        body: recordedBody,
-        stream: false,
-      });
-    }
+    if (requestId) beginClientRecord(c, config, requestId, recordedBody, false);
 
     if (!modelName) {
       const response = c.json({ error: "Missing 'model' in request body" }, 400);

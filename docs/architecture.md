@@ -34,7 +34,7 @@ docs/                Reference docs
 
 | Module | Files | Responsibility |
 |---|---|---|
-| `core` | `config`, `config-manager`, `auth`, `request-context`, `session-id`, `shutdown`, `startup-error`, `error-details`, `http-log`, `response-compression`, `stream-errors`, `i18n` | YAML config parsing and hot reload, bearer / `x-api-key` auth and per-model access tokens, per-request context, session id derivation, graceful shutdown, error formatting, response compression, page language selection and switch, web UI request language for server messages (`localize`) |
+| `core` | `config`, `config-manager`, `auth`, `request-context`, `session-id`, `shutdown`, `startup-error`, `error-details`, `http-log`, `response-compression`, `stream-errors`, `i18n`, `record-rule` | YAML config parsing and hot reload, the `record.skip_when` expression that keeps matching requests out of the records, bearer / `x-api-key` auth and per-model access tokens, per-request context, session id derivation, graceful shutdown, error formatting, response compression, page language selection and switch, web UI request language for server messages (`localize`) |
 | `converters` | `shared`, `requests`, `responses`, `streams`, `web-search`, `index` (+ `test`, `testres`) | Normalized types and the three-way protocol conversion; `web-search` holds native web search conversion. See [converters.md](converters.md) |
 | `proxy` | `proxy`, `fallback`, `response-cache`, `model-test`, `upstream-models`, `reasoning-history`, `pause-turn`, `thinking-binding` | Upstream HTTP calls, fallback-group failure tracking and ordering, in-memory cache of Responses API output items (resolves `item_reference`), model test request builder, upstream model listing, replayed-thinking rules per upstream, resuming a paused Claude turn, retrying a rejected thinking binding |
 | `subscriptions` | `openai-subscription`, `claude-subscription`, `claude-subscription-body`, `claude-billing`, `codex-version`, `subscription-client-compat`, `oauth-transport` | OAuth credential storage/refresh, client identity constants, Claude body transform, Rust helper transport |
@@ -65,7 +65,7 @@ core ──► (nothing)
 
 ## Tests
 
-- `tests/run.ts` is the main suite. `tests/jobs.ts`, `tests/subscription-proxy.ts`, `tests/storage-migration.ts` and `tests/shutdown.ts` use `node:test`. New test files must be added to the `test` script in `package.json`.
+- `tests/run.ts` is the main suite. `tests/jobs.ts`, `tests/subscription-proxy.ts`, `tests/storage-migration.ts`, `tests/shutdown.ts` and `tests/record-rule.ts` use `node:test`. New test files must be added to the `test` script in `package.json`.
 - `npm run converter:test` runs the converter suite in `src/converters/test.ts`.
 
 ## How to extend

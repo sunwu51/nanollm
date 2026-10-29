@@ -106,7 +106,7 @@ export class ConfigManager {
       this.lastObservedHash = nextHash;
       const result = {
         snapshot: this.snapshot,
-        appliedFields: ["providers", "models", "fallback", "server.ttfb_timeout", "record.max_size"],
+        appliedFields: ["providers", "models", "fallback", "server.ttfb_timeout", "record.max_size", "record.skip_when"],
         requiresRestartFields,
       };
       for (const listener of this.listeners) {

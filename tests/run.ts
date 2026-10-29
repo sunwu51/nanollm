@@ -4471,7 +4471,7 @@ fallback:
     - beta
 `, "ui");
 
-    assert.deepEqual(result.appliedFields, ["providers", "models", "fallback", "server.ttfb_timeout", "record.max_size"]);
+    assert.deepEqual(result.appliedFields, ["providers", "models", "fallback", "server.ttfb_timeout", "record.max_size", "record.skip_when"]);
     assert.deepEqual(result.requiresRestartFields, ["server.port", "server.auth.token"]);
     assert.equal(result.snapshot.effectiveConfig.port, 3000);
     assert.equal(result.snapshot.effectiveConfig.auth?.token, "old-token");

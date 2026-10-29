@@ -213,6 +213,9 @@ const zh = {
   addModel: "添加模型",
   fallbackIntro: "为分组命名后，从上面已经配置过的模型里选择成员。",
   addGroup: "添加分组",
+  advancedSettingsIntro: "不常用的全局设置。",
+  advancedSettingsConfigured: "已配置 record.skip_when。",
+  skipWhenHelper: "可选。JS 表达式，返回真值时该请求不写入采样记录，也不占用 record.max_size 的名额，可大幅减少数据库写入；/status 和用量统计不受影响。可用变量：body 为客户端请求体（只读）、model 为请求的模型或分组名、headers 为客户端请求头（名称不区分大小写，含真实的 authorization / x-api-key）、path 为请求路径。表达式出错时照常记录。",
 };
 
 const MESSAGES: Record<Lang, typeof zh> = {
@@ -422,6 +425,9 @@ const MESSAGES: Record<Lang, typeof zh> = {
     addModel: "Add model",
     fallbackIntro: "Name a group, then pick its members from the models configured above.",
     addGroup: "Add group",
+    advancedSettingsIntro: "Global settings you rarely need.",
+    advancedSettingsConfigured: " record.skip_when is set.",
+    skipWhenHelper: "Optional. A JS expression: when it returns a truthy value, the request is not recorded and takes no slot of record.max_size, which greatly cuts database writes. /status and usage stats still count it. Variables: body is the client request body (read-only), model the requested model or group name, headers the client request headers (case-insensitive names, with the real authorization / x-api-key values), and path the request path. If the expression fails, the request is recorded.",
   },
 };
 
@@ -615,7 +621,8 @@ const STYLE = /* css */ String.raw`
         padding-left: 12px;
         border-left: 2px solid rgba(143, 91, 51, 0.18);
       }
-      .group-body[hidden] {
+      .group-body[hidden],
+      .field-grid[hidden] {
         display: none;
       }
       .fetch-model-toolbar {
@@ -1124,6 +1131,7 @@ const SCRIPT = /* js */ String.raw`
           },
           record: {
             max_size: form.record?.max_size ?? "",
+            skip_when: form.record?.skip_when ?? "",
           },
           providers: (form.providers || []).map((provider) => ({
             ...provider,
@@ -1173,6 +1181,11 @@ const SCRIPT = /* js */ String.raw`
       const modelsContainer = document.getElementById("models-container");
       const fallbackContainer = document.getElementById("fallback-container");
       const globalFieldsEl = document.getElementById("global-fields");
+      const advancedFieldsEl = document.getElementById("advanced-fields");
+      const advancedToggleEl = document.getElementById("advanced-toggle");
+      const advancedConfiguredEl = document.getElementById("advanced-configured");
+      // The Advanced section starts collapsed and keeps its state across renders.
+      let advancedSettingsExpanded = false;
       const snapshotMetaEl = document.getElementById("snapshot-meta");
 
       function setStatus(kind, text) {
@@ -1419,9 +1432,9 @@ const SCRIPT = /* js */ String.raw`
 
       function bindExpressionField(container, model, key, options) {
         const field = document.createElement("div");
-        field.className = "field span-2";
+        field.className = "field " + (options.spanClass || "span-2");
         const label = document.createElement("label");
-        label.textContent = key;
+        label.textContent = options.label || key;
         const textarea = document.createElement("textarea");
         textarea.className = "expression-input";
         textarea.spellcheck = false;
@@ -1574,6 +1587,20 @@ const SCRIPT = /* js */ String.raw`
             formState.record.max_size = value;
             markDirty(true);
           },
+        });
+      }
+
+      function renderAdvancedFields() {
+        advancedToggleEl.textContent = advancedSettingsExpanded ? T.hideAdvanced : T.showAdvanced;
+        advancedToggleEl.setAttribute("aria-expanded", String(advancedSettingsExpanded));
+        advancedConfiguredEl.textContent = !advancedSettingsExpanded && (formState.record.skip_when || "").trim() ? T.advancedSettingsConfigured : "";
+        advancedFieldsEl.hidden = !advancedSettingsExpanded;
+        advancedFieldsEl.textContent = "";
+        bindExpressionField(advancedFieldsEl, formState.record, "skip_when", {
+          label: "record.skip_when",
+          spanClass: "span-3",
+          placeholder: "model === 'gpt-5-mini'\n  || headers['authorization']?.endsWith('abc123')",
+          helper: T.skipWhenHelper,
         });
       }
 
@@ -2992,6 +3019,7 @@ const SCRIPT = /* js */ String.raw`
         renderProviders();
         renderModels();
         renderFallbackGroups();
+        renderAdvancedFields();
         if (preserveScroll) window.scrollTo(scrollX, scrollY);
         focusPendingTarget({ scrollToFocus, selection });
         if (preserveScroll) {
@@ -3128,6 +3156,11 @@ const SCRIPT = /* js */ String.raw`
         renderAll();
       });
 
+      advancedToggleEl.addEventListener("click", () => {
+        advancedSettingsExpanded = !advancedSettingsExpanded;
+        renderAdvancedFields();
+      });
+
       document.getElementById("add-fallback-button").addEventListener("click", () => {
         const id = nextId("fallback");
         formState.fallbackGroups.push({
@@ -3255,6 +3288,17 @@ function AdminConfigPage({ payload, lang }: { payload: Record<string, unknown>; 
                 <button id="add-fallback-button" class="secondary" type="button">{m.addGroup}</button>
               </div>
               <div class="card-list" id="fallback-container"></div>
+            </section>
+
+            <section class="panel">
+              <div class="section-header">
+                <div>
+                  <h2>Advanced</h2>
+                  <p class="meta">{m.advancedSettingsIntro}<span id="advanced-configured"></span></p>
+                </div>
+                <button id="advanced-toggle" class="secondary" type="button" aria-controls="advanced-fields" aria-expanded="false">{m.showAdvanced}</button>
+              </div>
+              <div class="field-grid" id="advanced-fields" hidden></div>
             </section>
           </div>
         </main>

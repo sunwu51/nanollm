@@ -37,6 +37,7 @@ export type AdminConfigForm = {
   };
   record: {
     max_size: string;
+    skip_when?: string;
   };
   models: AdminModelDraft[];
   providers: AdminProviderDraft[];
@@ -66,7 +67,7 @@ export function buildAdminConfigForm(rawText: string): AdminConfigForm {
   const serverObject = toPlainObject(server);
   const recordObject = toPlainObject(record);
   const { port, ttfb_timeout, ...serverExtras } = serverObject;
-  const { max_size, ...recordExtras } = recordObject;
+  const { max_size, skip_when, ...recordExtras } = recordObject;
 
   return {
     rootExtras,
@@ -78,6 +79,7 @@ export function buildAdminConfigForm(rawText: string): AdminConfigForm {
     },
     record: {
       max_size: toInputString(max_size),
+      skip_when: toInputString(skip_when),
     },
     providers: Array.isArray(providers)
       ? providers.map((entry) => {
@@ -141,6 +143,7 @@ export function buildAdminConfigFormFromEffectiveConfig(config: ServerConfig): A
     },
     record: {
       max_size: toInputString(config.record.max_size),
+      skip_when: config.record.skip_when ?? "",
     },
     providers: config.providers.map((provider) => ({ ...provider, proxy: provider.proxy ?? "" })),
     models: config.models.map((model) => ({
@@ -172,6 +175,7 @@ export function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { pr
   const preservedPort = toPositiveIntegerOrUndefined(options?.preservedPort, "server.port");
   const serverTTFBTimeout = toPositiveIntegerOrUndefined(form.server?.ttfb_timeout, "server.ttfb_timeout");
   const recordMaxSize = toPositiveIntegerOrUndefined(form.record?.max_size, "record.max_size");
+  const recordSkipWhen = toInputString(form.record?.skip_when).trim();
 
   const providers = Array.isArray(form.providers)
     ? form.providers.map((entry) => {
@@ -231,10 +235,11 @@ export function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { pr
     };
   }
 
-  if (Object.keys(recordExtras).length > 0 || recordMaxSize !== undefined) {
+  if (Object.keys(recordExtras).length > 0 || recordMaxSize !== undefined || recordSkipWhen) {
     document.record = {
       ...recordExtras,
       ...(recordMaxSize !== undefined ? { max_size: recordMaxSize } : {}),
+      ...(recordSkipWhen ? { skip_when: recordSkipWhen } : {}),
     };
   }
 
