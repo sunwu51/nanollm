@@ -3,7 +3,7 @@
 LLM gateway (OpenAI Chat / Responses / Anthropic compatible). See `docs/architecture.md` for the module layout, dependency rules and request flow.
 
 ## Layout
-- `server.ts` entrypoint and routes; `src/{core,converters,proxy,subscriptions,storage,jobs,pages}` feature modules; `tests/`; `scripts/`.
+- `server.ts` entrypoint and routes; `src/{core,converters,proxy,subscriptions,storage,jobs,tokens,pages}` feature modules; `tests/`; `scripts/`.
 - Imports use explicit `.js` extensions and must follow the dependency direction in `docs/architecture.md`.
 
 ## Commands

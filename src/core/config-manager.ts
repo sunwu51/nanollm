@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { readFileSync, watchFile, unwatchFile } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, renameSync, watchFile, unwatchFile, writeFileSync } from "node:fs";
 import {
   materializeConfig,
   parseConfigDocument,
@@ -7,6 +7,7 @@ import {
   type ParsedConfigDocument,
   type ServerConfig,
 } from "./config.js";
+import { migrateLegacyAuthTokens } from "./token-migration.js";
 
 export type ConfigUpdateSource = "startup" | "ui" | "file-watch";
 
@@ -32,6 +33,12 @@ export interface ApplyConfigResult {
 
 const RELOAD_DEBOUNCE_MS = 150;
 const WATCH_INTERVAL_MS = 500;
+
+export function writeFileAtomic(path: string, text: string) {
+  const tempPath = `${path}.${randomUUID()}.tmp`;
+  writeFileSync(tempPath, text, "utf-8");
+  renameSync(tempPath, path);
+}
 
 function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -62,7 +69,7 @@ export class ConfigManager {
   private readonly listeners = new Set<(result: ApplyConfigResult, source: ConfigUpdateSource) => void>();
 
   constructor(private readonly configPath: string) {
-    const rawText = readFileSync(this.configPath, "utf-8");
+    const rawText = this.readMigrated();
     const effectiveConfig = parseConfigText(rawText);
     this.snapshot = {
       version: 1,
@@ -143,6 +150,16 @@ export class ConfigManager {
     };
   }
 
+  /** Reads the config file, first rewriting legacy model and group `auth_token` fields into `tokens`. */
+  private readMigrated(): string {
+    const rawText = readFileSync(this.configPath, "utf-8");
+    const migrated = migrateLegacyAuthTokens(rawText);
+    if (migrated === undefined) return rawText;
+    writeFileAtomic(this.configPath, migrated);
+    console.log(`[CONFIG MIGRATE] moved model and fallback group auth_token fields into tokens in ${this.configPath}`);
+    return migrated;
+  }
+
   private startWatching() {
     watchFile(
       this.configPath,
@@ -160,7 +177,7 @@ export class ConfigManager {
 
   private reloadFromDisk() {
     try {
-      const rawText = readFileSync(this.configPath, "utf-8");
+      const rawText = this.readMigrated();
       const nextHash = hashText(rawText);
       if (nextHash === this.lastObservedHash) return;
       this.applyText(rawText, "file-watch");

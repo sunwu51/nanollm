@@ -296,37 +296,36 @@ http://localhost:3000/admin
 http://localhost:3000/status
 http://localhost:3000/record
 http://localhost:3000/jobs
+http://localhost:3000/tokens
 ```
 
 Without a configured password, pages remain open. When authentication is enabled, unsigned visitors are redirected to `/login`; enter the access password configured through `server.auth.token` or `NANOLLM_AUTH_TOKEN` to return to the original page. URL query tokens (`?token=`) no longer authenticate requests, so old links also redirect to login when no valid cookie is present.
 
 Successful login (or Bearer authentication) sets a same-origin `HttpOnly` auth cookie lasting 90 days, renewed on successful access, with `Secure` enabled over HTTPS. The browser automatically sends this cookie for later visits and page requests. Expired cookies or password changes send WebUI users back to login; API clients still receive a standard `401 Unauthorized` response.
 
-### Model and group access tokens
+### Client tokens
 
-To give a client access to a single model or fallback group without sharing the admin token, set `auth_token` on the model or the group. A fallback group takes the object form to carry one; the plain array form still works:
+To give a client its own key without sharing the admin token, add it to the top-level `tokens` list. Each token lists the model names the client may send under `available_models`, and maps each one to a model or fallback group in this config:
 
 ```yaml
-models:
-  - name: gpt-5.4-a
-    # ...
-    auth_token: ${TEAM_A_TOKEN}
-fallback:
-  gpt-5.4:                # existing array form, unchanged
-    - gpt-5.4-a
-    - gpt-5.4-b
-  gpt-5.4-team:           # object form, only needed to carry a token
-    models:
-      - gpt-5.4-a
-      - gpt-5.4-b
-    auth_token: ${TEAM_B_TOKEN}
+tokens:
+  - name: team-a              # optional label shown on /tokens
+    value: ${TEAM_A_TOKEN}
+    available_models:
+      - gpt-5.4: gpt-5.4-team # the client sends "gpt-5.4", nanollm routes it to the "gpt-5.4-team" group
+      - fast: gpt-5.4-a
+      - gpt-5.4-b             # short for "gpt-5.4-b: gpt-5.4-b"
+      - claude-*: wild-*      # prefix mapping: "claude-x" routes to "wild-x"
 ```
 
-- A token only works with the exact name it is attached to. `TEAM_A_TOKEN` can call `gpt-5.4-a`; `TEAM_B_TOKEN` can call `gpt-5.4-team` (which still falls back through every member) but not `gpt-5.4-a` or `gpt-5.4-b` by name.
-- The admin token (`server.auth.token`) can always call every model and group.
-- A model or group without its own `auth_token` is reachable with the admin token only, or by anyone when no admin token is configured. A model or group *with* its own `auth_token` stays locked even when no admin token is configured.
-- These tokens only reach the model APIs (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/images/*`, `/v1/alpha/search`) and `/v1/models`, which lists only the names the token can use. Pages, `/admin`, `/record`, `/status` and `/jobs` still need the admin token, and no login cookie is set. A disallowed model returns `403`.
-- Clients send them the same way as the admin token (`Authorization: Bearer` or `x-api-key`). Model and group tokens hot-reload with `models` and `fallback`, and support `${ENV_VAR}`. The `/admin` page has an `auth_token` field with a "Generate" button on each model and group.
+- A token can only use the names listed under it, mapped to their targets. `TEAM_A_TOKEN` can call `fast` (routed to `gpt-5.4-a`) but not `gpt-5.4-a` by name.
+- A name ending in `*` maps a prefix; if the target ends in `*` too (a wildcard model), the rest of the name carries over. Exact names win over prefixes, and longer prefixes over shorter ones.
+- The admin token (`server.auth.token`) can always call every model and group by its own name.
+- Without an admin token, models and groups that no token maps to are open to everyone; the ones a token maps to can only be used with a token.
+- Tokens only reach the model APIs (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/images/*`, `/v1/alpha/search`) and `/v1/models`, which lists the names the token can use. Pages, `/admin`, `/record`, `/status`, `/jobs` and `/tokens` still need the admin token, and no login cookie is set. A disallowed model returns `403`.
+- Clients send them the same way as the admin token (`Authorization: Bearer` or `x-api-key`). Tokens hot-reload and support `${ENV_VAR}`.
+- The `/tokens` page creates, generates and edits tokens and their models, and saves them to `config.yaml`. A token that points at a model or group that no longer exists makes the config invalid, so update the token when you rename or delete one on `/admin`.
+- Older configs that put `auth_token` on a model or a fallback group are migrated when nanollm loads `config.yaml`: each distinct token becomes a `tokens` entry that maps the names it opened to themselves, fallback groups go back to the plain list form, and the file is saved.
 
 ### Dynamic request body expression
 

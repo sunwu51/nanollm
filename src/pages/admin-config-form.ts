@@ -12,7 +12,6 @@ type AdminModelDraft = {
   proxy?: string;
   body_expression?: string;
   response_expression?: string;
-  auth_token?: string;
   extras?: Record<string, unknown>;
 };
 type AdminProviderDraft = {
@@ -25,7 +24,6 @@ type AdminProviderDraft = {
 type AdminFallbackDraft = {
   name: string;
   members: string[];
-  auth_token?: string;
 };
 export type AdminConfigForm = {
   rootExtras?: Record<string, unknown>;
@@ -98,7 +96,7 @@ export function buildAdminConfigForm(rawText: string): AdminConfigForm {
           const modelObject = toPlainObject(entry);
           const {
             name, provider, custom_provider, base_url, api_key, model, proxy,
-            body_expression, bodyExpression, response_expression, responseExpression, auth_token,
+            body_expression, bodyExpression, response_expression, responseExpression,
             ...extras
           } = modelObject;
           return {
@@ -112,22 +110,16 @@ export function buildAdminConfigForm(rawText: string): AdminConfigForm {
             proxy: toInputString(proxy),
             body_expression: toInputString(body_expression ?? bodyExpression),
             response_expression: toInputString(response_expression ?? responseExpression),
-            auth_token: toInputString(auth_token),
             extras,
           };
         })
       : [],
     fallbackGroups:
       fallback && typeof fallback === "object" && !Array.isArray(fallback)
-        ? Object.entries(fallback as Record<string, unknown>).map(([name, group]) => {
-            const groupObject = toPlainObject(group);
-            const members = Array.isArray(group) ? group : groupObject.models;
-            return {
-              name,
-              members: Array.isArray(members) ? members.map((member) => toInputString(member)).filter(Boolean) : [],
-              auth_token: toInputString(groupObject.auth_token),
-            };
-          })
+        ? Object.entries(fallback as Record<string, unknown>).map(([name, members]) => ({
+            name,
+            members: Array.isArray(members) ? members.map((member) => toInputString(member)).filter(Boolean) : [],
+          }))
         : [],
   };
 }
@@ -157,14 +149,9 @@ export function buildAdminConfigFormFromEffectiveConfig(config: ServerConfig): A
       proxy: model.proxy ?? "",
       body_expression: model.bodyExpression ?? "",
       response_expression: model.responseExpression ?? "",
-      auth_token: model.auth_token ?? "",
       extras: {},
     })),
-    fallbackGroups: Object.entries(config.fallback).map(([name, members]) => ({
-      name,
-      members,
-      auth_token: config.fallback_auth_tokens?.[name] ?? "",
-    })),
+    fallbackGroups: Object.entries(config.fallback).map(([name, members]) => ({ name, members })),
   };
 }
 
@@ -192,11 +179,10 @@ export function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { pr
   const models = Array.isArray(form.models)
     ? form.models.map((entry) => {
         const customProvider = entry.connection_mode === "custom" ? (entry.custom_provider ?? "").trim() : "";
-        const { body_expression, bodyExpression: legacyBody, response_expression, responseExpression: legacyResponse, proxy: extraProxy, auth_token: extraAuthToken, ...extras } = toPlainObject(entry.extras);
+        const { body_expression, bodyExpression: legacyBody, response_expression, responseExpression: legacyResponse, proxy: extraProxy, ...extras } = toPlainObject(entry.extras);
         const proxy = toInputString(entry.proxy || extraProxy).trim();
         const bodyExpression = toInputString(entry.body_expression || body_expression || legacyBody).trim();
         const responseExpression = toInputString(entry.response_expression || response_expression || legacyResponse).trim();
-        const authToken = toInputString(entry.auth_token || extraAuthToken).trim();
         return {
           ...extras,
           name: entry.name ?? "",
@@ -207,7 +193,6 @@ export function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { pr
           ...(proxy ? { proxy } : {}),
           ...(bodyExpression ? { body_expression: bodyExpression } : {}),
           ...(responseExpression ? { response_expression: responseExpression } : {}),
-          ...(authToken ? { auth_token: authToken } : {}),
         };
       })
     : [];
@@ -217,9 +202,7 @@ export function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { pr
       .filter((group) => group && typeof group.name === "string" && group.name.trim())
       .map((group) => {
         const members = (Array.isArray(group.members) ? group.members : []).map((member) => String(member).trim()).filter(Boolean);
-        const authToken = toInputString(group.auth_token).trim();
-        // Groups without a token keep the short array form.
-        return [group.name.trim(), authToken ? { models: members, auth_token: authToken } : members];
+        return [group.name.trim(), members];
       }),
   );
 

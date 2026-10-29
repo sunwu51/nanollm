@@ -5,8 +5,8 @@ import { resolveLang } from "./i18n.js";
 
 const COOKIE_NAME = "nanollm_auth";
 const COOKIE_MAX_AGE = 90 * 24 * 60 * 60;
-const PAGE_PATHS = new Set(["/admin", "/admin/config", "/status", "/record", "/jobs"]);
-// Routes that name a model; a model/group token may reach them and the route checks the model it names.
+const PAGE_PATHS = new Set(["/admin", "/admin/config", "/status", "/record", "/jobs", "/tokens"]);
+// Routes that name a model; a client token from 'tokens' may reach them and the route checks the model it names.
 const MODEL_API_PATHS = new Set([
   "/v1/models",
   "/v1/chat/completions",
@@ -40,7 +40,7 @@ export function getRequestAuthToken(c: Context, adminToken: string | undefined):
   return extractRequestToken(c.req.raw.headers);
 }
 
-/** `isScopedToken` lets model/group tokens through to model routes; it never grants pages or a cookie. */
+/** `isScopedToken` lets client tokens through to model routes; it never grants pages or a cookie. */
 export function webAuth(getToken: () => string | undefined, isScopedToken?: (candidate: string | undefined) => boolean): MiddlewareHandler {
   return async (c, next) => {
     if (c.req.method === "OPTIONS" || c.req.path === "/health") return next();

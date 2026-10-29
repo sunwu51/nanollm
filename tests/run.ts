@@ -27,7 +27,7 @@ import { decodeReasoningCarrier, encodeReasoningCarrier, encodeRedactedReasoning
 import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, denormalizeToOpenAIResponsesRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { CLAUDE_CODE_SYSTEM_IDENTITY, relocateNonClaudeSystemPrompt } from "../src/subscriptions/claude-system-prompt.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
-import { buildAuthCookieValue, canAccessModel, extractBearerToken, extractRequestToken, getAccessibleModelNames, isAuthorizedToken, isScopedToken, readAuthCookie } from "../src/core/auth.js";
+import { buildAuthCookieValue, extractBearerToken, extractRequestToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
 import { getRequestAuthToken, webAuth } from "../src/core/web-auth.js";
 import { renderLoginPage, withWebUIAuth } from "../src/pages/login-page.js";
 import { resolveLang } from "../src/core/i18n.js";
@@ -6488,38 +6488,6 @@ models:
   assert.doesNotMatch(legacy, /bodyExpression/);
 });
 
-run("admin config form round-trips model and fallback group auth tokens", () => {
-  const form = buildAdminConfigForm(`
-models:
-  - name: m1
-    provider: openai-chat
-    base_url: https://example.com/v1
-    api_key: k
-    model: m1
-    auth_token: \${TEAM_TOKEN}
-fallback:
-  plain: [m1]
-  team:
-    models: [m1]
-    auth_token: team-token
-`);
-  assert.equal(form.models[0].auth_token, "${TEAM_TOKEN}");
-  assert.deepEqual(form.models[0].extras, {});
-  assert.deepEqual(form.fallbackGroups, [
-    { name: "plain", members: ["m1"], auth_token: "" },
-    { name: "team", members: ["m1"], auth_token: "team-token" },
-  ]);
-  const yamlText = buildYamlTextFromAdminForm(form);
-  assert.match(yamlText, /auth_token: \$\{TEAM_TOKEN\}/);
-  assert.match(yamlText, /plain:\n    - m1/);
-  assert.match(yamlText, /team:\n    models:\n      - m1\n    auth_token: team-token/);
-  form.fallbackGroups[1].auth_token = " ";
-  form.models[0].auth_token = "";
-  const cleared = buildYamlTextFromAdminForm(form);
-  assert.doesNotMatch(cleared, /auth_token/);
-  assert.match(cleared, /team:\n    - m1/);
-});
-
 run("admin config form preserves provider, model and fallback order", () => {
   const yamlText = buildYamlTextFromAdminForm({
     server: { port: "", ttfb_timeout: "" },
@@ -7276,9 +7244,9 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.match(html, /function bindExpressionField/);
   assert.match(html, /bindExpressionField\(grid, model, "body_expression"/);
   assert.match(html, /bindExpressionField\(grid, model, "response_expression"/);
-  assert.match(html, /"bodyExpression", "responseExpression", "auth_token"\]\)/);
-  assert.match(html, /bindAuthTokenField\(grid, model, T\.modelAuthTokenHelper\)/);
-  assert.match(html, /bindAuthTokenField\(grid, group, T\.groupAuthTokenHelper\)/);
+  assert.match(html, /"bodyExpression", "responseExpression"\]\)/);
+  assert.doesNotMatch(html, /auth_token|bindAuthTokenField/);
+  assert.match(html, /href="\/tokens"/);
   assert.match(html, /function attachCardDrag/);
   assert.match(html, /attachCardDrag\(card, head, "provider", \(\) => formState\.providers, provider\)/);
   assert.match(html, /attachCardDrag\(card, head, "model", \(\) => formState\.models, model\)/);
@@ -7772,86 +7740,6 @@ await runAsync("auth middleware rejects unauthenticated requests when token is c
   const healthResponse = await app.request("http://localhost/health");
   assert.equal(healthResponse.status, 200);
   assert.deepEqual(await healthResponse.json(), { ok: true });
-});
-
-const SCOPED_AUTH_CONFIG = `
-server:
-  auth:
-    token: admin-token
-models:
-  - name: m1
-    provider: openai-chat
-    base_url: https://example.com/v1
-    api_key: k
-    model: m1
-    auth_token: m1-token
-  - name: m2
-    provider: anthropic
-    base_url: https://example.com/v1
-    api_key: k
-    model: m2
-  - name: wild-*
-    provider: openai-chat
-    base_url: https://example.com/v1
-    api_key: k
-    model: "*"
-    auth_token: \${NANOLLM_TEST_WILD_TOKEN}
-fallback:
-  plain: [m1, m2]
-  team:
-    models: [m1, m2]
-    auth_token: team-token
-`;
-
-run("config parses model and fallback group auth tokens in both fallback forms", () => {
-  process.env.NANOLLM_TEST_WILD_TOKEN = "wild-token";
-  const config = parseConfigText(SCOPED_AUTH_CONFIG);
-  assert.equal(config.models[0].auth_token, "m1-token");
-  assert.equal("auth_token" in config.models[1], false);
-  assert.equal(config.models[2].auth_token, "wild-token");
-  assert.deepEqual(config.fallback, { plain: ["m1", "m2"], team: ["m1", "m2"] });
-  assert.deepEqual(config.fallback_auth_tokens, { team: "team-token" });
-  assert.equal(parseConfigText("models: []\nfallback: {}\n").fallback_auth_tokens, undefined);
-  assert.throws(() => parseConfigText(`
-models:
-  - { name: m1, provider: openai-chat, base_url: https://example.com/v1, api_key: k, model: m1 }
-fallback:
-  team: { auth_token: t }
-`), /Fallback group 'team' must be a non-empty model array/);
-});
-
-run("model access allows the admin token and each name's own token only", () => {
-  process.env.NANOLLM_TEST_WILD_TOKEN = "wild-token";
-  const config = parseConfigText(SCOPED_AUTH_CONFIG);
-  const cases: Array<[string, string | undefined, boolean]> = [
-    ["m1", "admin-token", true], ["m1", "m1-token", true], ["m1", "team-token", false], ["m1", undefined, false],
-    ["m2", "admin-token", true], ["m2", "m1-token", false], ["m2", "team-token", false],
-    ["team", "admin-token", true], ["team", "team-token", true], ["team", "m1-token", false],
-    ["plain", "admin-token", true], ["plain", "m1-token", false], ["plain", "team-token", false],
-    ["wild-x", "wild-token", true], ["wild-x", "m1-token", false],
-    ["unknown", "m1-token", false], ["unknown", "admin-token", true],
-  ];
-  for (const [name, token, expected] of cases) {
-    assert.equal(canAccessModel(config, name, token), expected, `${name} with ${token}`);
-  }
-  assert.deepEqual(getAccessibleModelNames(config, "team-token"), ["team"]);
-  assert.deepEqual(getAccessibleModelNames(config, "m1-token"), ["m1"]);
-  assert.deepEqual(getAccessibleModelNames(config, "admin-token"), ["plain", "team", "m1", "m2", "wild-*"]);
-  assert.equal(isScopedToken(config, "m1-token"), true);
-  assert.equal(isScopedToken(config, "team-token"), true);
-  assert.equal(isScopedToken(config, "admin-token"), false);
-  assert.equal(isScopedToken(config, undefined), false);
-});
-
-run("model access keeps names with their own token locked without an admin token", () => {
-  const config = parseConfigText(SCOPED_AUTH_CONFIG.replace("  auth:\n    token: admin-token\n", ""));
-  assert.equal(config.auth, undefined);
-  assert.equal(canAccessModel(config, "m2", undefined), true);
-  assert.equal(canAccessModel(config, "plain", undefined), true);
-  assert.equal(canAccessModel(config, "m1", undefined), false);
-  assert.equal(canAccessModel(config, "m1", "m1-token"), true);
-  assert.equal(canAccessModel(config, "team", "m1-token"), false);
-  assert.deepEqual(getAccessibleModelNames(config, undefined), ["plain", "m2"]);
 });
 
 run("request token comes from bearer first, then x-api-key", () => {
