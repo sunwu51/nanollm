@@ -25,8 +25,9 @@ import {
 } from "../src/converters/index.js";
 import { decodeReasoningCarrier, encodeReasoningCarrier, encodeRedactedReasoningCarrier, UnsupportedContentError } from "../src/converters/shared.js";
 import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, denormalizeToOpenAIResponsesRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
+import { CLAUDE_CODE_SYSTEM_IDENTITY, relocateNonClaudeSystemPrompt } from "../src/subscriptions/claude-system-prompt.js";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
-import { buildAuthCookieValue, canAccessModel, extractBearerToken, extractRequestToken, getAccessibleModelNames, isAuthorizedToken, isScopedToken, readAuthCookie } from "../src/core/auth.js";
+import { buildAuthCookieValue, extractBearerToken, extractRequestToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
 import { getRequestAuthToken, webAuth } from "../src/core/web-auth.js";
 import { renderLoginPage, withWebUIAuth } from "../src/pages/login-page.js";
 import { resolveLang } from "../src/core/i18n.js";
@@ -80,6 +81,7 @@ import { denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeU
 import { openSqliteStorage, resolveSqliteConfig, createSqliteWakeFetch, waitForClientWrites } from "../src/storage/sqlite.js";
 import { autoMigrateSqliteFileToTurso } from "../scripts/turso-migration.js";
 import { runReasoningStreamTests } from "./reasoning-streams.js";
+import { runWebSearchTests } from "./web-search.js";
 
 function createTestSqliteClient(path: string): Client {
   return createClient({ url: `file:${path}`, intMode: "number", timeout: 5000 });
@@ -129,6 +131,7 @@ function runThrows(name: string, fn: () => void, expectedMessage: string) {
 }
 
 runReasoningStreamTests(run);
+runWebSearchTests(run);
 
 run("extractErrorCauses preserves useful nested transport details and redacts secrets", () => {
   const nested = Object.assign(new Error("HTTP/2 GOAWAY Bearer secret-token"), {
@@ -412,7 +415,7 @@ run("anthropic messages request keeps schema tools including explicit custom typ
   assert.deepEqual((chat as any).tool_choice, { type: "function", function: { name: "get_weather" } });
 });
 
-run("anthropic server tool history is downgraded to function-style chat history", () => {
+run("anthropic web search history becomes a chat text note, even with the result in a user message", () => {
   const result = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -450,14 +453,13 @@ run("anthropic server tool history is downgraded to function-style chat history"
     ],
   } as any);
 
+  // Chat has no web search tool: the search is a note at its position, and the user message that only
+  // held the result leaves no orphan tool message behind.
+  assert.equal(result.messages.length, 1);
   assert.equal(result.messages[0].role, "assistant");
-  assert.equal((result.messages[0].tool_calls?.[0] as any).type, "function");
-  assert.equal((result.messages[0].tool_calls?.[0] as any).function.name, "web_search");
-  assert.equal((result.messages[0].tool_calls?.[0] as any).function.arguments, "{\"query\":\"nanollm\"}");
-  assert.equal(result.messages[1].role, "tool");
-  assert.equal((result.messages[1] as any).tool_call_id, "srv_1");
-  assert.match(String((result.messages[1] as any).content), /nanollm/);
-  assert.match(String((result.messages[1] as any).content), /https:\/\/example\.com\/nanollm/);
+  assert.equal((result.messages[0] as any).tool_calls, null);
+  assert.match(String((result.messages[0] as any).content), /^\[web_search\] query: nanollm/);
+  assert.match(String((result.messages[0] as any).content), /- nanollm — https:\/\/example\.com\/nanollm/);
 });
 
 run("responses tool output becomes anthropic tool_result block", () => {
@@ -2370,6 +2372,124 @@ run("anthropic request tools omit strict field", () => {
 
   assert.equal((anthropic.tools?.[0] as any).strict, undefined);
   assert.equal(((anthropic.tools?.[0] as any).input_schema ?? {}).additionalProperties, false);
+});
+
+run("anthropic tool input_schema flattens top-level oneOf with $refs", () => {
+  // Mirrors a Codex MCP discriminated-union tool: top-level oneOf over local $defs branches.
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "run" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "automation_update",
+          parameters: {
+            type: "object",
+            properties: {},
+            oneOf: [
+              { $ref: "#/$defs/__view" },
+              { $ref: "#/$defs/__create" },
+            ],
+            $defs: {
+              __view: { type: "object", properties: { mode: { const: "view" }, id: { type: "string" } }, required: ["id", "mode"] },
+              __create: { type: "object", properties: { mode: { const: "create" }, id: { type: "string" }, name: { type: "string" }, prompt: { type: "string" } }, required: ["mode", "name", "prompt"] },
+            },
+          },
+        },
+      },
+    ],
+  } as any);
+
+  const schema = (anthropic.tools?.[0] as any).input_schema;
+  // Top-level combinator is gone, branches' properties merged.
+  assert.equal(schema.oneOf, undefined);
+  assert.equal(schema.type, "object");
+  assert.deepEqual(Object.keys(schema.properties).sort(), ["id", "mode", "name", "prompt"]);
+  // required = intersection of branch required lists.
+  assert.deepEqual(schema.required, ["mode"]);
+  // $defs survive for nested use.
+  assert.ok(schema.$defs);
+});
+
+run("anthropic tool input_schema flattens top-level allOf with required union", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "run" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "combo",
+          parameters: {
+            allOf: [
+              { type: "object", properties: { a: { type: "string" } }, required: ["a"] },
+              { type: "object", properties: { b: { type: "number" } }, required: ["b"] },
+            ],
+          },
+        },
+      },
+    ],
+  } as any);
+
+  const schema = (anthropic.tools?.[0] as any).input_schema;
+  assert.equal(schema.allOf, undefined);
+  assert.deepEqual(Object.keys(schema.properties).sort(), ["a", "b"]);
+  assert.deepEqual(schema.required, ["a", "b"]);
+});
+
+run("anthropic tool input_schema keeps nested oneOf and strips meta keywords", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "run" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "nested",
+          parameters: {
+            $schema: "http://json-schema.org/draft-07/schema#",
+            $id: "https://example.com/nested.json",
+            type: "object",
+            properties: {
+              value: { oneOf: [{ type: "string" }, { type: "number" }] },
+            },
+          },
+        },
+      },
+    ],
+  } as any);
+
+  const schema = (anthropic.tools?.[0] as any).input_schema;
+  // Meta keywords stripped at any depth; nested oneOf is left for Anthropic (only the top level is hard-rejected).
+  assert.equal(schema.$schema, undefined);
+  assert.equal(schema.$id, undefined);
+  assert.deepEqual(schema.properties.value, { oneOf: [{ type: "string" }, { type: "number" }] });
+});
+
+run("anthropic tool input_schema leaves cyclic or unresolvable refs untouched", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: "run" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "cyclic",
+          parameters: {
+            type: "object",
+            properties: {},
+            oneOf: [{ $ref: "#/$defs/a" }],
+            $defs: { a: { oneOf: [{ $ref: "#/$defs/a" }] } },
+          },
+        },
+      },
+    ],
+  } as any);
+
+  const schema = (anthropic.tools?.[0] as any).input_schema;
+  // Cannot safely flatten: the original combinator stays so the caller sees the real schema.
+  assert.ok(Array.isArray(schema.oneOf));
 });
 
 run("anthropic disable_parallel_tool_use becomes responses parallel_tool_calls false", () => {
@@ -4351,7 +4471,7 @@ fallback:
     - beta
 `, "ui");
 
-    assert.deepEqual(result.appliedFields, ["providers", "models", "fallback", "server.ttfb_timeout", "record.max_size"]);
+    assert.deepEqual(result.appliedFields, ["providers", "models", "fallback", "server.ttfb_timeout", "record.max_size", "record.skip_when"]);
     assert.deepEqual(result.requiresRestartFields, ["server.port", "server.auth.token"]);
     assert.equal(result.snapshot.effectiveConfig.port, 3000);
     assert.equal(result.snapshot.effectiveConfig.auth?.token, "old-token");
@@ -5017,6 +5137,38 @@ run("claude subscription fills missing defaults and removes tool_choice without 
   for (const tools of [[], null]) {
     const result = sanitizeClaudeSubscriptionBody({ ...explicit, tools }) as Record<string, unknown>;
     assert.equal("tool_choice" in result, false);
+  }
+});
+
+run("claude subscription relocates a non-Claude system prompt into a system-reminder user block", () => {
+  const billing = { type: "text", text: "x-anthropic-billing-header: cc_version=1.2.3.abc; cc_entrypoint=cli;" };
+  const identity = { type: "text", text: CLAUDE_CODE_SYSTEM_IDENTITY };
+  const cache = { type: "ephemeral" };
+  const original = { model: "m", system: [billing, { type: "text", text: "You are pi." }, { type: "text", text: "Docs: pi.md", cache_control: cache }], messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }] };
+  const snapshot = structuredClone(original);
+  const result = relocateNonClaudeSystemPrompt(original) as any;
+  assert.deepEqual(original, snapshot);
+  assert.deepEqual(result.system, [billing, identity]);
+  assert.deepEqual(result.messages[0].content, [{ type: "text", text: "<system-reminder>\nYou are pi.\n\nDocs: pi.md\n</system-reminder>", cache_control: cache }, { type: "text", text: "hi" }]);
+  assert.equal(result.messages.length, 2);
+
+  const stringSystem = relocateNonClaudeSystemPrompt({ system: "Be brief.", messages: [{ role: "user", content: [{ type: "text", text: "a" }] }] }) as any;
+  assert.deepEqual(stringSystem.system, [identity]);
+  assert.equal(stringSystem.messages[0].content[0].text, "<system-reminder>\nBe brief.\n</system-reminder>");
+
+  const noUser = relocateNonClaudeSystemPrompt({ system: "Be brief.", messages: [] }) as any;
+  assert.deepEqual(noUser.messages, [{ role: "user", content: [{ type: "text", text: "<system-reminder>\nBe brief.\n</system-reminder>" }] }]);
+});
+
+run("claude subscription leaves Claude system prompts and prompt-less requests untouched", () => {
+  const messages = [{ role: "user", content: "hi" }];
+  for (const system of [
+    [{ type: "text", text: "x-anthropic-billing-header: cc_version=1;" }, { type: "text", text: `${CLAUDE_CODE_SYSTEM_IDENTITY} Extra.` }],
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    undefined, "", [{ type: "text", text: "x-anthropic-billing-header: cc_version=1;" }],
+  ]) {
+    const body = { system, messages };
+    assert.equal(relocateNonClaudeSystemPrompt(body), body);
   }
 });
 
@@ -6210,6 +6362,36 @@ await runAsync("turso auto migration copies sqlite data only once per migration 
   }
 });
 
+await runAsync("record source comes from the client's user agent", async () => {
+  await startRecording({ maxSize: 50 });
+  const cases: Array<[string | undefined, string]> = [
+    ["claude-cli/2.1.300 (external, cli)", "claudecode"],
+    ["codex_cli_rs/0.130.0 (Windows 10.0.26100; x86_64) WindowsTerminal", "codex"],
+    ["opencode/1.14.2", "opencode"],
+    ["Kilo-Code/5.2.0", "kilocode"],
+    ["pi/1.0.3 (win32; node/v22.19.0; x64)", "pi"],
+    ["pi", "pi"],
+    ["pip/24.0", "other"],
+    ["Cline/3.40.1", "cline"],
+    ["QwenCode/0.9.0 (darwin; arm64)", "qwencode"],
+    ["Charm-Crush/0.20.0 (https://charm.land/crush)", "crush"],
+    ["Zed/0.215.3 (macos; aarch64)", "zed"],
+    ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", "browser"],
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15", "browser"],
+    ["Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0", "browser"],
+    ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) SomeApp/1.0 Chrome/138.0.0.0 Electron/37.2.0 Safari/537.36", "other"],
+    ["Mozilla/5.0 (compatible; VSCodeExtension/1.0; +https://cline.bot)", "other"],
+    ["OpenAI/Python 2.3.0", "other"],
+    [undefined, "other"],
+  ];
+  for (const [index, [userAgent]] of cases.entries()) {
+    beginRecordedRequest({ requestId: `source-${index}`, path: "/v1/chat/completions", headers: userAgent ? { "User-Agent": userAgent } : {}, body: { model: "alpha" }, stream: false });
+  }
+  const sources = new Map((await getRecordSummary()).recentKeys.map((entry) => [entry.requestId, entry.source]));
+  for (const [index, [userAgent, expected]] of cases.entries()) assert.equal(sources.get(`source-${index}`), expected, String(userAgent));
+  await stopRecording();
+});
+
 await runAsync("record store resets on start and supports full request id lookup", async () => {
   await startRecording();
   const requestId = "abcdef12-3456-7890-abcd-ef1234567890";
@@ -6334,38 +6516,6 @@ models:
   const legacy = buildYamlTextFromAdminForm({ ...form, models: [{ ...model, body_expression: "", extras: { bodyExpression: "body" } }] });
   assert.match(legacy, /body_expression: body/);
   assert.doesNotMatch(legacy, /bodyExpression/);
-});
-
-run("admin config form round-trips model and fallback group auth tokens", () => {
-  const form = buildAdminConfigForm(`
-models:
-  - name: m1
-    provider: openai-chat
-    base_url: https://example.com/v1
-    api_key: k
-    model: m1
-    auth_token: \${TEAM_TOKEN}
-fallback:
-  plain: [m1]
-  team:
-    models: [m1]
-    auth_token: team-token
-`);
-  assert.equal(form.models[0].auth_token, "${TEAM_TOKEN}");
-  assert.deepEqual(form.models[0].extras, {});
-  assert.deepEqual(form.fallbackGroups, [
-    { name: "plain", members: ["m1"], auth_token: "" },
-    { name: "team", members: ["m1"], auth_token: "team-token" },
-  ]);
-  const yamlText = buildYamlTextFromAdminForm(form);
-  assert.match(yamlText, /auth_token: \$\{TEAM_TOKEN\}/);
-  assert.match(yamlText, /plain:\n    - m1/);
-  assert.match(yamlText, /team:\n    models:\n      - m1\n    auth_token: team-token/);
-  form.fallbackGroups[1].auth_token = " ";
-  form.models[0].auth_token = "";
-  const cleared = buildYamlTextFromAdminForm(form);
-  assert.doesNotMatch(cleared, /auth_token/);
-  assert.match(cleared, /team:\n    - m1/);
 });
 
 run("admin config form preserves provider, model and fallback order", () => {
@@ -6978,27 +7128,23 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /recent-title/);
   assert.match(html, /recent-model-row/);
   assert.match(html, /recent-model/);
-  assert.match(html, /source-badge/);
-  assert.match(html, /source-badge\.claudecode/);
-  assert.match(html, /source-badge\.codex/);
-  assert.match(html, /source-badge\.opencode/);
-  assert.match(html, /source-badge\.other/);
+  assert.match(html, /\.source-icon \{/);
+  for (const source of ["claudecode", "codex", "opencode", "pi", "cline", "kilocode", "qwencode", "crush", "zed", "browser", "other"]) {
+    assert.match(html, new RegExp(`\\.source-icon\\.${source} \\{ background-image: url\\("data:image/(svg\\+xml|png;base64),`));
+  }
   assert.match(html, /status-badge/);
   assert.match(html, /width: 260px/);
   assert.match(html, /color: #2f5cb8/);
-  assert.match(html, /color: #1f1f1f/);
-  assert.match(html, /getSourceBadgeLabel/);
+  assert.match(html, /getSourceIconKey/);
   assert.match(html, /getStatusLabel/);
-  assert.match(html, /return "CC"/);
-  assert.match(html, /return "Codex"/);
-  assert.match(html, /return "OpenCode"/);
-  assert.match(html, /return "Other"/);
+  assert.match(html, /const SOURCE_LABELS = \{"claudecode":"Claude Code","codex":"Codex",.*"browser":"浏览器","other":"其他客户端"\}/);
   assert.match(html, /return T.statusSuccess/);
   assert.match(html, /return T.statusFailure/);
   assert.match(html, /return T.statusInProgress/);
   assert.match(html, /titleRow\.className = "recent-title-row"/);
   assert.match(html, /title\.className = "recent-title"/);
-  assert.match(html, /sourceBadge\.className = "source-badge " \+ item\.source/);
+  assert.match(html, /sourceIcon\.className = "source-icon " \+ sourceKey/);
+  assert.match(html, /sourceIcon\.setAttribute\("aria-label", SOURCE_LABELS\[sourceKey\]\)/);
   assert.match(html, /statusBadge\.className = getStatusBadgeClass\(item\)/);
   assert.match(html, /actualModel\.textContent = "-> " \+ \(item\.actualModel \|\| "-"\)/);
   assert.match(html, /meta\.textContent = item\.path \+ " · " \+ formatRecentTime\(item\.createdAt\)/);
@@ -7124,9 +7270,9 @@ run("admin page relies on server cookie auth instead of client-side token storag
   assert.match(html, /function bindExpressionField/);
   assert.match(html, /bindExpressionField\(grid, model, "body_expression"/);
   assert.match(html, /bindExpressionField\(grid, model, "response_expression"/);
-  assert.match(html, /"bodyExpression", "responseExpression", "auth_token"\]\)/);
-  assert.match(html, /bindAuthTokenField\(grid, model, T\.modelAuthTokenHelper\)/);
-  assert.match(html, /bindAuthTokenField\(grid, group, T\.groupAuthTokenHelper\)/);
+  assert.match(html, /"bodyExpression", "responseExpression"\]\)/);
+  assert.doesNotMatch(html, /auth_token|bindAuthTokenField/);
+  assert.match(html, /href="\/tokens"/);
   assert.match(html, /function attachCardDrag/);
   assert.match(html, /attachCardDrag\(card, head, "provider", \(\) => formState\.providers, provider\)/);
   assert.match(html, /attachCardDrag\(card, head, "model", \(\) => formState\.models, model\)/);
@@ -7620,86 +7766,6 @@ await runAsync("auth middleware rejects unauthenticated requests when token is c
   const healthResponse = await app.request("http://localhost/health");
   assert.equal(healthResponse.status, 200);
   assert.deepEqual(await healthResponse.json(), { ok: true });
-});
-
-const SCOPED_AUTH_CONFIG = `
-server:
-  auth:
-    token: admin-token
-models:
-  - name: m1
-    provider: openai-chat
-    base_url: https://example.com/v1
-    api_key: k
-    model: m1
-    auth_token: m1-token
-  - name: m2
-    provider: anthropic
-    base_url: https://example.com/v1
-    api_key: k
-    model: m2
-  - name: wild-*
-    provider: openai-chat
-    base_url: https://example.com/v1
-    api_key: k
-    model: "*"
-    auth_token: \${NANOLLM_TEST_WILD_TOKEN}
-fallback:
-  plain: [m1, m2]
-  team:
-    models: [m1, m2]
-    auth_token: team-token
-`;
-
-run("config parses model and fallback group auth tokens in both fallback forms", () => {
-  process.env.NANOLLM_TEST_WILD_TOKEN = "wild-token";
-  const config = parseConfigText(SCOPED_AUTH_CONFIG);
-  assert.equal(config.models[0].auth_token, "m1-token");
-  assert.equal("auth_token" in config.models[1], false);
-  assert.equal(config.models[2].auth_token, "wild-token");
-  assert.deepEqual(config.fallback, { plain: ["m1", "m2"], team: ["m1", "m2"] });
-  assert.deepEqual(config.fallback_auth_tokens, { team: "team-token" });
-  assert.equal(parseConfigText("models: []\nfallback: {}\n").fallback_auth_tokens, undefined);
-  assert.throws(() => parseConfigText(`
-models:
-  - { name: m1, provider: openai-chat, base_url: https://example.com/v1, api_key: k, model: m1 }
-fallback:
-  team: { auth_token: t }
-`), /Fallback group 'team' must be a non-empty model array/);
-});
-
-run("model access allows the admin token and each name's own token only", () => {
-  process.env.NANOLLM_TEST_WILD_TOKEN = "wild-token";
-  const config = parseConfigText(SCOPED_AUTH_CONFIG);
-  const cases: Array<[string, string | undefined, boolean]> = [
-    ["m1", "admin-token", true], ["m1", "m1-token", true], ["m1", "team-token", false], ["m1", undefined, false],
-    ["m2", "admin-token", true], ["m2", "m1-token", false], ["m2", "team-token", false],
-    ["team", "admin-token", true], ["team", "team-token", true], ["team", "m1-token", false],
-    ["plain", "admin-token", true], ["plain", "m1-token", false], ["plain", "team-token", false],
-    ["wild-x", "wild-token", true], ["wild-x", "m1-token", false],
-    ["unknown", "m1-token", false], ["unknown", "admin-token", true],
-  ];
-  for (const [name, token, expected] of cases) {
-    assert.equal(canAccessModel(config, name, token), expected, `${name} with ${token}`);
-  }
-  assert.deepEqual(getAccessibleModelNames(config, "team-token"), ["team"]);
-  assert.deepEqual(getAccessibleModelNames(config, "m1-token"), ["m1"]);
-  assert.deepEqual(getAccessibleModelNames(config, "admin-token"), ["plain", "team", "m1", "m2", "wild-*"]);
-  assert.equal(isScopedToken(config, "m1-token"), true);
-  assert.equal(isScopedToken(config, "team-token"), true);
-  assert.equal(isScopedToken(config, "admin-token"), false);
-  assert.equal(isScopedToken(config, undefined), false);
-});
-
-run("model access keeps names with their own token locked without an admin token", () => {
-  const config = parseConfigText(SCOPED_AUTH_CONFIG.replace("  auth:\n    token: admin-token\n", ""));
-  assert.equal(config.auth, undefined);
-  assert.equal(canAccessModel(config, "m2", undefined), true);
-  assert.equal(canAccessModel(config, "plain", undefined), true);
-  assert.equal(canAccessModel(config, "m1", undefined), false);
-  assert.equal(canAccessModel(config, "m1", "m1-token"), true);
-  assert.equal(canAccessModel(config, "team", "m1-token"), false);
-  assert.deepEqual(getAccessibleModelNames(config, undefined), ["plain", "m2"]);
 });
 
 run("request token comes from bearer first, then x-api-key", () => {

@@ -36,13 +36,72 @@ export type OpenAIChatStreamChunk = Omit<ChatCompletionChunk, "usage"> & { usage
 
 export type NormalizedRole = "system" | "developer" | "user" | "assistant" | "tool" | "function";
 
+/** A web citation on a text part: Anthropic web_search_result_location or Responses url_citation. */
+export interface NormalizedCitation {
+  url: string;
+  title?: string | null;
+  /** Anthropic: up to 150 characters quoted from the source. */
+  citedText?: string;
+  /** Anthropic: opaque reference that only the issuing account can verify. */
+  encryptedIndex?: string;
+  /** Responses: code-point range of the citation within this text part. */
+  startIndex?: number;
+  endIndex?: number;
+}
+
+export type NormalizedWebSearchAction =
+  | { type: "search"; queries: string[] }
+  | { type: "open_page"; url: string }
+  | { type: "find_in_page"; url: string; pattern: string };
+
+export interface NormalizedWebSearchSource {
+  url: string;
+  title?: string | null;
+  pageAge?: string | null;
+}
+
+/**
+ * One native web search call and its result. `origin` is the protocol that ran it; `native` keeps that
+ * protocol's original data (Anthropic blocks or a Responses web_search_call item) so it can be replayed
+ * exactly to the same protocol. Other protocols get a degraded form (see converters/web-search).
+ */
+export interface NormalizedWebSearch {
+  type: "web_search";
+  id: string;
+  origin: "anthropic" | "openai-responses";
+  action: NormalizedWebSearchAction;
+  status: "completed" | "failed" | "in_progress";
+  sources: NormalizedWebSearchSource[];
+  errorCode?: string;
+  native?: { blocks: unknown[] } | { item: Record<string, unknown> };
+  /**
+   * Only carries the native result block of a search shown earlier (an Anthropic result that arrives
+   * in a later turn, after a client tool call). The earlier part already holds the readable result,
+   * so degraded forms skip this one.
+   */
+  continuation?: boolean;
+}
+
 export type NormalizedPart =
-  | { type: "text"; text: string; cacheControl?: { type: "ephemeral" } }
+  | { type: "text"; text: string; cacheControl?: { type: "ephemeral" }; citations?: NormalizedCitation[] }
   | { type: "refusal"; text: string }
   | { type: "thinking"; thinking: string; signature?: string }
   | { type: "redacted_thinking"; data: string; origin?: "anthropic" | "openai-responses" }
   | { type: "image_url"; url: string; detail?: "auto" | "low" | "high"; cacheControl?: { type: "ephemeral" } }
-  | { type: "input_audio"; data: string; format: "mp3" | "wav" };
+  | { type: "input_audio"; data: string; format: "mp3" | "wav" }
+  | NormalizedWebSearch;
+
+export interface NormalizedWebSearchTool {
+  kind: "web_search";
+  name: "web_search";
+  allowedDomains?: string[];
+  blockedDomains?: string[];
+  userLocation?: { city?: string | null; region?: string | null; country?: string | null; timezone?: string | null };
+  maxUses?: number;
+  searchContextSize?: "low" | "medium" | "high";
+  /** Responses: false means cache-only search. */
+  externalWebAccess?: boolean;
+}
 
 export type NormalizedTool =
   | {
@@ -57,13 +116,14 @@ export type NormalizedTool =
       name: string;
       description?: string | null;
       format?: unknown;
-    };
+    }
+  | NormalizedWebSearchTool;
 
 export type NormalizedToolChoice =
   | { type: "auto"; disableParallel?: boolean }
   | { type: "required"; disableParallel?: boolean }
   | { type: "none" }
-  | { type: "tool"; name: string; kind: "function" | "custom"; disableParallel?: boolean };
+  | { type: "tool"; name: string; kind: "function" | "custom" | "web_search"; disableParallel?: boolean };
 
 export type NormalizedToolCall =
   | { kind: "function"; id: string; name: string; payload: string }

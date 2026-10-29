@@ -43,7 +43,7 @@ nanollm is a `litellm`-like proxy for LLM APIs. It stays small and runs locally,
 - **Request rewriting**: modify request `headers` and `body` (the body is deep-merged), or use `body_expression` / `response_expression` for dynamic rewriting.
 - **Fallback groups**: if the model you call fails upstream and belongs to a fallback group, the other members of the group are tried.
 - **Subscription providers**: use an OpenAI Codex subscription or a Claude Pro/Max subscription as a provider after logging in from the admin page.
-- **Hot reload and admin page**: `/admin` is a form-based config editor with model connectivity tests and upstream model listing. `models`, `fallback`, `server.ttfb_timeout` and `record.max_size` apply immediately after saving; `server.port` and `server.auth.token` are written back and need a restart.
+- **Hot reload and admin page**: `/admin` is a form-based config editor with model connectivity tests and upstream model listing. `models`, `fallback`, `server.ttfb_timeout`, `record.max_size` and `record.skip_when` apply immediately after saving; `server.port` and `server.auth.token` are written back and need a restart.
 - **Monitoring and usage**: `/status` shows model health and daily token usage; `/record` keeps recent requests and can replay them, which is very useful for debugging.
 - **Scheduled model jobs**: `/jobs` calls several models on a cron schedule, stores the outputs, and supports history comparison and manual review.
 - **Optional persistence**: in-memory by default; `--storage sqlite` uses a local SQLite file or a remote libSQL/quicSQL service.
@@ -98,6 +98,7 @@ server:
 
 record:
   max_size: 100 # optional, default 10
+  skip_when: "model === 'cheap-model'" # optional, matching requests are not recorded
 
 providers:
   # Shared provider: keeps protocol, URL and API key in one place.
@@ -295,37 +296,36 @@ http://localhost:3000/admin
 http://localhost:3000/status
 http://localhost:3000/record
 http://localhost:3000/jobs
+http://localhost:3000/tokens
 ```
 
 Without a configured password, pages remain open. When authentication is enabled, unsigned visitors are redirected to `/login`; enter the access password configured through `server.auth.token` or `NANOLLM_AUTH_TOKEN` to return to the original page. URL query tokens (`?token=`) no longer authenticate requests, so old links also redirect to login when no valid cookie is present.
 
 Successful login (or Bearer authentication) sets a same-origin `HttpOnly` auth cookie lasting 90 days, renewed on successful access, with `Secure` enabled over HTTPS. The browser automatically sends this cookie for later visits and page requests. Expired cookies or password changes send WebUI users back to login; API clients still receive a standard `401 Unauthorized` response.
 
-### Model and group access tokens
+### Client tokens
 
-To give a client access to a single model or fallback group without sharing the admin token, set `auth_token` on the model or the group. A fallback group takes the object form to carry one; the plain array form still works:
+To give a client its own key without sharing the admin token, add it to the top-level `tokens` list. Each token lists the model names the client may send under `available_models`, and maps each one to a model or fallback group in this config:
 
 ```yaml
-models:
-  - name: gpt-5.4-a
-    # ...
-    auth_token: ${TEAM_A_TOKEN}
-fallback:
-  gpt-5.4:                # existing array form, unchanged
-    - gpt-5.4-a
-    - gpt-5.4-b
-  gpt-5.4-team:           # object form, only needed to carry a token
-    models:
-      - gpt-5.4-a
-      - gpt-5.4-b
-    auth_token: ${TEAM_B_TOKEN}
+tokens:
+  - name: team-a              # optional label shown on /tokens
+    value: ${TEAM_A_TOKEN}
+    available_models:
+      - gpt-5.4: gpt-5.4-team # the client sends "gpt-5.4", nanollm routes it to the "gpt-5.4-team" group
+      - fast: gpt-5.4-a
+      - gpt-5.4-b             # short for "gpt-5.4-b: gpt-5.4-b"
+      - claude-*: wild-*      # prefix mapping: "claude-x" routes to "wild-x"
 ```
 
-- A token only works with the exact name it is attached to. `TEAM_A_TOKEN` can call `gpt-5.4-a`; `TEAM_B_TOKEN` can call `gpt-5.4-team` (which still falls back through every member) but not `gpt-5.4-a` or `gpt-5.4-b` by name.
-- The admin token (`server.auth.token`) can always call every model and group.
-- A model or group without its own `auth_token` is reachable with the admin token only, or by anyone when no admin token is configured. A model or group *with* its own `auth_token` stays locked even when no admin token is configured.
-- These tokens only reach the model APIs (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/images/*`, `/v1/alpha/search`) and `/v1/models`, which lists only the names the token can use. Pages, `/admin`, `/record`, `/status` and `/jobs` still need the admin token, and no login cookie is set. A disallowed model returns `403`.
-- Clients send them the same way as the admin token (`Authorization: Bearer` or `x-api-key`). Model and group tokens hot-reload with `models` and `fallback`, and support `${ENV_VAR}`. The `/admin` page has an `auth_token` field with a "Generate" button on each model and group.
+- A token can only use the names listed under it, mapped to their targets. `TEAM_A_TOKEN` can call `fast` (routed to `gpt-5.4-a`) but not `gpt-5.4-a` by name.
+- A name ending in `*` maps a prefix; if the target ends in `*` too (a wildcard model), the rest of the name carries over. Exact names win over prefixes, and longer prefixes over shorter ones.
+- The admin token (`server.auth.token`) can always call every model and group by its own name.
+- Without an admin token, models and groups that no token maps to are open to everyone; the ones a token maps to can only be used with a token.
+- Tokens only reach the model APIs (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/images/*`, `/v1/alpha/search`) and `/v1/models`, which lists the names the token can use. Pages, `/admin`, `/record`, `/status`, `/jobs` and `/tokens` still need the admin token, and no login cookie is set. A disallowed model returns `403`.
+- Clients send them the same way as the admin token (`Authorization: Bearer` or `x-api-key`). Tokens hot-reload and support `${ENV_VAR}`.
+- The `/tokens` page creates, generates and edits tokens and their models, and saves them to `config.yaml`. A token that points at a model or group that no longer exists makes the config invalid, so update the token when you rename or delete one on `/admin`.
+- Older configs that put `auth_token` on a model or a fallback group are migrated when nanollm loads `config.yaml`: each distinct token becomes a `tokens` entry that maps the names it opened to themselves, fallback groups go back to the plain list form, and the file is saved.
 
 ### Dynamic request body expression
 
@@ -531,7 +531,7 @@ A local configuration page at `http://localhost:3000/admin`.
 - Shortcuts lead to `/status` and `/record` so you can check model health and recent requests after saving.
 - "Discard unsaved changes" drops your edits; "Refresh from server" reloads the file if it was changed externally.
 - Saving converts the form into YAML, validates it and writes the config file atomically.
-- `models`, `fallback`, `server.ttfb_timeout` and `record.max_size` hot-reload for new requests; `server.port` and `server.auth.token` are written back but need a restart.
+- `models`, `fallback`, `server.ttfb_timeout`, `record.max_size` and `record.skip_when` hot-reload for new requests; `server.port` and `server.auth.token` are written back but need a restart.
 - Advanced fields on existing models that are not shown in the form are preserved on save.
 - If you edit `config.yaml` by hand, nanollm detects and loads the change. Invalid content is rejected: the last valid config stays active and the error is shown in the admin page.
 
@@ -548,6 +548,22 @@ By default this data lives in memory and disappears when the process exits. With
 `http://localhost:3000/record` lists sampled requests and is very useful for debugging. By default only the latest 10 requests are kept; change it with `record.max_size`. A recorded request can be replayed (sensitive client headers are not replayed, and provider authentication uses the current config).
 
 Images in requests (`data:image/...;base64,...`) are stored once per content hash. The record page shows image references and sizes, and replay restores the original images, so a multi-turn tool conversation that keeps carrying the same image stores it only once. Copy a `__nanollm_record_image_ref` value and open `GET /record/images/{hash}` to view the original; that endpoint uses the same authentication as `/record`. With `--storage sqlite` the latest `record.max_size` records are persisted.
+
+`record.skip_when` is an optional JS expression evaluated once per client request, before routing. When it returns a truthy value, the request is not recorded at all, so it takes no slot of `record.max_size` and writes nothing to the record table (useful with a remote SQLite such as Turso). `/status` and usage stats still count it. The expression receives:
+
+- `body`: the client request body (read-only)
+- `model`: the requested model or fallback group name (`body.model`)
+- `headers`: the client request headers, including the real `authorization` / `x-api-key` values. Names are case-insensitive: `headers['authorization']` and `headers.Authorization` both match whatever casing the client sent
+- `path`: the request path, e.g. `/v1/messages`
+
+```yaml
+record:
+  skip_when: |
+    model === 'cheap-model' || model === 'batch-group'
+      || headers['authorization']?.endsWith('-nolog')
+```
+
+The expression runs with a 100 ms timeout. If it throws, times out or returns a Promise, the request is recorded and the error is logged. A syntax error is rejected when the config is loaded. On `/admin` the field is in the collapsed Advanced section at the bottom.
 
 ### Scheduled model jobs: `/jobs`
 

@@ -15,6 +15,7 @@ src/
   subscriptions/     Codex / Claude OAuth subscription providers
   storage/           SQLite access, request records, status buckets, usage stats
   jobs/              Scheduled model jobs (jobs.yaml, scheduler, executor, routes, page)
+  tokens/            Client token management page and routes (the `tokens` list in config.yaml)
   pages/             Server-rendered HTML pages (admin config, record, status, usage)
 scripts/             Storage migration and maintenance scripts (do not import src/)
 tests/               Test entrypoints (compiled to .test-dist/ by tsconfig.build.json)
@@ -23,7 +24,7 @@ docs/                Reference docs
 
 ## Request flow
 
-1. `server.ts` authenticates the request (`core/web-auth`, `core/auth`): the admin token opens everything; a model or fallback group `auth_token` passes the middleware only on model routes, and the route then checks it against the requested model name (`canAccessModel`). It then resolves the model and fallback group (`core/config`, `proxy/fallback`) and binds a request context (`core/request-context`).
+1. `server.ts` authenticates the request (`core/web-auth`, `core/auth`): the admin token opens everything; a client token from `tokens` passes the middleware only on model routes, and the route then maps the requested name to a model or fallback group through that token's `available_models` (`resolveModelAccess`). In-process calls (jobs, replay, model test) skip that check. It then resolves the model and fallback group (`core/config`, `proxy/fallback`) and binds a request context (`core/request-context`).
 2. The request body is normalized and re-encoded for the upstream format (`converters/requests`).
 3. `proxy/proxy` calls the upstream. Subscription providers obtain tokens and headers through `subscriptions/*`.
 4. The response (or SSE stream) is converted back (`converters/responses`, `converters/streams`) and returned, with errors shaped by `core/error-details` and `core/stream-errors`.
@@ -34,19 +35,21 @@ docs/                Reference docs
 
 | Module | Files | Responsibility |
 |---|---|---|
-| `core` | `config`, `config-manager`, `auth`, `request-context`, `session-id`, `shutdown`, `startup-error`, `error-details`, `http-log`, `response-compression`, `stream-errors`, `i18n` | YAML config parsing and hot reload, bearer / `x-api-key` auth and per-model access tokens, per-request context, session id derivation, graceful shutdown, error formatting, response compression, page language selection and switch, web UI request language for server messages (`localize`) |
-| `converters` | `shared`, `requests`, `responses`, `streams`, `index` (+ `test`, `testres`) | Normalized types and the three-way protocol conversion. See [converters.md](converters.md) |
-| `proxy` | `proxy`, `fallback`, `response-cache`, `model-test`, `upstream-models` | Upstream HTTP calls, fallback-group failure tracking and ordering, in-memory cache of Responses API output items (resolves `item_reference`), model test request builder, upstream model listing |
+| `core` | `config`, `config-manager`, `token-migration`, `auth`, `request-context`, `session-id`, `shutdown`, `startup-error`, `error-details`, `http-log`, `response-compression`, `stream-errors`, `i18n`, `record-rule` | YAML config parsing and hot reload, the `record.skip_when` expression that keeps matching requests out of the records, bearer / `x-api-key` auth and client tokens (`tokens`, with the startup migration of the old per-model `auth_token`), per-request context, session id derivation, graceful shutdown, error formatting, response compression, page language selection and switch, web UI request language for server messages (`localize`) |
+| `converters` | `shared`, `requests`, `responses`, `streams`, `web-search`, `index` (+ `test`, `testres`) | Normalized types and the three-way protocol conversion; `web-search` holds native web search conversion. See [converters.md](converters.md) |
+| `proxy` | `proxy`, `fallback`, `response-cache`, `model-test`, `upstream-models`, `reasoning-history`, `pause-turn`, `thinking-binding` | Upstream HTTP calls, fallback-group failure tracking and ordering, in-memory cache of Responses API output items (resolves `item_reference`), model test request builder, upstream model listing, replayed-thinking rules per upstream, resuming a paused Claude turn, retrying a rejected thinking binding |
 | `subscriptions` | `openai-subscription`, `claude-subscription`, `claude-subscription-body`, `claude-billing`, `codex-version`, `subscription-client-compat`, `oauth-transport` | OAuth credential storage/refresh, client identity constants, Claude body transform, Rust helper transport |
 | `storage` | `sqlite`, `record`, `status`, `usage` | libsql client with write queue, request records, status buckets, usage by day |
 | `jobs` | `jobs`, `job-run-store`, `job-executor`, `job-scheduler`, `job-routes`, `job-model-catalog`, `jobs-page` | Job config store, run history, executor, cron scheduler, HTTP routes, model name resolution, page |
-| `pages` | `admin-config-page`, `admin-config-form`, `record-page`, `status-page`, `usage-page`, `logo` | HTML renderers, admin form payload handling, and the shared logo/favicon (`assets/logo.svg`) |
+| `tokens` | `tokens`, `token-routes`, `tokens-page` | The /tokens page: reads and rewrites the `tokens` list of config.yaml, HTTP routes, page |
+| `pages` | `admin-config-page`, `admin-config-form`, `record-page`, `status-page`, `usage-page`, `logo`, `source-icons` | HTML renderers, admin form payload handling, the shared logo/favicon (`assets/logo.svg`), and the client logos shown on records |
 
 ## Dependency rules
 
 ```
 pages ──► storage, core
 jobs ──► proxy, storage, core, converters
+tokens ──► core
 proxy ──► subscriptions, converters, storage, core
 subscriptions ──► core, proxy/upstream-models
 storage ──► core, converters/shared
@@ -65,7 +68,7 @@ core ──► (nothing)
 
 ## Tests
 
-- `tests/run.ts` is the main suite. `tests/jobs.ts`, `tests/subscription-proxy.ts`, `tests/storage-migration.ts` and `tests/shutdown.ts` use `node:test`. New test files must be added to the `test` script in `package.json`.
+- `tests/run.ts` is the main suite. `tests/jobs.ts`, `tests/subscription-proxy.ts`, `tests/storage-migration.ts`, `tests/shutdown.ts` and `tests/record-rule.ts` use `node:test`. New test files must be added to the `test` script in `package.json`.
 - `npm run converter:test` runs the converter suite in `src/converters/test.ts`.
 
 ## How to extend

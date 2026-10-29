@@ -46,7 +46,7 @@ export interface RecordedAttempt {
   };
 }
 
-export type RequestSource = "claudecode" | "codex" | "opencode" | "other";
+export type RequestSource = "claudecode" | "codex" | "opencode" | "pi" | "cline" | "kilocode" | "qwencode" | "crush" | "zed" | "browser" | "other";
 export type RequestStatus = "in_progress" | "success" | "failure";
 
 export interface RecordEntry {
@@ -158,10 +158,20 @@ function classifyRequestSource(headers: Headers | Record<string, string> | undef
   const userAgent = typeof (headers as Headers).get === "function"
     ? (headers as Headers).get("user-agent")
     : Object.entries(headers).find(([key]) => key.toLowerCase() === "user-agent")?.[1];
-  const normalized = userAgent?.toLowerCase() ?? "";
+  const normalized = userAgent?.trim().toLowerCase() ?? "";
+  // pi signed in with a Claude subscription sends `claude-cli/…` too, so it shows as Claude Code then.
   if (normalized.includes("claude-cli")) return "claudecode";
   if (normalized.includes("codex")) return "codex";
+  // Kilo Code is built on OpenCode, so it goes first.
+  if (normalized.includes("kilo-code/")) return "kilocode";
   if (normalized.includes("opencode")) return "opencode";
+  if (/^pi(\/|$)/.test(normalized)) return "pi";
+  if (normalized.startsWith("cline/")) return "cline";
+  if (normalized.startsWith("qwencode/")) return "qwencode";
+  if (normalized.startsWith("charm-crush/")) return "crush";
+  if (normalized.startsWith("zed/")) return "zed";
+  // Electron apps send a browser-like user agent but aren't browsers.
+  if (/^mozilla\/5\.0 /.test(normalized) && /\b(chrome|firefox|safari)\//.test(normalized) && !normalized.includes("electron/")) return "browser";
   return "other";
 }
 

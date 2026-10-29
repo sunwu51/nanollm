@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { JobModelCatalog } from "./src/jobs/job-model-catalog.js";
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { Hono } from "hono";
@@ -9,14 +9,14 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { Server as HttpServer } from "node:http";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
-import { randomUUID } from "node:crypto";
 import type { ModelConfig, ServerConfig } from "./src/core/config.js";
 import { getRequestAuthToken, webAuth } from "./src/core/web-auth.js";
-import { canAccessModel, getAccessibleModelNames, isScopedToken } from "./src/core/auth.js";
+import { getAccessibleModelNames, isScopedToken, listAccessibleModels, resolveInternalModelName, resolveModelAccess } from "./src/core/auth.js";
 import { localize, resolveLang, runWithLang } from "./src/core/i18n.js";
 import { withWebUIAuth } from "./src/pages/login-page.js";
-import { getModelAuthToken, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
-import { ConfigManager } from "./src/core/config-manager.js";
+import { parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
+import { ConfigManager, writeFileAtomic } from "./src/core/config-manager.js";
+import { shouldSkipRecord } from "./src/core/record-rule.js";
 import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy/proxy.js";
 import { forwardRequest, forwardStreamRequest, passthroughAlphaSearchRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, type OpenAIImageOperation } from "./src/proxy/proxy.js";
 import { FallbackFailureTracker, sortFallbackGroupMembers } from "./src/proxy/fallback.js";
@@ -71,6 +71,8 @@ import { JobScheduler } from "./src/jobs/job-scheduler.js";
 import { createModelRequestExecutor } from "./src/jobs/job-executor.js";
 import { createJobRoutes } from "./src/jobs/job-routes.js";
 import { renderJobsPage } from "./src/jobs/jobs-page.js";
+import { createTokenRoutes } from "./src/tokens/token-routes.js";
+import { renderTokensPage } from "./src/tokens/tokens-page.js";
 import { openSqliteStorage, waitForClientWrites } from "./src/storage/sqlite.js";
 import { buildAdminConfigForm, buildAdminConfigFormFromEffectiveConfig, buildYamlTextFromAdminForm, type AdminConfigForm } from "./src/pages/admin-config-form.js";
 import { extractErrorCauses, formatErrorWithCauses } from "./src/core/error-details.js";
@@ -204,7 +206,7 @@ app.use("*", async (c, next) => {
 });
 
 app.use("*", async (c, next) => {
-  if (c.req.path.startsWith("/admin/") || c.req.path === "/jobs" || c.req.path.startsWith("/jobs/")) {
+  if (c.req.path.startsWith("/admin/") || /^\/(jobs|tokens)(\/|$)/.test(c.req.path)) {
     return next();
   }
   return apiCors(c, next);
@@ -215,9 +217,9 @@ app.use("*", webAuth(
   (candidate) => isScopedToken(configManager.getActiveSnapshot().effectiveConfig, candidate),
 ));
 
-// Errors from the admin and jobs APIs are shown in the web UI, so they follow the page language.
+// Errors from the admin, jobs and tokens APIs are shown in the web UI, so they follow the page language.
 app.use("*", async (c, next) => {
-  if (c.req.path.startsWith("/admin/") || c.req.path.startsWith("/jobs/")) {
+  if (c.req.path.startsWith("/admin/") || c.req.path.startsWith("/jobs/") || c.req.path.startsWith("/tokens/")) {
     return runWithLang(pageLang(c), next);
   }
   return next();
@@ -248,11 +250,9 @@ const jobRequestExecutor = createModelRequestExecutor(async (model, request, sig
   const requestId = getRequestId() ?? createRequestId();
   const headers = new Headers({ "content-type": "application/json" });
   if (!model.subscription_provider && !model.claude_subscription_provider) headers.set("user-agent", "nanollm-scheduled-job");
-  const authToken = internalAuthToken(config, model.name);
-  if (authToken) headers.set("authorization", `Bearer ${authToken}`);
   jobRequestModels.set(requestId, model);
   try {
-    return await app.fetch(new Request(`http://127.0.0.1:${config.port}${request.path}`, { method: "POST", headers, body: JSON.stringify(request.body), signal }));
+    return await app.fetch(internalRequest(config, request.path, { method: "POST", headers, body: JSON.stringify(request.body), signal }));
   } finally {
     jobRequestModels.delete(requestId);
   }
@@ -265,12 +265,6 @@ const jobScheduler = new JobScheduler(jobConfigStore, jobRunStore,
 await jobScheduler.initialize();
 const ORANGE = "\x1b[38;5;214m";
 const RESET = "\x1b[0m";
-
-function writeConfigAtomic(path: string, text: string) {
-  const tempPath = `${path}.${randomUUID()}.tmp`;
-  writeFileSync(tempPath, text, "utf-8");
-  renameSync(tempPath, path);
-}
 
 function getNormalizer(format: StreamFormat): Normalizer {
   switch (format) {
@@ -344,14 +338,33 @@ function orange(message: string): string {
   return `${ORANGE}${message}${RESET}`;
 }
 
-/** Token for in-process calls (jobs, replay, model test): the admin token, else the target's own token. */
-function internalAuthToken(config: ServerConfig, modelName: string | undefined): string | undefined {
-  return config.auth?.token ?? (modelName ? getModelAuthToken(config, modelName) : undefined);
+// In-process calls (jobs, replay, model test) skip the per-token model check; see routeModelRequest.
+const internalRequests = new WeakSet<Request>();
+
+/** A request to the app's own routes. It carries the admin token (if any) to pass the auth middleware. */
+function internalRequest(config: ServerConfig, path: string, init: RequestInit & { headers: Headers }): Request {
+  if (config.auth?.token) init.headers.set("authorization", `Bearer ${config.auth.token}`);
+  const request = new Request(`http://127.0.0.1:${config.port}${path}`, init);
+  internalRequests.add(request);
+  return request;
 }
 
-/** Rejects a request whose token can't reach the named model or group; records the rejection if one is being recorded. */
-function rejectModelAccess(c: Context, config: ServerConfig, modelName: string): Response | undefined {
-  if (canAccessModel(config, modelName, getRequestAuthToken(c, config.auth?.token))) return undefined;
+/** Starts the record for a client request, unless it matches `record.skip_when`; status and usage are counted either way. */
+function beginClientRecord(c: Context, config: ServerConfig, requestId: string, body: unknown, stream: boolean) {
+  const headers = c.req.raw.headers;
+  if (shouldSkipRecord(config.record.skip_when, { path: c.req.path, headers, body })) return;
+  beginRecordedRequest({ requestId, path: c.req.path, headers, body, stream });
+}
+
+/**
+ * The public model or group name the requested name routes to (a client token maps its own names),
+ * or a 403 response when the token can't use it; the rejection is recorded if the request is being recorded.
+ */
+function routeModelRequest(c: Context, config: ServerConfig, modelName: string): string | Response {
+  const routed = internalRequests.has(c.req.raw)
+    ? resolveInternalModelName(config, modelName)
+    : resolveModelAccess(config, modelName, getRequestAuthToken(c, config.auth?.token));
+  if (routed !== undefined) return routed;
   const errorBody = { error: `This token is not allowed to use model '${modelName}'` };
   const response = c.json(errorBody, 403);
   if (getRequestId()) {
@@ -479,7 +492,7 @@ const REPLAY_HEADER_OVERRIDES = new Set([
   "x-nanollm-replay-of",
 ]);
 
-function buildReplayHeaders(record: RecordEntry, authToken?: string): Headers {
+function buildReplayHeaders(record: RecordEntry): Headers {
   const headers = new Headers();
   for (const [key, value] of Object.entries(record.clientRequest.headers ?? {})) {
     const normalized = key.toLowerCase();
@@ -491,9 +504,6 @@ function buildReplayHeaders(record: RecordEntry, authToken?: string): Headers {
     headers.set("content-type", "application/json");
   }
   headers.set("x-nanollm-replay-of", record.requestId);
-  if (authToken) {
-    headers.set("authorization", `Bearer ${authToken}`);
-  }
   return headers;
 }
 
@@ -515,9 +525,8 @@ async function replayRecordedRequest(record: RecordEntry, config: ServerConfig) 
   }
 
   const replayRequestId = createRequestId();
-  const recordedModel = (record.clientRequest.body as { model?: unknown } | undefined)?.model;
-  const headers = buildReplayHeaders(record, internalAuthToken(config, typeof recordedModel === "string" ? recordedModel : undefined));
-  const response = await runWithRequestId(replayRequestId, async () => app.fetch(new Request(`http://127.0.0.1:${config.port}${path}`, {
+  const headers = buildReplayHeaders(record);
+  const response = await runWithRequestId(replayRequestId, async () => app.fetch(internalRequest(config, path, {
     method: "POST",
     headers,
     body: JSON.stringify(record.clientRequest.body ?? {}),
@@ -549,12 +558,10 @@ async function testConfiguredModel(name: string, message: string, config: Server
   if (!model.subscription_provider && !model.claude_subscription_provider) {
     headers.set("user-agent", "nanollm-admin-model-test");
   }
-  const authToken = internalAuthToken(config, model.name);
-  if (authToken) headers.set("authorization", `Bearer ${authToken}`);
 
   const requestId = createRequestId();
   const started = Date.now();
-  const response = await runWithRequestId(requestId, async () => app.fetch(new Request(`http://127.0.0.1:${config.port}${path}`, {
+  const response = await runWithRequestId(requestId, async () => app.fetch(internalRequest(config, path, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
@@ -718,15 +725,7 @@ function createRoute(incomingFormat: StreamFormat) {
     const modelName = extractModel(rawBody);
     const stream = isStreamRequest(rawBody);
     const requestId = getRequestId();
-    if (requestId) {
-      beginRecordedRequest({
-        requestId,
-        path: c.req.path,
-        headers: c.req.raw.headers,
-        body: rawBody,
-        stream,
-      });
-    }
+    if (requestId) beginClientRecord(c, config, requestId, rawBody, stream);
 
     if (!modelName) {
       const response = c.json({ error: "Missing 'model' in request body" }, 400);
@@ -737,10 +736,10 @@ function createRoute(incomingFormat: StreamFormat) {
       return response;
     }
 
-    const accessDenied = rejectModelAccess(c, config, modelName);
-    if (accessDenied) return accessDenied;
+    const routedName = routeModelRequest(c, config, modelName);
+    if (routedName instanceof Response) return routedName;
 
-    const candidateModels = getCandidateModels(config, modelName);
+    const candidateModels = getCandidateModels(config, routedName);
     if (candidateModels.length === 0) {
       const errorBody = { error: `Model '${modelName}' not found in config`, available: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)) };
       const response = c.json(errorBody, 404);
@@ -764,7 +763,7 @@ function createRoute(incomingFormat: StreamFormat) {
         recordModelAttempt(modelConfig.name, requestStartedAt);
         console.log(
           withRequestId(
-            `[REQUEST] model=${modelName} path=${c.req.path} target=${getUpstreamURL(modelConfig)} candidate=${modelConfig.name}`,
+            `[REQUEST] model=${modelName}${routedName === modelName ? "" : ` routed=${routedName}`} path=${c.req.path} target=${getUpstreamURL(modelConfig)} candidate=${modelConfig.name}`,
           ),
         );
 
@@ -879,12 +878,13 @@ function createAlphaSearchRoute() {
     const rawBody = await c.req.json();
     const modelName = extractModel(rawBody);
     if (!modelName) return c.json({ error: "Missing 'model' in request body" }, 400);
-    if (!canAccessModel(config, modelName, getRequestAuthToken(c, config.auth?.token))) return c.json({ error: `This token is not allowed to use model '${modelName}'` }, 403);
-    const candidateModels = getCandidateModels(config, modelName);
+    const routedName = routeModelRequest(c, config, modelName);
+    if (routedName instanceof Response) return routedName;
+    const candidateModels = getCandidateModels(config, routedName);
     if (candidateModels.length === 0) return c.json({ error: `Model '${modelName}' not found in config`, available: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)) }, 404);
     const requestId = getRequestId();
     const stream = isStreamRequest(rawBody);
-    if (requestId) beginRecordedRequest({ requestId, path: c.req.path, headers: c.req.raw.headers, body: rawBody, stream });
+    if (requestId) beginClientRecord(c, config, requestId, rawBody, stream);
     let lastError;
     for (const [candidateIndex, modelConfig] of candidateModels.entries()) {
       const started = Date.now();
@@ -926,15 +926,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
     const { bytes, recordedBody } = await readImageRequestBody(c);
     const modelName = extractModel(recordedBody);
     const requestId = getRequestId();
-    if (requestId) {
-      beginRecordedRequest({
-        requestId,
-        path: c.req.path,
-        headers: c.req.raw.headers,
-        body: recordedBody,
-        stream: false,
-      });
-    }
+    if (requestId) beginClientRecord(c, config, requestId, recordedBody, false);
 
     if (!modelName) {
       const response = c.json({ error: "Missing 'model' in request body" }, 400);
@@ -945,10 +937,10 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
       return response;
     }
 
-    const accessDenied = rejectModelAccess(c, config, modelName);
-    if (accessDenied) return accessDenied;
+    const routedName = routeModelRequest(c, config, modelName);
+    if (routedName instanceof Response) return routedName;
 
-    const candidateModels = getCandidateModels(config, modelName);
+    const candidateModels = getCandidateModels(config, routedName);
     if (candidateModels.length === 0) {
       const errorBody = { error: `Model '${modelName}' not found in config`, available: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)) };
       const response = c.json(errorBody, 404);
@@ -967,7 +959,7 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
         recordModelAttempt(modelConfig.name, requestStartedAt);
         console.log(
           withRequestId(
-            `[REQUEST] model=${modelName} path=${c.req.path} target=${getUpstreamURL(modelConfig)} candidate=${modelConfig.name}`,
+            `[REQUEST] model=${modelName}${routedName === modelName ? "" : ` routed=${routedName}`} path=${c.req.path} target=${getUpstreamURL(modelConfig)} candidate=${modelConfig.name}`,
           ),
         );
 
@@ -1257,10 +1249,10 @@ app.get("/", (c) => {
   return c.json({
     ok: true,
     message: "nanollm gateway",
-    models: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)).map((name) => ({
+    models: listAccessibleModels(config, getRequestAuthToken(c, config.auth?.token)).map(({ name, target }) => ({
       name,
-      provider: config.fallback[name] ? "fallback-group" : resolveModel(config, name)?.provider,
-      model: config.fallback[name] ? config.fallback[name] : resolveModel(config, name)?.model,
+      provider: config.fallback[target] ? "fallback-group" : resolveModel(config, target)?.provider,
+      model: config.fallback[target] ? config.fallback[target] : resolveModel(config, target)?.model,
     })),
     endpoints: {
       health: "GET /health",
@@ -1331,6 +1323,8 @@ app.get("/admin", (c) => c.html(withWebUIAuth(renderAdminConfigPage(buildConfigA
 app.get("/jobs", (c) => c.html(withWebUIAuth(renderJobsPage(pageLang(c)))));
 app.route("/jobs/api", createJobRoutes(jobScheduler,
   () => configManager.getActiveSnapshot().effectiveConfig.models, storageMode, jobModelCatalog));
+app.get("/tokens", (c) => c.html(withWebUIAuth(renderTokensPage(pageLang(c)))));
+app.route("/tokens/api", createTokenRoutes(configManager, (text) => writeFileAtomic(configPath, text)));
 app.post("/admin/providers/:name/device-login", async (c) => {
   try {
     const provider = configManager.getActiveSnapshot().effectiveConfig.providers.find((item) => item.name === c.req.param("name"));
@@ -1475,7 +1469,7 @@ app.post("/admin/config/apply", async (c) => {
   }
 
   try {
-    writeConfigAtomic(configPath, yamlText);
+    writeFileAtomic(configPath, yamlText);
     const result = configManager.applyText(yamlText, "ui");
     return c.json({
       ok: true,
@@ -1498,10 +1492,10 @@ app.get("/v1/models", (c) => {
   const config = configManager.getActiveSnapshot().effectiveConfig;
   return c.json({
     object: "list",
-    data: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)).map((name) => ({
+    data: listAccessibleModels(config, getRequestAuthToken(c, config.auth?.token)).map(({ name, target }) => ({
       id: name,
       object: "model",
-      owned_by: config.fallback[name] ? "fallback-group" : resolveModel(config, name)?.provider,
+      owned_by: config.fallback[target] ? "fallback-group" : resolveModel(config, target)?.provider,
     })),
   });
 });

@@ -3,10 +3,28 @@ import type { ResponseStreamEvent } from "openai/resources/responses/responses";
 import type { RawMessageStreamEvent } from "@anthropic-ai/sdk/resources/messages/messages";
 import { decodeReasoningCarrier, denormalizeUsageToAnthropic, denormalizeUsageToOpenAIChat, denormalizeUsageToOpenAIResponses, encodeReasoningCarrier, encodeRedactedReasoningCarrier, isReasoningCarrier, normalizeUsage, qualifyOpenAIResponsesToolName, sanitizeAnthropicToolId, splitQualifiedOpenAIResponsesToolName, unwrapResponsesCustomToolInput, type NormalizedUsage } from "./shared.js";
 import { isResponsesCustomToolName, } from "../core/request-context.js";
+import {
+  attachAnthropicWebSearchResult,
+  denormalizeResponsesAction,
+  normalizeAnthropicCitations,
+  normalizeResponsesWebSearch,
+  responsesAnnotations,
+  startAnthropicWebSearch,
+  toAnthropicWebSearchId,
+  toResponsesWebSearchId,
+  webSearchQueryText,
+  webSearchToAnthropicBlocks,
+  webSearchToResponsesItems,
+  WEB_SEARCH_MARKER,
+  WEB_SEARCH_TOOL_NAME,
+  type AnthropicSearchIndex,
+} from "./web-search.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export type StreamFormat = "openai-chat" | "openai-responses" | "anthropic" | "openai-image";
+
+type WebSearchStreamAction = import("./shared.js").NormalizedWebSearchAction;
 
 export type NormalizedStreamEvent =
   | { type: "start"; id: string; model: string; createdAt: number }
@@ -18,6 +36,12 @@ export type NormalizedStreamEvent =
   | { type: "tool_start"; index: number; id: string; name: string; kind: "function" | "custom" }
   | { type: "tool_delta"; index: number; delta: string }
   | { type: "tool_done"; index: number }
+  // A web search began (action is known when the source streams it before running the search).
+  | { type: "web_search_start"; index: number; id: string; origin: "anthropic" | "openai-responses"; action?: WebSearchStreamAction }
+  // A web search finished (or, with status "in_progress", ended unresolved behind a client tool call).
+  | { type: "web_search_done"; index: number; search: import("./shared.js").NormalizedWebSearch }
+  // A web citation on the text block `index` (a range when the source gives one).
+  | { type: "citation"; index: number; citation: import("./shared.js").NormalizedCitation }
   | { type: "end"; finishReason: string | null; usage?: import("./shared.js").NormalizedUsage };
 
 type ParsedSSE = { event?: string; data: string };
@@ -274,6 +298,9 @@ export class ResponsesStreamParser implements StreamParser {
   private reasoningItemIndexes = new Map<string, number>();
   private emittedReasoningMetadata = new Set<number>();
   private ended = false;
+  // web_search_call output index -> normalized block index, and the ones already finished.
+  private searchBlocks = new Map<number, number>();
+  private finishedSearches = new Set<number>();
 
   parse(event: ResponseStreamEvent): NormalizedStreamEvent[] {
     const out: NormalizedStreamEvent[] = [];
@@ -299,6 +326,12 @@ export class ResponsesStreamParser implements StreamParser {
           break;
         }
         this.finishReasoningItems(out);
+        if (item.type === "web_search_call") {
+          const idx = this.nextIndex++;
+          this.searchBlocks.set(event.output_index, idx);
+          out.push({ type: "web_search_start", index: idx, id: item.id, origin: "openai-responses" });
+          break;
+        }
         if (item.type === "function_call" || item.type === "custom_tool_call") {
           this.seenToolCall = true;
           const idx = this.nextIndex++;
@@ -403,6 +436,18 @@ export class ResponsesStreamParser implements StreamParser {
         if (event.item.type === "reasoning") {
           const item = this.rememberReasoningItem(event.output_index, event.item, true);
           this.finishReasoningItem(out, event.output_index, item);
+        } else if (event.item.type === "web_search_call") {
+          this.finishSearch(out, event.output_index, event.item);
+        }
+        break;
+      }
+
+      // Citations arrive after the text they cover, with a range into it.
+      case "response.output_text.annotation.added": {
+        const annotation = event.annotation as any;
+        const idx = this.blockMapping.get(`${event.output_index}_${event.content_index}`);
+        if (idx != null && annotation?.type === "url_citation" && typeof annotation.url === "string") {
+          out.push({ type: "citation", index: idx, citation: { url: annotation.url, title: annotation.title ?? null, startIndex: annotation.start_index, endIndex: annotation.end_index } });
         }
         break;
       }
@@ -430,6 +475,10 @@ export class ResponsesStreamParser implements StreamParser {
       case "response.incomplete": {
         const r = event.response;
         this.finishResponseReasoning(out, r);
+        // A search whose done event never arrived is still in the final output.
+        r.output?.forEach((item: any, outputIndex: number) => {
+          if (item.type === "web_search_call") this.finishSearch(out, outputIndex, item);
+        });
         // Some providers return an empty output array in response.completed even when
         // tool calls were streamed earlier via response.output_item.added events.
         // Fall back to seenToolCall to avoid incorrectly emitting finishReason "stop".
@@ -463,6 +512,18 @@ export class ResponsesStreamParser implements StreamParser {
     if (!this.ended) this.finishReasoningItems(out);
     this.ended = true;
     return out;
+  }
+
+  private finishSearch(out: NormalizedStreamEvent[], outputIndex: number, item: any) {
+    if (this.finishedSearches.has(outputIndex)) return;
+    this.finishedSearches.add(outputIndex);
+    let idx = this.searchBlocks.get(outputIndex);
+    if (idx == null) {
+      idx = this.nextIndex++;
+      this.searchBlocks.set(outputIndex, idx);
+      out.push({ type: "web_search_start", index: idx, id: item.id, origin: "openai-responses" });
+    }
+    out.push({ type: "web_search_done", index: idx, search: normalizeResponsesWebSearch(item) });
   }
 
   // An upstream may stream both a summary and raw reasoning text for the same
@@ -604,6 +665,14 @@ export class ResponsesStreamParser implements StreamParser {
 
 export class AnthropicStreamParser implements StreamParser {
   private blockTypes = new Map<number, string>();
+  // Web search call blocks buffer their input until the block stops (the query is then known);
+  // result blocks arrive complete in one start event. Neither is shown as a function call.
+  private searchCalls = new Map<number, { id: string; block: any; json: string }>();
+  private resultBlocks = new Set<number>();
+  private searches: AnthropicSearchIndex = new Map();
+  private searchIds = new Set<string>();
+  private searchBlockIndexes = new Map<string, number>();
+  private unresolvedSearches = new Set<string>();
 
   parse(event: RawMessageStreamEvent): NormalizedStreamEvent[] {
     const out: NormalizedStreamEvent[] = [];
@@ -619,9 +688,19 @@ export class AnthropicStreamParser implements StreamParser {
         const block = event.content_block;
         const idx = event.index;
         this.blockTypes.set(idx, block.type);
+        // The result follows its search call directly. Any other block starting first means the
+        // search is waiting behind a client tool call, so it is closed here to keep the block order.
+        if (block.type !== "server_tool_use" && block.type !== "web_search_tool_result") this.closeUnresolvedSearches(out);
 
-        if (block.type === "text") {
+        if (block.type === "server_tool_use" && block.name === WEB_SEARCH_TOOL_NAME) {
+          this.searchCalls.set(idx, { id: block.id, block, json: "" });
+        } else if (block.type === "web_search_tool_result") {
+          this.resultBlocks.add(idx);
+          this.finishSearchResult(out, block);
+        } else if (block.type === "text") {
           out.push({ type: "content_start", index: idx, contentType: "text" });
+          // A text block can start with citations already attached.
+          for (const citation of normalizeAnthropicCitations((block as any).citations) ?? []) out.push({ type: "citation", index: idx, citation });
         } else if (block.type === "thinking") {
           out.push({ type: "content_start", index: idx, contentType: "thinking" });
           if (block.thinking) out.push({ type: "content_delta", index: idx, delta: block.thinking });
@@ -638,8 +717,17 @@ export class AnthropicStreamParser implements StreamParser {
         const idx = event.index;
         const delta = event.delta;
 
+        const call = this.searchCalls.get(idx);
+        if (call) {
+          if (delta.type === "input_json_delta") call.json += delta.partial_json;
+          break;
+        }
+        if (this.resultBlocks.has(idx)) break;
         if (delta.type === "text_delta") {
           out.push({ type: "content_delta", index: idx, delta: delta.text });
+        } else if (delta.type === "citations_delta") {
+          const [citation] = normalizeAnthropicCitations([delta.citation]) ?? [];
+          if (citation) out.push({ type: "citation", index: idx, citation });
         } else if (delta.type === "thinking_delta") {
           out.push({ type: "content_delta", index: idx, delta: delta.thinking });
         } else if (delta.type === "input_json_delta") {
@@ -653,7 +741,12 @@ export class AnthropicStreamParser implements StreamParser {
       case "content_block_stop": {
         const idx = event.index;
         const blockType = this.blockTypes.get(idx);
-        if (blockType === "tool_use" || blockType === "server_tool_use") {
+        const call = this.searchCalls.get(idx);
+        if (call) {
+          this.startSearch(out, idx, call);
+        } else if (this.resultBlocks.has(idx)) {
+          // Handled when the result block started.
+        } else if (blockType === "tool_use" || blockType === "server_tool_use") {
           out.push({ type: "tool_done", index: idx });
         } else {
           out.push({ type: "content_done", index: idx });
@@ -662,6 +755,7 @@ export class AnthropicStreamParser implements StreamParser {
       }
 
       case "message_delta": {
+        this.closeUnresolvedSearches(out);
         out.push({
           type: "end",
           finishReason: event.delta?.stop_reason ?? null,
@@ -676,6 +770,38 @@ export class AnthropicStreamParser implements StreamParser {
 
   finish(): NormalizedStreamEvent[] {
     return [];
+  }
+
+  // A search with no result in this response (its result arrives in the next one).
+  private closeUnresolvedSearches(out: NormalizedStreamEvent[]) {
+    for (const id of this.unresolvedSearches) {
+      out.push({ type: "web_search_done", index: this.searchBlockIndexes.get(id)!, search: this.searches.get(id)!.part });
+    }
+    this.unresolvedSearches.clear();
+  }
+
+  private startSearch(out: NormalizedStreamEvent[], idx: number, call: { id: string; block: any; json: string }) {
+    let input: unknown = {};
+    try {
+      input = call.json ? JSON.parse(call.json) : {};
+    } catch {
+      // Keep the empty input; the search is still shown and carried.
+    }
+    const block = { ...call.block, input };
+    const part = startAnthropicWebSearch(block, this.searches, this.searchIds);
+    this.searchBlockIndexes.set(call.id, idx);
+    this.unresolvedSearches.add(call.id);
+    out.push({ type: "web_search_start", index: idx, id: call.id, origin: "anthropic", action: part.action });
+  }
+
+  private finishSearchResult(out: NormalizedStreamEvent[], block: any) {
+    const id: string = block.tool_use_id;
+    const known = this.searches.has(id);
+    const search = attachAnthropicWebSearchResult(block, this.searches, this.searchIds) ?? this.searches.get(id)!.part;
+    this.unresolvedSearches.delete(id);
+    // A result whose call was in an earlier response has no start event of its own.
+    const index = known ? this.searchBlockIndexes.get(id)! : -1 - this.resultBlocks.size;
+    out.push({ type: "web_search_done", index, search });
   }
 }
 
@@ -798,9 +924,39 @@ export class ResponsesStreamEmitter implements StreamEmitter {
   private messageContentParts: Record<string, unknown>[] = [];
   private completedOutputItems = new Map<number, Record<string, unknown>>();
   private outputText = "";
+  // Once a web search is seen, each non-text item closes the message item before it, so the output
+  // keeps its real order (thinking, search, thinking, text) and a search splits the text around it.
+  private sawWebSearch = false;
+  private searchItems = new Map<number, { outputIndex: number; itemId: string }>();
+  private blockCitations = new Map<number, import("./shared.js").NormalizedCitation[]>();
 
   private nextSeq() {
     return this.seq++;
+  }
+
+  private closeMessage(out: Record<string, unknown>[]) {
+    if (this.messageOutputIndex == null) return;
+    const itemId = this.itemIds.get(this.messageOutputIndex);
+    if (itemId) {
+      const msgItem = { id: itemId, type: "message", role: "assistant", status: "completed", content: this.messageContentParts };
+      this.completedOutputItems.set(this.messageOutputIndex, msgItem);
+      out.push({ type: "response.output_item.done", output_index: this.messageOutputIndex, item: msgItem, sequence_number: this.nextSeq() });
+    }
+    this.contentIndexes.delete(this.messageOutputIndex);
+    this.messageOutputIndex = null;
+    this.messageContentParts = [];
+  }
+
+  private announceSearch(out: Record<string, unknown>[], index: number, itemId: string, action?: Record<string, unknown>) {
+    this.sawWebSearch = true;
+    this.closeMessage(out);
+    const oi = this.outputIndex++;
+    this.itemIds.set(oi, itemId);
+    this.searchItems.set(index, { outputIndex: oi, itemId });
+    out.push({ type: "response.output_item.added", output_index: oi, item: { id: itemId, type: "web_search_call", status: "in_progress", ...(action ? { action } : {}) }, sequence_number: this.nextSeq() });
+    out.push({ type: "response.web_search_call.in_progress", output_index: oi, item_id: itemId, sequence_number: this.nextSeq() });
+    out.push({ type: "response.web_search_call.searching", output_index: oi, item_id: itemId, sequence_number: this.nextSeq() });
+    return oi;
   }
 
   private makeItemId(outputIndex: number, prefix: string): string {
@@ -840,6 +996,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         this.accumulated.set(event.index, event.contentType === "redacted_thinking" ? event.data ?? "" : "");
 
         if (event.contentType === "thinking" || event.contentType === "redacted_thinking") {
+          if (this.sawWebSearch) this.closeMessage(out);
           const oi = this.outputIndex++;
           let itemId = event.reasoningId ?? `rs_${oi}`;
           let suffix = 0;
@@ -910,7 +1067,13 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         if (!itemId) break;
 
         if (ct === "text") {
-          const part = { type: "output_text", text: acc, annotations: [] };
+          // Citations arrive with the block (Anthropic) or after its text (Responses); either way they
+          // are announced just before the text is done. Anthropic ones cover the whole block.
+          const annotations = responsesAnnotations(acc, this.blockCitations.get(event.index));
+          annotations.forEach((annotation, annotationIndex) => {
+            out.push({ type: "response.output_text.annotation.added", item_id: itemId, output_index: mapping.outputIndex, content_index: mapping.contentIndex, annotation_index: annotationIndex, annotation, sequence_number: this.nextSeq() });
+          });
+          const part = { type: "output_text", text: acc, annotations };
           this.messageContentParts.push(part);
           this.outputText += acc;
           out.push({ type: "response.output_text.done", item_id: itemId, output_index: mapping.outputIndex, content_index: mapping.contentIndex, text: acc, sequence_number: this.nextSeq() });
@@ -937,7 +1100,46 @@ export class ResponsesStreamEmitter implements StreamEmitter {
         break;
       }
 
+      case "citation": {
+        this.blockCitations.set(event.index, [...(this.blockCitations.get(event.index) ?? []), event.citation]);
+        break;
+      }
+
+      case "web_search_start": {
+        this.announceSearch(out, event.index, event.origin === "anthropic" ? toResponsesWebSearchId(event.id) : event.id, event.action ? denormalizeResponsesAction(event.action) : undefined);
+        break;
+      }
+
+      case "web_search_done": {
+        const search = event.search;
+        // [visible web_search_call?, reasoning carrier?]: a search with no result yet is only carried.
+        const items = webSearchToResponsesItems(search);
+        const visible = items.find((item) => item.type === "web_search_call");
+        const carrier = items.find((item) => item.type === "reasoning");
+        let entry = this.searchItems.get(event.index);
+        if (!entry && visible) {
+          this.announceSearch(out, event.index, String(visible.id));
+          entry = this.searchItems.get(event.index);
+        }
+        if (entry) {
+          const item = visible ?? { id: entry.itemId, type: "web_search_call", status: "incomplete", action: denormalizeResponsesAction(search.action) };
+          if (item.status === "completed") out.push({ type: "response.web_search_call.completed", output_index: entry.outputIndex, item_id: entry.itemId, sequence_number: this.nextSeq() });
+          this.completedOutputItems.set(entry.outputIndex, item);
+          out.push({ type: "response.output_item.done", output_index: entry.outputIndex, item, sequence_number: this.nextSeq() });
+        }
+        if (carrier) {
+          this.sawWebSearch = true;
+          const oi = this.outputIndex++;
+          this.itemIds.set(oi, String(carrier.id));
+          out.push({ type: "response.output_item.added", output_index: oi, item: { id: carrier.id, type: "reasoning", status: "in_progress", summary: [] }, sequence_number: this.nextSeq() });
+          this.completedOutputItems.set(oi, carrier);
+          out.push({ type: "response.output_item.done", output_index: oi, item: carrier, sequence_number: this.nextSeq() });
+        }
+        break;
+      }
+
       case "tool_start": {
+        if (this.sawWebSearch) this.closeMessage(out);
         this.blockTypes.set(event.index, "tool_call");
         this.accumulated.set(event.index, "");
         const custom = event.kind === "custom" || isResponsesCustomToolName(event.name);
@@ -1022,14 +1224,7 @@ export class ResponsesStreamEmitter implements StreamEmitter {
       }
 
       case "end": {
-        if (this.messageOutputIndex != null) {
-          const itemId = this.itemIds.get(this.messageOutputIndex);
-          if (itemId) {
-            const msgItem = { id: itemId, type: "message", role: "assistant", status: "completed", content: this.messageContentParts };
-            this.completedOutputItems.set(this.messageOutputIndex, msgItem);
-            out.push({ type: "response.output_item.done", output_index: this.messageOutputIndex, item: msgItem, sequence_number: this.nextSeq() });
-          }
-        }
+        this.closeMessage(out);
         const status = event.finishReason === "error" ? "failed" : event.finishReason === "length" ? "incomplete" : "completed";
         out.push({ type: "response.completed", response: this.buildResponseShell(status, event.usage), sequence_number: this.nextSeq() });
         break;
@@ -1117,6 +1312,10 @@ export class AnthropicStreamEmitter implements StreamEmitter {
   private normalizedToAnthropicIndex = new Map<number, number>();
   private toolKinds = new Map<number, "function" | "custom">();
   private redactedData = new Map<number, string>();
+  private textAccumulated = new Map<number, string>();
+  // Search call blocks: shown at once, with the input filled in when the source only knows it later.
+  private searchCalls = new Map<number, { blockIndex: number; stopped: boolean }>();
+  private webSearchRequests = 0;
 
   private encodeCustomToolDelta(delta: string): string {
     return JSON.stringify(delta).slice(1, -1);
@@ -1159,6 +1358,7 @@ export class AnthropicStreamEmitter implements StreamEmitter {
         this.blockTypes.set(event.index, event.contentType);
 
         if (event.contentType === "text") {
+          this.textAccumulated.set(event.index, "");
           out.push({ type: "content_block_start", index: idx, content_block: { type: "text", text: "", citations: null } });
         } else if (event.contentType === "thinking") {
           out.push({ type: "content_block_start", index: idx, content_block: { type: "thinking", thinking: "", signature: "" } });
@@ -1182,8 +1382,56 @@ export class AnthropicStreamEmitter implements StreamEmitter {
         } else if (ct === "redacted_thinking") {
           this.redactedData.set(event.index, (this.redactedData.get(event.index) ?? "") + event.delta);
         } else {
+          if (this.textAccumulated.has(event.index)) this.textAccumulated.set(event.index, this.textAccumulated.get(event.index)! + event.delta);
           out.push({ type: "content_block_delta", index: idx, delta: { type: "text_delta", text: event.delta } });
         }
+        break;
+      }
+
+      // A Responses citation arrives after the text it covers, so it goes on the block that is still open;
+      // the block cannot be split any more. The cited text is the answer's own words (no source quote).
+      case "citation": {
+        const idx = this.normalizedToAnthropicIndex.get(event.index);
+        if (idx == null) break;
+        const citation = event.citation;
+        const answer = this.textAccumulated.get(event.index) ?? "";
+        const cited = citation.citedText ?? (citation.startIndex !== undefined && citation.endIndex !== undefined ? Array.from(answer).slice(citation.startIndex, citation.endIndex).join("") : "");
+        out.push({
+          type: "content_block_delta",
+          index: idx,
+          delta: {
+            type: "citations_delta",
+            citation: { type: "web_search_result_location", url: citation.url, title: citation.title ?? null, cited_text: Array.from(cited).slice(0, 150).join(""), encrypted_index: citation.encryptedIndex ?? WEB_SEARCH_MARKER },
+          },
+        });
+        break;
+      }
+
+      case "web_search_start": {
+        const idx = this.getBlockIndex(event.index);
+        this.blockTypes.set(event.index, "web_search");
+        const call = { blockIndex: idx, stopped: false };
+        this.searchCalls.set(event.index, call);
+        out.push({ type: "content_block_start", index: idx, content_block: { type: "server_tool_use", id: event.origin === "anthropic" ? event.id : toAnthropicWebSearchId(event.id), name: WEB_SEARCH_TOOL_NAME, input: {} } });
+        if (event.action) this.finishSearchCall(out, call, { query: webSearchQueryText(event.action) });
+        break;
+      }
+
+      case "web_search_done": {
+        const search = event.search;
+        const blocks = webSearchToAnthropicBlocks(search, new Map());
+        const call = this.searchCalls.get(event.index);
+        const callBlock = blocks.find((block) => block.type === "server_tool_use");
+        if (call && !call.stopped) this.finishSearchCall(out, call, (callBlock?.input ?? {}) as Record<string, unknown>);
+        // Without a result yet the call is already closed, and the result arrives in a later response.
+        if (search.status === "in_progress") break;
+        const resultBlock = blocks.find((block) => block.type === "web_search_tool_result") ?? blocks.find((block) => block.type === "text");
+        if (resultBlock) {
+          const idx = this.blockIndex++;
+          out.push({ type: "content_block_start", index: idx, content_block: resultBlock.type === "web_search_tool_result" ? { ...resultBlock, caller: { type: "direct" } } : resultBlock });
+          out.push({ type: "content_block_stop", index: idx });
+        }
+        if (search.action.type === "search" && !search.continuation) this.webSearchRequests += 1;
         break;
       }
 
@@ -1241,7 +1489,10 @@ export class AnthropicStreamEmitter implements StreamEmitter {
         out.push({
           type: "message_delta",
           delta: { stop_reason: normalizeAnthropicStopReason(event.finishReason), stop_sequence: null, container: null },
-          usage: denormalizeUsageToAnthropic(event.usage) ?? { output_tokens: 0 },
+          usage: {
+            ...(denormalizeUsageToAnthropic(event.usage) ?? { output_tokens: 0 }),
+            ...(this.webSearchRequests > 0 ? { server_tool_use: { web_search_requests: this.webSearchRequests, web_fetch_requests: 0 } } : {}),
+          },
         });
         out.push({ type: "message_stop" });
         break;
@@ -1249,6 +1500,12 @@ export class AnthropicStreamEmitter implements StreamEmitter {
     }
 
     return out;
+  }
+
+  private finishSearchCall(out: Record<string, unknown>[], call: { blockIndex: number; stopped: boolean }, input: Record<string, unknown>) {
+    call.stopped = true;
+    out.push({ type: "content_block_delta", index: call.blockIndex, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
+    out.push({ type: "content_block_stop", index: call.blockIndex });
   }
 
   finish(): Record<string, unknown>[] {

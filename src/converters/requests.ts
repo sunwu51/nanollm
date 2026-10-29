@@ -2,10 +2,12 @@ import type {
   AnthropicMessagesRequest,
   MessageCreateParamsBase,
   MessageParam,
+  NormalizedCitation,
   NormalizedMessage,
   NormalizedRequest,
   NormalizedTool,
   NormalizedToolChoice,
+  NormalizedWebSearch,
   OpenAIChatRequest,
   OpenAIResponsesRequest,
   ToolChoice,
@@ -34,6 +36,30 @@ import {
   unwrapResponsesCustomToolInput,
   wrapResponsesCustomToolInput,
 } from "./shared.js";
+import {
+  attachAnthropicWebSearchResult,
+  startAnthropicWebSearch,
+  type AnthropicSearchIndex,
+  anthropicWebSearchBlocks,
+  collectCitationTitles,
+  collectCitedSnippets,
+  denormalizeAnthropicWebSearchTool,
+  denormalizeResponsesWebSearchTool,
+  isAnthropicWebSearchTool,
+  isResponsesWebSearchTool,
+  isWebSearchCarrier,
+  normalizeAnthropicCitations,
+  normalizeAnthropicWebSearch,
+  normalizeAnthropicWebSearchTool,
+  normalizeResponsesAnnotations,
+  normalizeResponsesWebSearch,
+  normalizeResponsesWebSearchTool,
+  normalizeWebSearchCarrier,
+  responsesWebSearchItem,
+  webSearchFunctionCallItems,
+  webSearchNoteText,
+  WEB_SEARCH_TOOL_NAME,
+} from "./web-search.js";
 import { getClientIp, getClientRequestHeaders, isResponsesCustomToolName, markResponsesCustomToolName } from "../core/request-context.js";
 import { resolveSessionId } from "../core/session-id.js";
 
@@ -127,7 +153,8 @@ export function normalizeOpenAIResponsesRequest(request: OpenAIResponsesRequest)
 export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): NormalizedRequest {
   const messages: NormalizedMessage[] = [];
   if (request.system) messages.push(normalizeAnthropicSystem(request.system as any));
-  for (const message of request.messages) messages.push(...normalizeAnthropicMessage(message));
+  const searches: AnthropicSearchIndex = new Map();
+  for (const message of request.messages) messages.push(...normalizeAnthropicMessage(message, searches));
 
   // Anthropic has no prompt_cache_key; derive a per-conversation key the same way Claude subscriptions derive session ids.
   const promptCacheKey = resolveSessionId(request, { namespace: "prompt_cache_key", clientHeaders: getClientRequestHeaders(), clientIp: getClientIp() });
@@ -135,7 +162,7 @@ export function normalizeAnthropicRequest(request: AnthropicMessagesRequest): No
     const normalized = normalizeAnthropicTool(tool);
     return normalized ? [normalized] : [];
   });
-  const normalizedToolChoice = request.tool_choice ? normalizeAnthropicToolChoice(request.tool_choice) : undefined;
+  const normalizedToolChoice = request.tool_choice ? normalizeAnthropicToolChoice(request.tool_choice, tools) : undefined;
 
   return {
     model: request.model,
@@ -169,7 +196,7 @@ export function denormalizeToOpenAIChatRequest(request: NormalizedRequest): Open
   const reasoningEffort = request.reasoningEffort ?? normalizeReasoningEffortFromBudget(request.thinkingBudgetTokens);
   return {
     model: request.model,
-    messages: denormalizeOpenAIChatMessages(reorderMessagesForOpenAIChatToolResults(request.messages), request.image ?? true),
+    messages: denormalizeOpenAIChatMessages(reorderMessagesForOpenAIChatToolResults(request.messages), request.image ?? true, collectCitationTitles(request.messages.flatMap((message) => message.parts))),
     max_completion_tokens: request.maxOutputTokens,
     metadata: request.metadata ?? undefined,
     service_tier: normalizeOpenAIServiceTier(request.serviceTier),
@@ -186,17 +213,20 @@ export function denormalizeToOpenAIChatRequest(request: NormalizedRequest): Open
     reasoning: reasoningEffort ? { effort: reasoningEffort as never } : undefined,
     verbosity: request.textVerbosity ?? undefined,
     response_format: denormalizeOpenAIChatResponseFormat(request.responseFormat),
-    tools: request.tools?.map((tool) =>
+    // Chat has no native web search tool (search is a model choice there).
+    tools: request.tools?.flatMap<any>((tool) =>
       tool.kind === "function"
-        ? { type: "function", function: { name: tool.name, description: tool.description ?? undefined, parameters: tool.inputSchema, strict: tool.strict ?? undefined } }
-        : { type: "custom", custom: { name: tool.name, description: tool.description ?? undefined, format: tool.format as never } },
+        ? [{ type: "function", function: { name: tool.name, description: tool.description ?? undefined, parameters: tool.inputSchema, strict: tool.strict ?? undefined } }]
+        : tool.kind === "custom"
+          ? [{ type: "custom", custom: { name: tool.name, description: tool.description ?? undefined, format: tool.format as never } }]
+          : [],
     ) as OpenAIChatRequest["tools"],
     tool_choice: denormalizeOpenAIChatToolChoice(request.toolChoice),
   };
 }
 
-function denormalizeOpenAIChatMessages(messages: NormalizedMessage[], imageEnabled: boolean): OpenAIChatRequest["messages"] {
-  const denormalized = messages.flatMap((message) => denormalizeOpenAIChatMessage(message, imageEnabled)) as any[];
+function denormalizeOpenAIChatMessages(messages: NormalizedMessage[], imageEnabled: boolean, citationTitles: Map<string, string>): OpenAIChatRequest["messages"] {
+  const denormalized = messages.flatMap((message) => denormalizeOpenAIChatMessage(message, imageEnabled, citationTitles)) as any[];
   if (!imageEnabled) {
     const merged: any[] = [];
     for (const message of denormalized) {
@@ -318,10 +348,16 @@ export function denormalizeToOpenAIResponsesRequest(request: NormalizedRequest):
     break;
   }
 
+  const allParts = request.messages.flatMap((message) => message.parts);
+  const webSearchContext = { snippets: collectCitedSnippets(allParts), titles: collectCitationTitles(allParts) };
+  const hasWebSearchTool = request.tools?.some((tool) => tool.kind === "web_search") ?? false;
+
   return {
     model: request.model,
     instructions: instructionLines.length > 0 ? instructionLines.join("\n") : undefined,
-    input: request.messages.slice(index).flatMap((message) => denormalizeOpenAIResponsesMessage(message, request.sourceFormat === "openai-responses")) as any,
+    input: request.messages.slice(index).flatMap((message) => denormalizeOpenAIResponsesMessage(message, request.sourceFormat === "openai-responses", webSearchContext)) as any,
+    // Without sources a converted search result would have no URLs.
+    ...(hasWebSearchTool ? { include: ["web_search_call.action.sources" as const] } : {}),
     max_output_tokens: request.maxOutputTokens,
     // metadata: request.metadata ?? undefined,
     service_tier: normalizeOpenAIResponsesServiceTier(request.serviceTier),
@@ -357,8 +393,14 @@ export function denormalizeToAnthropicRequest(request: NormalizedRequest, option
     request.sourceFormat === "anthropic"
       ? filteredMessages
       : ensureAnthropicMessagesEndWithUser(reorderMessagesForAnthropicToolResults(filteredMessages));
-  const messages = mergeAnthropicMessages(anthropicMessages.flatMap((message) => denormalizeAnthropicMessage(message, request.sourceFormat === "anthropic", ignoreInvalidHistory)));
+  const citationTitles = collectCitationTitles(request.messages.flatMap((message) => message.parts));
+  const messages = mergeAnthropicMessages(anthropicMessages.flatMap((message) => denormalizeAnthropicMessage(message, request.sourceFormat === "anthropic", ignoreInvalidHistory, citationTitles)));
   const cacheControl = request.cacheControl ?? { type: "ephemeral" };
+  const tools = request.tools?.flatMap((tool) => {
+    if (tool.kind === "function") return [denormalizeAnthropicTool(tool)];
+    const webSearchTool = tool.kind === "web_search" ? denormalizeAnthropicWebSearchTool(tool) : undefined;
+    return webSearchTool ? [webSearchTool as unknown as ToolUnion] : [];
+  });
 
   return {
     model: request.model,
@@ -371,8 +413,8 @@ export function denormalizeToAnthropicRequest(request: NormalizedRequest, option
     stop_sequences: request.stopSequences,
     temperature: request.temperature ?? undefined,
     top_p: request.topP ?? undefined,
-    tools: request.tools?.filter(tool => tool.kind === "function").map((tool) => denormalizeAnthropicTool(tool)),
-    tool_choice: denormalizeAnthropicToolChoice(request.toolChoice, request.parallelToolCalls, (request.tools?.length ?? 0) > 0),
+    tools,
+    tool_choice: denormalizeAnthropicToolChoice(request.toolChoice, request.parallelToolCalls, (tools?.length ?? 0) > 0),
     output_config: denormalizeAnthropicOutputConfig(request.responseFormat, request.reasoningEffort, request.thinkingBudgetTokens),
     thinking: denormalizeAnthropicThinking(request.reasoningEffort, request.thinkingBudgetTokens),
     cache_control: cacheControl,
@@ -471,10 +513,21 @@ function normalizeOpenAIChatResponseFormat(format: any): NormalizedRequest["resp
 function normalizeOpenAIResponsesInput(input: string | any[]): NormalizedMessage[] {
   if (typeof input === "string") return [{ role: "user", parts: [text(input)] }];
 
+  // Searches whose original Anthropic blocks travel in a carrier; their visible copies are skipped.
+  const carriedSearchIds = new Set(input.flatMap((item) => item?.type === "reasoning" ? (normalizeWebSearchCarrier(item.encrypted_content) ?? []).map((search) => search.id) : []));
+
   return input.flatMap((item) => {
     const itemType = item.type ?? "message";
     if (itemType === "message") return [normalizeOpenAIResponsesMessage(item)];
     if (itemType === "agent_message") return [normalizeOpenAIResponsesAgentMessage(item)];
+    if (itemType === "reasoning" && isWebSearchCarrier(item.encrypted_content)) {
+      const searches = normalizeWebSearchCarrier(item.encrypted_content) ?? [];
+      return searches.length > 0 ? [{ role: "assistant", parts: searches }] : [];
+    }
+    if (itemType === "web_search_call") {
+      const search = normalizeResponsesWebSearch(item);
+      return search.origin === "anthropic" && carriedSearchIds.has(search.id) ? [] : [{ role: "assistant", parts: [search] }];
+    }
     if (itemType === "reasoning") {
       // Thinking nanollm converted from another protocol comes back intact (with its
       // signature) even when the client dropped the summary.
@@ -551,7 +604,11 @@ function normalizeOpenAIResponsesMessage(item: any): NormalizedMessage {
   return {
     role: item.role,
     parts: item.content.map((part: any) => {
-      if (part.type === "input_text" || part.type === "output_text") return text(part.text);
+      if (part.type === "input_text") return text(part.text);
+      if (part.type === "output_text") {
+        const citations = normalizeResponsesAnnotations(part.annotations);
+        return citations ? { type: "text", text: part.text, citations } : text(part.text);
+      }
       if (part.type === "refusal") return refusal(part.refusal);
       if (part.type === "input_image") {
         if (!part.image_url) fail("Responses input_image without image_url is not supported");
@@ -583,6 +640,8 @@ function normalizeOpenAIResponsesTool(tool: any, namespace?: string): Normalized
     return (tool.tools ?? []).flatMap((child: any) => normalizeOpenAIResponsesTool(child, qualifiedNamespace));
   }
 
+  if (isResponsesWebSearchTool(tool)) return [normalizeResponsesWebSearchTool(tool)];
+
   const name = qualifyOpenAIResponsesToolName(tool.name, namespace);
 
   if (tool.type === "function") return [{ kind: "function", name, description: tool.description, inputSchema: tool.parameters ?? { type: "object" }, strict: tool.strict ?? null }];
@@ -610,6 +669,7 @@ function normalizeOpenAIResponsesToolChoice(choice: any): NormalizedToolChoice |
     return { type: "tool", kind: "function", name: choice.name };
   }
   if (choice.type === "allowed_tools") return { type: choice.mode === "required" ? "required" : "auto" };
+  if (isResponsesWebSearchTool(choice)) return { type: "tool", kind: "web_search", name: WEB_SEARCH_TOOL_NAME };
   return undefined;
 }
 
@@ -623,7 +683,7 @@ function normalizeAnthropicSystem(system: any): NormalizedMessage {
   return typeof system === "string" ? { role: "system", parts: [text(system)] } : { role: "system", parts: system.map((block: any) => text(block.text)) };
 }
 
-function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
+function normalizeAnthropicMessage(message: MessageParam, searches: AnthropicSearchIndex): NormalizedMessage[] {
   // Compatible Messages providers may also send system messages in the messages array.
   const role = message.role as string;
   if (role === "system") {
@@ -633,10 +693,22 @@ function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
   if (message.role === "assistant") {
     const parts: NormalizedMessage["parts"] = [];
     const toolCalls: NonNullable<NormalizedMessage["toolCalls"]> = [];
+    // A search stays at its server_tool_use position; its result block follows later in the content.
+    const sameMessageIds = new Set<string>();
     for (const block of message.content as any[]) {
-      if (block.type === "text") parts.push(text(block.text));
+      if (block.type === "text") {
+        const citations = normalizeAnthropicCitations(block.citations);
+        parts.push(citations ? { type: "text", text: block.text, citations } : text(block.text));
+      }
       else if (block.type === "thinking") parts.push({ type: "thinking", thinking: block.thinking, signature: block.signature });
       else if (block.type === "redacted_thinking") parts.push({ type: "redacted_thinking", data: block.data, origin: "anthropic" });
+      else if (block.type === "server_tool_use" && block.name === WEB_SEARCH_TOOL_NAME) {
+        parts.push(startAnthropicWebSearch(block, searches, sameMessageIds));
+      }
+      else if (block.type === "web_search_tool_result") {
+        const continuation = attachAnthropicWebSearchResult(block, searches, sameMessageIds);
+        if (continuation) parts.push(continuation);
+      }
       else if (block.type === "tool_use" || block.type === "server_tool_use") toolCalls.push({ kind: "function", id: block.id, name: block.name, payload: JSON.stringify(block.input) });
     }
     return [{ role: "assistant", parts, toolCalls }];
@@ -668,6 +740,13 @@ function normalizeAnthropicMessage(message: MessageParam): NormalizedMessage[] {
     if (block.type === "container_upload") rejectFileContent('Anthropic "container_upload" content');
     if (block.type === "tool_result") {
       normalized.push({ role: "tool", toolCallId: block.tool_use_id, isError: block.is_error, parts: normalizeAnthropicToolResultParts(block.content) });
+      continue;
+    }
+    // Anthropic puts search results in assistant content; one in a user message still completes its search.
+    if (block.type === "web_search_tool_result" && searches.has(block.tool_use_id)) {
+      const entry = searches.get(block.tool_use_id)!;
+      const completed = normalizeAnthropicWebSearch(entry.serverToolUse, block);
+      Object.assign(entry.part, completed);
       continue;
     }
     if (isAnthropicServerToolResultBlock(block)) {
@@ -727,6 +806,7 @@ function normalizeAnthropicToolResultParts(content: any): NormalizedMessage["par
 }
 
 function normalizeAnthropicTool(tool: ToolUnion): NormalizedTool | undefined {
+  if (isAnthropicWebSearchTool(tool)) return normalizeAnthropicWebSearchTool(tool);
   if (!("input_schema" in tool)) return undefined;
   const toolType: unknown = "type" in tool ? tool.type : undefined;
   if (toolType != null && toolType !== "custom" && toolType !== "function") return undefined;
@@ -745,7 +825,7 @@ function filterUnsupportedToolChoice(choice: NormalizedToolChoice | undefined, t
   return choice;
 }
 
-function normalizeAnthropicToolChoice(choice: ToolChoice): NormalizedToolChoice {
+function normalizeAnthropicToolChoice(choice: ToolChoice, tools: NormalizedTool[] | undefined): NormalizedToolChoice {
   switch (choice.type) {
     case "auto":
       return { type: "auto", disableParallel: choice.disable_parallel_tool_use };
@@ -753,12 +833,14 @@ function normalizeAnthropicToolChoice(choice: ToolChoice): NormalizedToolChoice 
       return { type: "required", disableParallel: choice.disable_parallel_tool_use };
     case "none":
       return { type: "none" };
-    case "tool":
-      return { type: "tool", kind: "function", name: choice.name, disableParallel: choice.disable_parallel_tool_use };
+    case "tool": {
+      const kind = tools?.some((tool) => tool.kind === "web_search" && tool.name === choice.name) ? "web_search" : "function";
+      return { type: "tool", kind, name: choice.name, disableParallel: choice.disable_parallel_tool_use };
+    }
   }
 }
 
-function denormalizeOpenAIChatMessage(message: NormalizedMessage, imageEnabled: boolean): OpenAIChatRequest["messages"] {
+function denormalizeOpenAIChatMessage(message: NormalizedMessage, imageEnabled: boolean, citationTitles: Map<string, string>): OpenAIChatRequest["messages"] {
   switch (message.role) {
     case "system":
       return [{ role: "system", content: collapseText(requireTextOnly(message.parts, "Chat system message")) }];
@@ -767,7 +849,7 @@ function denormalizeOpenAIChatMessage(message: NormalizedMessage, imageEnabled: 
     case "user":
       return [{ role: "user", content: denormalizeOpenAIChatUserParts(message.parts, imageEnabled) }];
     case "assistant": {
-      let content = denormalizeOpenAIChatAssistantParts(message.parts);
+      let content = denormalizeOpenAIChatAssistantParts(message.parts, citationTitles);
       const toolCalls = message.toolCalls?.map((toolCall) => denormalizeOpenAIChatToolCall(toolCall)) as any[] | undefined;
       const thinking = message.parts.filter((part) => part.type === "thinking").map((part) => part.thinking).filter(Boolean).join("\n");
       if (content === null && thinking) content = "";
@@ -799,11 +881,13 @@ function denormalizeOpenAIChatUserParts(parts: NormalizedMessage["parts"], image
   return parts.map((part) => stringifyOpenAIChatPart(part, "Chat user message")).filter(Boolean).join("\n");
 }
 
-function denormalizeOpenAIChatAssistantParts(parts: NormalizedMessage["parts"]): any {
+function denormalizeOpenAIChatAssistantParts(parts: NormalizedMessage["parts"], citationTitles: Map<string, string>): any {
   if (parts.length === 0) return null;
-  const chatParts = parts.filter(part => part.type === "text" || part.type === "refusal").map((part) => {
-    if (part.type === "text") return { type: "text", text: part.text };
-    return { type: "refusal", refusal: part.text };
+  const chatParts = parts.flatMap<any>((part) => {
+    if (part.type === "text") return [{ type: "text", text: part.text }];
+    if (part.type === "refusal") return [{ type: "refusal", refusal: part.text }];
+    if (part.type === "web_search") return part.continuation ? [] : [{ type: "text", text: webSearchNoteText(part, citationTitles) }];
+    return [];
   });
   if (chatParts.length === 0) return null;
   if (chatParts.every((part) => part.type === "text")) return chatParts.map((part) => part.text).join("\n");
@@ -879,13 +963,17 @@ function denormalizeOpenAIResponsesToolOutput(parts: NormalizedMessage["parts"],
   return outputParts.every((part) => part.type === "input_text") ? outputParts.map((part) => part.text).join("\n") : outputParts;
 }
 
-function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveThinking: boolean): any[] {
+function denormalizeOpenAIResponsesMessage(
+  message: NormalizedMessage,
+  preserveThinking: boolean,
+  webSearchContext: { snippets: Map<string, string[]>; titles: Map<string, string> },
+): any[] {
   switch (message.role) {
     case "system":
     case "developer":
     case "user": {
       const contentParts = message.parts
-        .filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking")
+        .filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking" && part.type !== "web_search")
         .map((part) => {
           if (part.type === "text") return { type: "input_text", text: part.text };
           if (part.type === "refusal") return { type: "refusal", refusal: part.text };
@@ -919,15 +1007,32 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
             })),
             ...encrypted.map((part) => ({ type: "reasoning", summary: [], encrypted_content: part.data })),
           ];
-      const contentParts = message.parts
-        .filter((part) => part.type !== "thinking" && part.type !== "redacted_thinking")
-        .map((part) => {
-          if (part.type === "text") return { type: "output_text", text: part.text, annotations: [] };
-          if (part.type === "refusal") return { type: "refusal", refusal: part.text };
-          if (part.type === "image_url") return { type: "input_image", image_url: part.url, detail: part.detail };
-          return { type: "input_audio", input_audio: { data: part.data, format: part.format } };
-        });
-      
+      // Visible parts keep their order: a web search splits the assistant text into the
+      // messages before and after it, as in native Responses output.
+      const visibleItems: any[] = [];
+      let contentParts: any[] = [];
+      const flushContent = () => {
+        if (contentParts.length === 0) return;
+        visibleItems.push({ type: "message", role: "assistant", content: contentParts });
+        contentParts = [];
+      };
+      let hasWebSearch = false;
+      for (const part of message.parts) {
+        if (part.type === "thinking" || part.type === "redacted_thinking") continue;
+        if (part.type === "web_search") {
+          hasWebSearch = true;
+          flushContent();
+          const native = responsesWebSearchItem(part);
+          if (native) visibleItems.push(native);
+          else if (!part.continuation) visibleItems.push(...webSearchFunctionCallItems(part, webSearchContext.snippets, webSearchContext.titles));
+          continue;
+        }
+        if (part.type === "text") contentParts.push({ type: "output_text", text: part.text, annotations: denormalizeResponsesAnnotations(part.citations) });
+        else if (part.type === "refusal") contentParts.push({ type: "refusal", refusal: part.text });
+        else if (part.type === "image_url") contentParts.push({ type: "input_image", image_url: part.url, detail: part.detail });
+        else if (part.type === "input_audio") contentParts.push({ type: "input_audio", input_audio: { data: part.data, format: part.format } });
+      }
+
       const toolCallItems = message.toolCalls?.map((toolCall) => {
         const { name, namespace } = splitQualifiedOpenAIResponsesToolName(toolCall.name);
         const isCustom = toolCall.kind === "custom" || (toolCall.kind === "function" && isResponsesCustomToolName(toolCall.name));
@@ -949,11 +1054,9 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
             };
       }) ?? [];
       
-      return [
-        ...reasoningItems,
-        ...(contentParts.length > 0 || toolCallItems.length > 0 ? [{ type: "message", role: "assistant", content: contentParts }] : []),
-        ...toolCallItems,
-      ];
+      // An assistant turn with only tool calls still gets its (empty) message, unless a search already split it.
+      if (contentParts.length > 0 || (toolCallItems.length > 0 && !hasWebSearch)) visibleItems.push({ type: "message", role: "assistant", content: contentParts });
+      return [...reasoningItems, ...visibleItems, ...toolCallItems];
     }
     case "tool":
       return [{ type: "function_call_output", call_id: message.toolCallId ?? "", output: denormalizeOpenAIResponsesToolOutput(message.parts, "Responses tool result") }];
@@ -962,12 +1065,19 @@ function denormalizeOpenAIResponsesMessage(message: NormalizedMessage, preserveT
   }
 }
 
-function denormalizeAnthropicMessage(message: NormalizedMessage, preserveThinking: boolean, ignoreInvalidHistory: boolean): MessageParam[] {
+/** Only Responses citations carry a range; Anthropic block citations become plain text. */
+function denormalizeResponsesAnnotations(citations: NormalizedCitation[] | undefined): any[] {
+  return (citations ?? [])
+    .filter((citation) => citation.startIndex !== undefined && citation.endIndex !== undefined)
+    .map((citation) => ({ type: "url_citation", url: citation.url, title: citation.title ?? "", start_index: citation.startIndex, end_index: citation.endIndex }));
+}
+
+function denormalizeAnthropicMessage(message: NormalizedMessage, preserveThinking: boolean, ignoreInvalidHistory: boolean, citationTitles: Map<string, string>): MessageParam[] {
   switch (message.role) {
     case "user":
       return [{ role: "user", content: denormalizeAnthropicUserParts(message.parts) }];
     case "assistant": {
-      const content = denormalizeAnthropicAssistantParts(message, preserveThinking, ignoreInvalidHistory);
+      const content = denormalizeAnthropicAssistantParts(message, preserveThinking, ignoreInvalidHistory, citationTitles);
       return content.length > 0 ? [{ role: "assistant", content }] : [];
     }
     case "tool":
@@ -1001,9 +1111,16 @@ function denormalizeAnthropicUserParts(allParts: NormalizedMessage["parts"]): an
   });
 }
 
-function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserveThinking: boolean, ignoreInvalidHistory: boolean): ContentBlockParam[] {
+function denormalizeAnthropicAssistantParts(message: NormalizedMessage, preserveThinking: boolean, ignoreInvalidHistory: boolean, citationTitles: Map<string, string>): ContentBlockParam[] {
   const blocks = message.parts.flatMap<ContentBlockParam>((part) => {
-    if (part.type === "text" || part.type === "refusal") return part.text === "" ? [] : [{ type: "text", text: part.text, citations: null }];
+    // Citations are dropped: Anthropic accepts text without them, and only the issuing account can verify encrypted_index.
+    // Claude rejects empty and whitespace-only text blocks (a blank acknowledgement message, for one).
+    if (part.type === "text" || part.type === "refusal") return part.text.trim() === "" ? [] : [{ type: "text", text: part.text, citations: null }];
+    if (part.type === "web_search") {
+      const native = anthropicWebSearchBlocks(part) as ContentBlockParam[] | undefined;
+      if (native) return native;
+      return part.continuation ? [] : [{ type: "text", text: webSearchNoteText(part, citationTitles), citations: null }];
+    }
     if (part.type === "thinking") {
       if (ignoreInvalidHistory && (part.signature === undefined || part.signature === null || part.signature === "")) return [];
       return [{ type: "thinking", thinking: part.thinking, signature: part.signature ?? "" }];
@@ -1031,9 +1148,112 @@ function denormalizeAnthropicToolResultParts(allParts: NormalizedMessage["parts"
   });
 }
 
+// Anthropic rejects oneOf/allOf/anyOf at the top level of a tool input_schema (and $schema/$id anywhere).
+// OpenAI accepts them, so Codex-issued tools (e.g. discriminated-union MCP schemas) must be rewritten here.
+// Mirrors LiteLLM's flatten_top_level_schema_combinators: branches merge into one object schema.
+const ANTHROPIC_TOP_LEVEL_COMBINATORS = ["allOf", "anyOf", "oneOf"] as const;
+const ANTHROPIC_META_KEYWORDS = new Set(["$schema", "$id", "$comment", "$vocabulary"]);
+const ANTHROPIC_MAX_FLATTEN_DEPTH = 32;
+
+type JsonSchemaObject = Record<string, any>;
+
+function schemaProperties(schema: JsonSchemaObject): JsonSchemaObject {
+  const properties = schema.properties;
+  return properties && typeof properties === "object" && !Array.isArray(properties) ? properties : {};
+}
+
+function schemaRequiredNames(schema: JsonSchemaObject): Set<string> {
+  const required = schema.required;
+  return Array.isArray(required) ? new Set(required.filter((name): name is string => typeof name === "string")) : new Set();
+}
+
+function isObjectSchema(schema: JsonSchemaObject): boolean {
+  return schema.type === "object" || (schema.type === undefined && typeof schema.properties === "object" && schema.properties !== null);
+}
+
+function resolveLocalSchemaRef(root: JsonSchemaObject, ref: string): JsonSchemaObject | undefined {
+  for (const [prefix, container] of [["#/$defs/", "$defs"], ["#/definitions/", "definitions"]] as const) {
+    if (!ref.startsWith(prefix)) continue;
+    const definitions = root[container];
+    if (!definitions || typeof definitions !== "object" || Array.isArray(definitions)) return undefined;
+    const target = definitions[ref.slice(prefix.length)];
+    return target && typeof target === "object" && !Array.isArray(target) ? target : undefined;
+  }
+  return undefined;
+}
+
+function mergeableAnthropicSchemaBranch(root: JsonSchemaObject, branch: unknown, seenRefs: ReadonlySet<string>, depth: number, expandedRefs: Map<string, JsonSchemaObject | undefined>): JsonSchemaObject | undefined {
+  if (!branch || typeof branch !== "object" || Array.isArray(branch) || depth > ANTHROPIC_MAX_FLATTEN_DEPTH) return undefined;
+  const ref = (branch as JsonSchemaObject).$ref;
+  if (typeof ref !== "string") {
+    const flattened = flattenAnthropicSchemaAgainstRoot(branch as JsonSchemaObject, root, seenRefs, depth, expandedRefs);
+    return ANTHROPIC_TOP_LEVEL_COMBINATORS.some((combinator) => combinator in flattened) ? undefined : flattened;
+  }
+  if (expandedRefs.has(ref)) return expandedRefs.get(ref);
+  if (seenRefs.has(ref)) return undefined;
+  const target = resolveLocalSchemaRef(root, ref);
+  const expanded = target === undefined ? undefined : mergeableAnthropicSchemaBranch(root, target, new Set([...seenRefs, ref]), depth + 1, expandedRefs);
+  expandedRefs.set(ref, expanded);
+  return expanded;
+}
+
+function flattenAnthropicSchemaAgainstRoot(schema: JsonSchemaObject, root: JsonSchemaObject, seenRefs: ReadonlySet<string>, depth: number, expandedRefs: Map<string, JsonSchemaObject | undefined>): JsonSchemaObject {
+  const branchGroups = ANTHROPIC_TOP_LEVEL_COMBINATORS
+    .filter((combinator) => Array.isArray(schema[combinator]))
+    .map((combinator) => [combinator, (schema[combinator] as unknown[]).map((branch) => mergeableAnthropicSchemaBranch(root, branch, seenRefs, depth + 1, expandedRefs))] as const);
+  if (branchGroups.length === 0) return schema;
+  if (branchGroups.some(([, group]) => group.some((branch) => branch === undefined))) return schema;
+
+  const branches = branchGroups.flatMap(([, group]) => group as JsonSchemaObject[]);
+  const objectSchema = isObjectSchema(schema) || (schema.type === undefined && branches.length > 0 && branches.every(isObjectSchema));
+  if (!objectSchema) return schema;
+
+  // Later sources win: reversed branches, then the top-level schema. Mirrors LiteLLM's simple overwrite merge.
+  const mergedProperties: JsonSchemaObject = {};
+  for (const source of [...branches].reverse().concat(schema)) Object.assign(mergedProperties, schemaProperties(source));
+
+  const requiredNames = new Set(schemaRequiredNames(schema));
+  for (const [combinator, group] of branchGroups) {
+    const branchRequired = (group as JsonSchemaObject[]).map(schemaRequiredNames);
+    if (branchRequired.length === 0) continue;
+    const merged = combinator === "allOf"
+      ? branchRequired.reduce((acc, names) => new Set([...acc, ...names]))
+      : branchRequired.reduce((acc, names) => new Set([...acc].filter((name) => names.has(name))));
+    for (const name of merged) requiredNames.add(name);
+  }
+
+  const kept = Object.fromEntries(Object.entries(schema).filter(([key]) => !(ANTHROPIC_TOP_LEVEL_COMBINATORS as readonly string[]).includes(key)));
+  return {
+    ...kept,
+    type: "object",
+    properties: mergedProperties,
+    ...(requiredNames.size > 0 ? { required: [...requiredNames].sort() } : {}),
+  };
+}
+
+function stripAnthropicSchemaMetaKeywords(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripAnthropicSchemaMetaKeywords);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as JsonSchemaObject)
+      .filter(([key]) => !ANTHROPIC_META_KEYWORDS.has(key))
+      .map(([key, entry]) => [key, stripAnthropicSchemaMetaKeywords(entry)]),
+  );
+}
+
+function sanitizeAnthropicInputSchema(inputSchema: Record<string, unknown>): Record<string, unknown> {
+  const normalized = (stripAnthropicSchemaMetaKeywords(inputSchema) ?? {}) as JsonSchemaObject;
+  const flattened = flattenAnthropicSchemaAgainstRoot(normalized, normalized, new Set(), 0, new Map());
+  return {
+    type: "object",
+    ...flattened,
+    properties: typeof flattened.properties === "object" && flattened.properties !== null ? flattened.properties : {},
+  };
+}
+
 function denormalizeAnthropicTool(tool: NormalizedTool): ToolUnion {
   if (tool.kind !== "function") fail("Anthropic request conversion only supports function-style tools");
-  return { name: tool.name, description: tool.description ?? undefined, input_schema: tool.inputSchema as any };
+  return { name: tool.name, description: tool.description ?? undefined, input_schema: sanitizeAnthropicInputSchema(tool.inputSchema) as any };
 }
 
 function denormalizeAnthropicToolChoice(choice: NormalizedToolChoice | undefined, parallelToolCalls: boolean | undefined, hasTools: boolean): MessageCreateParamsBase["tool_choice"] {
@@ -1045,6 +1265,8 @@ function denormalizeAnthropicToolChoice(choice: NormalizedToolChoice | undefined
   if (choice.type === "auto") return { type: "auto", disable_parallel_tool_use: disableParallel };
   if (choice.type === "required") return { type: "any", disable_parallel_tool_use: disableParallel };
   if (choice.type === "none") return { type: "none" };
+  // Opus 5.5, Sonnet 5.5 and Fable 5.1 reject a forced choice, and forcing skips thinking elsewhere.
+  if (choice.kind === "web_search") return hasTools ? { type: "auto", disable_parallel_tool_use: disableParallel } : undefined;
   if (choice.kind !== "function") fail("Anthropic tool_choice only supports function-style tools");
   return { type: "tool", name: choice.name, disable_parallel_tool_use: disableParallel };
 }
@@ -1288,6 +1510,10 @@ function denormalizeOpenAIResponsesTools(tools: NormalizedTool[] | undefined): O
   const namespaceTools = new Map<string, { type: "namespace"; name: string; description: string; tools: any[] }>();
 
   for (const tool of tools) {
+    if (tool.kind === "web_search") {
+      denormalizedTools.push(denormalizeResponsesWebSearchTool(tool));
+      continue;
+    }
     const { name, namespace } = splitQualifiedOpenAIResponsesToolName(tool.name);
     const denormalizedTool =
       tool.kind === "function"
@@ -1320,11 +1546,15 @@ function denormalizeOpenAIResponsesTools(tools: NormalizedTool[] | undefined): O
 function denormalizeOpenAIChatToolChoice(choice: NormalizedToolChoice | undefined): OpenAIChatRequest["tool_choice"] {
   if (!choice) return undefined;
   if (choice.type === "auto" || choice.type === "none" || choice.type === "required") return choice.type;
+  // The web search tool itself is dropped for Chat, so there is nothing to choose.
+  if (choice.kind === "web_search") return undefined;
   return choice.kind === "function" ? { type: "function", function: { name: choice.name } } : { type: "custom", custom: { name: choice.name } };
 }
 
 function denormalizeOpenAIResponsesToolChoice(choice: NormalizedToolChoice | undefined): OpenAIResponsesRequest["tool_choice"] {
   if (!choice) return undefined;
   if (choice.type === "auto" || choice.type === "none" || choice.type === "required") return choice.type;
+  // Forcing web search ({type:"web_search"} or "required") makes gpt-6.1-sol loop until max_messages.
+  if (choice.kind === "web_search") return "auto";
   return choice.kind === "function" ? { type: "function", name: choice.name } : { type: "custom", name: choice.name };
 }

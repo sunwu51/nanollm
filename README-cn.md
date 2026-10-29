@@ -43,7 +43,7 @@
 - **请求改写**：可配置修改请求的 `headers` 和 `body`（`body` 支持深度合并），还支持 `body_expression` / `response_expression` 动态表达式。
 - **兜底分组**：设置兜底分组后，调用的模型下游失败时会自动尝试分组内的其他模型。
 - **订阅供应商**：支持 OpenAI Codex 订阅和 Claude Pro/Max 订阅，在管理页登录即可作为模型供应商使用。
-- **热更新与管理页**：`/admin` 提供表单式配置管理（含模型连通性测试、拉取上游模型列表）；`models`、`fallback`、`server.ttfb_timeout`、`record.max_size` 保存后立即生效，`server.port` 和 `server.auth.token` 写回后需重启进程。
+- **热更新与管理页**：`/admin` 提供表单式配置管理（含模型连通性测试、拉取上游模型列表）；`models`、`fallback`、`server.ttfb_timeout`、`record.max_size`、`record.skip_when` 保存后立即生效，`server.port` 和 `server.auth.token` 写回后需重启进程。
 - **监控与用量**：`/status` 展示模型健康状态与按日 token 用量；`/record` 保存最近请求并支持回放，对 debug 很有用。
 - **定时模型任务**：`/jobs` 按 cron 定时调用多个模型，保存作品并支持历史对比与人工审核。
 - **持久化可选**：默认内存存储；`--storage sqlite` 可使用本地 SQLite 文件或远程 libSQL/quicSQL 服务。
@@ -98,6 +98,7 @@ server:
 
 record:
   max_size: 100 # optional, default 10
+  skip_when: "model === 'cheap-model'" # optional，命中的请求不写入采样记录
 
 providers:
   # 普通共享供应商：集中保存协议、地址和 API Key
@@ -309,37 +310,37 @@ http://localhost:3000/admin
 http://localhost:3000/status
 http://localhost:3000/record
 http://localhost:3000/jobs
+http://localhost:3000/tokens
 ```
 
 未配置访问密码时直接进入页面；配置了密码时，未登录会跳转到 `/login`，输入 `server.auth.token`（或环境变量 `NANOLLM_AUTH_TOKEN`）对应的访问密码后返回原页面。URL 中的 `?token=` 不再用于认证，旧链接在未登录时也会跳转到登录页。
 
 登录成功（或 Bearer header 认证成功）后，nanollm 会写入有效期为 90 天的同源 `HttpOnly` 认证 cookie，成功访问时续期，HTTPS 下启用 `Secure`。浏览器会自动携带 cookie，无需重复输入密码。cookie 失效或服务器密码变更后，页面及页面内请求会引导重新登录；API 客户端仍收到标准的 `401 Unauthorized` 响应。
 
-### 模型和分组访问 token
+### 客户端访问令牌
 
-如果想让某个客户端只能访问某个模型或 fallback 分组、而不分享管理员 token，可以在模型或分组上配置 `auth_token`。分组需要使用对象写法；原来的数组写法仍然可用：
+如果想给某个客户端单独发放令牌、而不分享管理员 token，可以在顶层 `tokens` 列表里添加。每个令牌在 `available_models` 里列出客户端可以传的模型名，并把每个名字映射到本配置中的模型或 fallback 分组：
 
 ```yaml
-models:
-  - name: gpt-5.4-a
-    # ...
-    auth_token: ${TEAM_A_TOKEN}
-fallback:
-  gpt-5.4:                # 原有数组写法，不变
-    - gpt-5.4-a
-    - gpt-5.4-b
-  gpt-5.4-team:           # 对象写法，只在需要 token 时使用
-    models:
-      - gpt-5.4-a
-      - gpt-5.4-b
-    auth_token: ${TEAM_B_TOKEN}
+tokens:
+  - name: team-a              # 可选，在 /tokens 页面显示的名称
+    value: ${TEAM_A_TOKEN}
+    available_models:
+      - gpt-5.4: gpt-5.4-team # 客户端传 "gpt-5.4"，nanollm 转发到 "gpt-5.4-team" 分组
+      - fast: gpt-5.4-a
+      - gpt-5.4-b             # 等同于 "gpt-5.4-b: gpt-5.4-b"
+      - claude-*: wild-*      # 前缀映射："claude-x" 转发到 "wild-x"
 ```
 
-- token 只对它所在的那个名字生效。`TEAM_A_TOKEN` 可以调用 `gpt-5.4-a`；`TEAM_B_TOKEN` 可以调用 `gpt-5.4-team`（仍会按顺序回退到所有成员），但不能直接以 `gpt-5.4-a` 或 `gpt-5.4-b` 的名字调用。
-- 管理员 token（`server.auth.token`）始终可以调用所有模型和分组。
-- 没有自己 `auth_token` 的模型或分组只能用管理员 token 访问；如果没有配置管理员 token，则任何人都可访问。配置了自己 `auth_token` 的模型或分组，即使没有管理员 token 也需要 token 才能访问。
-- 这些 token 只能访问模型接口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/images/*`、`/v1/alpha/search`）和 `/v1/models`（只列出该 token 可用的名字）。页面、`/admin`、`/record`、`/status`、`/jobs` 仍需管理员 token，也不会写入登录 cookie。访问不允许的模型返回 `403`。
-- 客户端的发送方式和管理员 token 相同（`Authorization: Bearer` 或 `x-api-key`）。模型和分组 token 随 `models`、`fallback` 热更新，支持 `${ENV_VAR}`。`/admin` 页面里每个模型和分组都有 `auth_token` 输入框和"生成"按钮。
+- 令牌只能使用它下面列出的名字，并按映射转发。`TEAM_A_TOKEN` 可以调用 `fast`（转发到 `gpt-5.4-a`），但不能直接以 `gpt-5.4-a` 调用。
+- 以 `*` 结尾的名字按前缀映射；如果目标也以 `*` 结尾（通配模型），名字剩余部分会带过去。精确名字优先于前缀，长前缀优先于短前缀。
+- 管理员 token（`server.auth.token`）始终可以用原名调用所有模型和分组。
+- 没有配置管理员 token 时，没有被任何令牌映射的模型和分组对所有人开放；被令牌映射的模型和分组只能通过令牌访问。
+- 令牌只能访问模型接口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/images/*`、`/v1/alpha/search`）和 `/v1/models`（只列出该令牌可用的名字）。页面、`/admin`、`/record`、`/status`、`/jobs`、`/tokens` 仍需管理员 token，也不会设置登录 cookie。不允许的模型返回 `403`。
+- 客户端的发送方式和管理员 token 相同（`Authorization: Bearer` 或 `x-api-key`）。令牌支持热更新和 `${ENV_VAR}`。
+- `/tokens` 页面可以新建、生成和编辑令牌及其模型，并保存到 `config.yaml`。令牌指向的模型或分组不存在时配置无效，所以在 `/admin` 重命名或删除模型、分组时要同步修改令牌。
+- 旧配置中写在模型或 fallback 分组上的 `auth_token` 会在 nanollm 加载 `config.yaml` 时自动迁移：每个不同的 token 变成一个 `tokens` 条目，把它原来能访问的名字映射到自身，分组改回普通数组写法，然后保存文件。
+
 
 ### 动态请求体表达式
 
@@ -549,7 +550,7 @@ fallback:
 - 页面内提供跳转到 `/status`、`/record` 的快捷入口，方便保存后继续查看当前模型状态和最近请求记录。
 - 如果只是想放弃当前改动，可以点击“撤销未保存修改”；如果配置文件已被外部改动，可以点击“从服务端刷新”重新加载最新内容。
 - 点击保存后会先把表单数据转换成 YAML、校验配置，再原子写回配置文件。
-- `models`、`fallback`、`server.ttfb_timeout`、`record.max_size` 会立即热更新到新请求；`server.port` 和 `server.auth.token` 会写回文件，但需要重启进程后才会真正生效。
+- `models`、`fallback`、`server.ttfb_timeout`、`record.max_size`、`record.skip_when` 会立即热更新到新请求；`server.port` 和 `server.auth.token` 会写回文件，但需要重启进程后才会真正生效。
 - 已有模型上未在表单中展开的高级字段会在保存时自动保留。
 - 如果你在外部手动修改 `config.yaml`，服务也会自动检测并加载新配置；若新内容非法，则继续保留上一份有效配置并在管理页显示错误。
 
@@ -566,6 +567,22 @@ fallback:
 `http://localhost:3000/record` 是采样记录页面，可以查看请求记录，对 debug 非常有用（默认只保留最新 10 次请求，可通过 `record.max_size` 配置修改）。记录页支持回放某次请求（客户端的敏感请求头不会被回放，供应商鉴权使用当前配置）。
 
 请求中的 `data:image/...;base64,...` 图片会按内容哈希去重保存；记录页显示图片引用和大小，点击回放时服务会自动还原原始图片。这样多轮工具调用重复携带同一图片时，只保留一份图片数据。可复制记录中的 `__nanollm_record_image_ref` 值，并通过 `GET /record/images/{hash}` 查看原图；该接口使用与 `/record` 相同的鉴权。使用 `--storage sqlite` 时会持久化最近 `record.max_size` 条请求记录。
+
+`record.skip_when` 是可选的 JS 表达式，每个客户端请求在路由前执行一次。返回真值时，该请求完全不写入采样记录，不占用 `record.max_size` 的名额，也不产生记录表写入（适合 Turso 等远程 SQLite）；`/status` 和用量统计仍会照常计入。表达式可用的变量：
+
+- `body`：客户端请求体（只读）
+- `model`：请求的模型或 fallback 分组名（即 `body.model`）
+- `headers`：客户端请求头，包含真实的 `authorization` / `x-api-key` 值。名称不区分大小写：无论客户端传的是什么大小写，`headers['authorization']` 和 `headers.Authorization` 都能取到
+- `path`：请求路径，例如 `/v1/messages`
+
+```yaml
+record:
+  skip_when: |
+    model === 'cheap-model' || model === 'batch-group'
+      || headers['authorization']?.endsWith('-nolog')
+```
+
+表达式超时时间为 100 ms；抛错、超时或返回 Promise 时，该请求照常记录并输出错误日志。语法错误会在加载配置时直接报错。`/admin` 页面最底部的 Advanced 区域（默认折叠）可以编辑此字段。
 
 ### 定时模型任务 `/jobs`
 在 `/admin` 点击 **/jobs**，或打开 `/jobs`，新建任务、选择具体模型、填写一条用户消息及五段 cron。调度时区需要明确指定；页面可预览未来 5 次运行时间。Pelican 和简单回复是可编辑的快捷模板，不是固定的任务类型。

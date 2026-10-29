@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { parse as parseYAML } from "yaml";
 import type { StreamFormat } from "../converters/streams.js";
+import { compileRecordRule } from "./record-rule.js";
 
 export const DEFAULT_RECORD_MAX_SIZE = 10;
 export const DEFAULT_TTFB_TIMEOUT = 5000;
@@ -28,7 +29,6 @@ export interface ModelConfig {
   response_expression?: string;
   ignore_invalid_history?: boolean;
   reasoning_profile?: ReasoningProfile;
-  auth_token?: string;
 }
 
 /** How replayed thinking is adapted to the upstream (see proxy/reasoning-history). */
@@ -59,21 +59,40 @@ export interface ServerConfig {
   models: ModelConfig[];
   providers: CustomProviderConfig[];
   fallback: Record<string, string[]>;
-  /** Access tokens of fallback groups that configure `auth_token`, keyed by group name. */
-  fallback_auth_tokens?: Record<string, string>;
+  tokens: TokenConfig[];
   record: {
     max_size: number;
+    /** JS expression over the client request; when truthy the request is not recorded. */
+    skip_when?: string;
   };
 }
 
-export type FallbackGroupDocument = string[] | { models?: string[]; auth_token?: string };
+/** One `available_models` entry: the name a client sends, and the model or fallback group it routes to. */
+export interface TokenModelMapping {
+  alias: string;
+  target: string;
+}
+
+/** A client token that may use only the names in its `available_models`. */
+export interface TokenConfig {
+  name?: string;
+  value: string;
+  models: TokenModelMapping[];
+}
+
+export interface TokenDocument {
+  name?: string;
+  value?: string;
+  available_models?: Array<string | Record<string, string>>;
+}
 
 export interface ParsedConfigDocument {
   server?: { port?: number; ttfb_timeout?: number; auth?: { token?: string } };
-  record?: { max_size?: number };
+  record?: { max_size?: number; skip_when?: string };
   models?: Array<Partial<ModelConfig> & Pick<ModelConfig, "name" | "model">>;
   providers?: CustomProviderConfig[];
-  fallback?: Record<string, FallbackGroupDocument>;
+  fallback?: Record<string, string[]>;
+  tokens?: TokenDocument[];
 }
 
 export interface MaterializeConfigOptions {
@@ -134,10 +153,6 @@ function normalizeOptionalString(value: unknown): string | undefined {
   return normalized ? normalized : undefined;
 }
 
-function normalizeAuthToken(value: unknown): string | undefined {
-  return value === undefined || value === null ? undefined : normalizeOptionalString(resolveEnvVars(String(value)));
-}
-
 function normalizeReasoningProfile(value: unknown, fieldName: string): ReasoningProfile {
   if (value === undefined || value === null || value === "") return "auto";
   const normalized = typeof value === "string" ? value.trim().toLowerCase() : value;
@@ -164,6 +179,17 @@ function normalizeExpressionAlias(model: ModelConfig, snakeKey: "body_expression
   }
   const value = snakeValue ?? camelValue;
   return value === undefined || value === null || value === "" ? undefined : String(value);
+}
+
+function normalizeRecordRule(value: unknown): string | undefined {
+  const expression = normalizeOptionalString(value);
+  if (!expression) return undefined;
+  try {
+    compileRecordRule(expression);
+  } catch (error) {
+    throw new Error(`'record.skip_when' is not a valid expression: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return expression;
 }
 
 function normalizeProxyUrl(value: unknown, fieldName: string): string | undefined {
@@ -204,7 +230,6 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
   const ignore_invalid_history = normalizeBoolean(model.ignore_invalid_history, `models.${model.name || "<unknown>"}.ignore_invalid_history`, true);
   const reasoning_profile = normalizeReasoningProfile(model.reasoning_profile, `models.${model.name || "<unknown>"}.reasoning_profile`);
   const proxy = normalizeProxyUrl(model.proxy, `models.${model.name || "<unknown>"}.proxy`);
-  const auth_token = normalizeAuthToken(model.auth_token);
 
   const normalized = {
     ...model,
@@ -221,8 +246,6 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
   };
   delete normalized.body_expression;
   delete normalized.response_expression;
-  if (auth_token) normalized.auth_token = auth_token;
-  else delete normalized.auth_token;
   return normalized;
 }
 
@@ -253,6 +276,7 @@ export function parseSourceConfigDocument(rawText: string): ParsedConfigDocument
 export function materializeConfig(document: ParsedConfigDocument, options?: MaterializeConfigOptions): ServerConfig {
   const defaultTTFBTimeout = options?.ttfb_timeout ?? normalizeTimeout(document.server?.ttfb_timeout, "server.ttfb_timeout") ?? DEFAULT_TTFB_TIMEOUT;
   const recordMaxSize = options?.recordMaxSize ?? (normalizePositiveInteger(document.record?.max_size, "record.max_size") ?? DEFAULT_RECORD_MAX_SIZE);
+  const recordSkipWhen = normalizeRecordRule(document.record?.skip_when);
   const authToken = normalizeOptionalString(options?.authToken ?? document.server?.auth?.token);
   const providers = (document.providers ?? []).map((provider) => {
     const name = String(provider.name || "").trim();
@@ -284,6 +308,9 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
     }
   }
   const models = (document.models ?? []).map((sourceModel) => {
+    if (Object.hasOwn(sourceModel, "auth_token")) {
+      throw new Error(`Model '${sourceModel.name}' uses 'auth_token'; access tokens are now configured in the top-level 'tokens' list`);
+    }
     const customProviderName = String(sourceModel.custom_provider || "").trim();
     if (customProviderName) {
       const conflictingFields = ["provider", "base_url", "api_key"].filter((field) => Object.hasOwn(sourceModel, field));
@@ -306,7 +333,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
       : { ...sourceModel, api_key: resolveEnvVars(String(sourceModel.api_key || "")) };
     return normalizeModelConfig(expanded as ModelConfig, defaultTTFBTimeout);
   });
-  const { fallback, authTokens: fallbackAuthTokens } = normalizeFallback(document.fallback ?? {});
+  const fallback = document.fallback ?? {};
 
   for (const m of models) {
     if (!m.name) throw new Error("Model config missing 'name'");
@@ -318,6 +345,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
     }
   }
   validateFallback(models, fallback);
+  const tokens = normalizeTokens(document.tokens, new Set([...Object.keys(fallback), ...models.map((model) => model.name)]), authToken);
 
   return {
     port: Number(process.env.PORT) || options?.port || (document.server?.port ?? 3000),
@@ -326,9 +354,10 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
     models,
     providers,
     fallback,
-    ...(Object.keys(fallbackAuthTokens).length > 0 ? { fallback_auth_tokens: fallbackAuthTokens } : {}),
+    tokens,
     record: {
       max_size: recordMaxSize,
+      ...(recordSkipWhen ? { skip_when: recordSkipWhen } : {}),
     },
   };
 }
@@ -370,31 +399,9 @@ export function resolveModelForRequest(config: ServerConfig, name: string): Reso
   };
 }
 
-/** The access token configured on a public model or fallback group name (groups win, like routing). */
-export function getModelAuthToken(config: ServerConfig, name: string): string | undefined {
-  if (name in config.fallback) return config.fallback_auth_tokens?.[name];
-  return resolveModelForRequest(config, name)?.model.auth_token;
-}
-
 export function resolveFallbackModels(config: ServerConfig, name: string): string[] {
   if (name in config.fallback) return config.fallback[name];
   return [name];
-}
-
-/** Accepts both `group: [a, b]` and `group: { models: [a, b], auth_token: x }`. */
-function normalizeFallback(document: Record<string, FallbackGroupDocument>): { fallback: Record<string, string[]>; authTokens: Record<string, string> } {
-  const fallback: Record<string, string[]> = {};
-  const authTokens: Record<string, string> = {};
-  for (const [groupName, group] of Object.entries(document)) {
-    if (Array.isArray(group) || !group || typeof group !== "object") {
-      fallback[groupName] = group as string[];
-      continue;
-    }
-    fallback[groupName] = group.models as string[];
-    const authToken = normalizeAuthToken(group.auth_token);
-    if (authToken) authTokens[groupName] = authToken;
-  }
-  return { fallback, authTokens };
 }
 
 function validateFallback(models: ModelConfig[], fallback: Record<string, string[]>) {
@@ -429,4 +436,48 @@ function validateFallback(models: ModelConfig[], fallback: Record<string, string
       seenMembers.add(member);
     }
   }
+}
+
+function normalizeTokenMapping(entry: unknown, path: string): TokenModelMapping {
+  // `- gpt-5` is short for `- gpt-5: gpt-5`.
+  if (typeof entry === "string") return { alias: entry.trim(), target: entry.trim() };
+  if (!entry || typeof entry !== "object" || Array.isArray(entry) || Object.keys(entry).length !== 1) {
+    throw new Error(`'${path}' must be a 'client name: model or group' pair`);
+  }
+  const [[alias, target]] = Object.entries(entry);
+  return { alias: alias.trim(), target: String(target ?? "").trim() };
+}
+
+function normalizeTokens(document: unknown, publicNames: Set<string>, adminToken: string | undefined): TokenConfig[] {
+  if (document === undefined || document === null) return [];
+  if (!Array.isArray(document)) throw new Error("'tokens' must be a list");
+  const values = new Set<string>();
+  return document.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`'tokens[${index}]' must be an object`);
+    const source = entry as TokenDocument;
+    const name = normalizeOptionalString(source.name);
+    const label = name ? `Token '${name}'` : `'tokens[${index}]'`;
+    if (source.value === undefined || source.value === null || !String(source.value).trim()) throw new Error(`${label} is missing 'value'`);
+    // An unset ${ENV_VAR} leaves the value empty; such a token matches no request.
+    const value = resolveEnvVars(String(source.value)).trim();
+    if (value) {
+      if (values.has(value)) throw new Error(`${label} repeats the value of another token`);
+      if (value === adminToken) throw new Error(`${label} has the same value as 'server.auth.token'`);
+      values.add(value);
+    }
+    const mappings = source.available_models ?? [];
+    if (!Array.isArray(mappings)) throw new Error(`${label}: 'available_models' must be a list`);
+    const aliases = new Set<string>();
+    const models = mappings.map((mapping, mappingIndex) => {
+      const { alias, target } = normalizeTokenMapping(mapping, `tokens[${index}].available_models[${mappingIndex}]`);
+      if (!alias || !target) throw new Error(`${label}: each 'available_models' entry needs a client name and a model or group`);
+      assertValidModelNamePattern(alias);
+      if (aliases.has(alias)) throw new Error(`${label} lists '${alias}' more than once`);
+      aliases.add(alias);
+      if (!publicNames.has(target)) throw new Error(`${label} maps '${alias}' to unknown model or group '${target}'`);
+      if (target.endsWith("*") && !alias.endsWith("*")) throw new Error(`${label}: '${alias}' must end with '*' to map to wildcard model '${target}'`);
+      return { alias, target };
+    });
+    return { ...(name ? { name } : {}), value, models };
+  });
 }
