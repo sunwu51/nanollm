@@ -801,6 +801,8 @@ function normalizeAnthropicToolResultParts(content: any): NormalizedMessage["par
       if (block.source.type === "text") return text(block.source.data);
       rejectFileContent(`Anthropic "document" tool_result content with a "${block.source.type}" source`);
     }
+    // ToolSearch results list the tools it loaded as tool_reference blocks; keep their names like tool_search_tool_search_result does.
+    if (block.type === "tool_reference") return text(block.tool_name);
     fail(`Anthropic tool_result block "${block.type}" is not supported`);
   });
 }

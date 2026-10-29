@@ -83,6 +83,7 @@ The shared intermediate form is `NormalizedRequest`, `NormalizedMessage`, `Norma
 | Anthropic `server_tool_use` | It is a server-side tool call in Anthropic. Web search becomes a `web_search` part; other server tools are normalized as a normal function call. | Non-search server tools denormalize to regular `tool_use`, not `server_tool_use`, so server-tool semantics are lost. |
 | Anthropic `*_tool_result` | Server tool results have provider-specific block types. | Any block with type ending in `_tool_result` is accepted and normalized to a normal tool result. Known web/tool-search contents are degraded to text; a `web_fetch_result` keeps the page text for text documents and only the URL otherwise. |
 | Anthropic tool search result | `tool_search_tool_result` contains `tool_references`. | It normalizes to a normal tool result whose text is a newline-separated list of `tool_name` values. |
+| Anthropic `tool_reference` in `tool_result` | ToolSearch results can put `tool_reference` blocks directly in `tool_result.content[]`. | Each block normalizes to a text part holding its `tool_name`. |
 | Anthropic adaptive thinking | New Anthropic thinking uses `thinking.type=adaptive` plus `output_config.effort`. | Normalization reads this first. Denormalization uses this form for every effort except `none`, which emits `thinking.type=disabled` with no effort; `minimal` is sent as `low` because Anthropic has no lower level. |
 | Anthropic old budget thinking | Old Anthropic thinking used `thinking.type=enabled` and `budget_tokens`. | Normalization still supports it and maps budgets `<=3000` to `low`, `<=7500` to `medium`, otherwise `high`. |
 | Chat thinking content | Providers use different non-standard fields for reasoning text. | Chat message/response conversion reads and writes `thinking`, `reasoning`, and `reasoning_content`. Streams also read/write all three delta fields. |
@@ -175,7 +176,7 @@ Common Responses item types that still error if they appear in request `input[]`
 | user/assistant content block | Block is not a supported message block and does not end with `_tool_result`. |
 | `document` | Source is url, base64 or file: rejected with 400 (file content). |
 | `document.source.type=content` | Child block is not `text`. |
-| ordinary `tool_result.content[]` | Block is not `text`, `image`, or a text-source `document`. A url/base64/file `document` is rejected with 400. |
+| ordinary `tool_result.content[]` | Block is not `text`, `image`, `tool_reference`, or a text-source `document`. A url/base64/file `document` is rejected with 400. |
 
 Anthropic content blocks that may still error outside `_tool_result` handling include:
 

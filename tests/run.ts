@@ -824,6 +824,18 @@ run("plain-text anthropic documents and fetched web pages still convert to text"
   assert.equal(fetched({ type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0xLjQK" } }), "https://example.com/x");
 });
 
+run("tool_reference blocks in a tool_result become the loaded tool names", () => {
+  const chat = anthropicMessageRequestToChatParams({
+    model: "m", max_tokens: 10,
+    messages: [
+      { role: "assistant", content: [{ type: "tool_use", id: "tu_search", name: "ToolSearch", input: { query: "select:Foo,Bar" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_search", content: [{ type: "tool_reference", tool_name: "Foo" }, { type: "tool_reference", tool_name: "Bar" }] }] },
+    ],
+  } as any) as any;
+  const tool = chat.messages.find((message: any) => message.role === "tool");
+  assert.equal(tool.content, "Foo\nBar");
+});
+
 run("responses text image tool output becomes anthropic mixed tool_result block", () => {
   const result = responsesRequestToAnthropicMessageRequest({
     model: "gpt-4o-mini",
