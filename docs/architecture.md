@@ -42,7 +42,7 @@ docs/                Reference docs
 | `storage` | `sqlite`, `record`, `status`, `usage` | libsql client with write queue, request records, status buckets, usage by day |
 | `jobs` | `jobs`, `job-run-store`, `job-executor`, `job-scheduler`, `job-routes`, `job-model-catalog`, `jobs-page` | Job config store, run history, executor, cron scheduler, HTTP routes, model name resolution, page |
 | `tokens` | `tokens`, `token-routes`, `tokens-page` | The /tokens page: reads and rewrites the `tokens` list of config.yaml, HTTP routes, page |
-| `pages` | `admin-config-page`, `admin-config-form`, `record-page`, `status-page`, `usage-page`, `logo` | HTML renderers, admin form payload handling, and the shared logo/favicon (`assets/logo.svg`) |
+| `pages` | `admin-config-page`, `admin-config-form`, `record-page`, `status-page`, `usage-page`, `logo`, `source-icons` | HTML renderers, admin form payload handling, the shared logo/favicon (`assets/logo.svg`), and the client logos shown on records |
 
 ## Dependency rules
 

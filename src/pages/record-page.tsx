@@ -1,5 +1,7 @@
 import { renderToString } from "hono/jsx/dom/server";
 import { LOGO_DATA_URI } from "./logo.js";
+import { SOURCE_ICONS } from "./source-icons.js";
+import type { RequestSource } from "../storage/record.js";
 import { htmlLang, withPageCorner, type Lang } from "../core/i18n.js";
 
 function serializeForScript(value: unknown): string {
@@ -18,6 +20,8 @@ const zh = {
   locale: "zh-CN",
   expand: "展开",
   collapse: "收起",
+  sourceBrowser: "浏览器",
+  sourceOther: "其他客户端",
   intro: "输入完整 requestId，页面会调用查询接口并展示本轮采样缓存里的请求详情。",
   requestIdPlaceholder: "例如 6dfae2ab-1234-5678-9abc-def012345678",
   query: "查询",
@@ -60,6 +64,8 @@ const MESSAGES: Record<Lang, typeof zh> = {
     locale: "en-US",
     expand: "Expand",
     collapse: "Collapse",
+    sourceBrowser: "Browser",
+    sourceOther: "Other client",
     intro: "Enter a full requestId to load the request details from the records captured in this session.",
     requestIdPlaceholder: "e.g. 6dfae2ab-1234-5678-9abc-def012345678",
     query: "Search",
@@ -102,7 +108,7 @@ export interface RecordSummary {
   capturedCount: number;
   limit: number;
   sessionStartedAt?: number;
-  recentKeys?: Array<{ key: string; requestId: string; path: string; model?: string; actualModel?: string; source: "claudecode" | "codex" | "opencode" | "other"; status: "in_progress" | "success" | "failure"; responseStatus?: number; createdAt: number }>;
+  recentKeys?: Array<{ key: string; requestId: string; path: string; model?: string; actualModel?: string; source: RequestSource; status: "in_progress" | "success" | "failure"; responseStatus?: number; createdAt: number }>;
 }
 
 const STYLE = /* css */ String.raw`
@@ -351,33 +357,13 @@ const STYLE = /* css */ String.raw`
         font-size: 12px;
         font-weight: 600;
       }
-      .source-badge {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: 28px;
-        padding: 2px 7px;
-        border-radius: 999px;
-        font-size: 10px;
-        font-weight: 800;
-        letter-spacing: 0.02em;
-        text-transform: uppercase;
-      }
-      .source-badge.claudecode {
-        background: rgba(140, 90, 47, 0.14);
-        color: var(--accent);
-      }
-      .source-badge.codex {
-        background: rgba(47, 92, 184, 0.14);
-        color: #2f5cb8;
-      }
-      .source-badge.opencode {
-        background: rgba(31, 31, 31, 0.14);
-        color: #1f1f1f;
-      }
-      .source-badge.other {
-        background: rgba(115, 101, 83, 0.14);
-        color: var(--muted);
+      .source-icon {
+        flex: none;
+        width: 20px;
+        height: 20px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: #fff center / 14px 14px no-repeat;
       }
       .status-badge {
         display: inline-flex;
@@ -683,6 +669,7 @@ const STYLE = /* css */ String.raw`
 const SCRIPT = String.raw`
       const INITIAL_SUMMARY = __INITIAL_SUMMARY__;
       const T = __MESSAGES__;
+      const SOURCE_LABELS = __SOURCE_LABELS__;
       const summaryEl = document.getElementById("summary");
       const recentEl = document.getElementById("recent");
       const recentPagerEl = document.getElementById("recent-pager");
@@ -779,11 +766,9 @@ const SCRIPT = String.raw`
         });
       }
 
-      function getSourceBadgeLabel(source) {
-        if (source === "claudecode") return "CC";
-        if (source === "codex") return "Codex";
-        if (source === "opencode") return "OpenCode";
-        return "Other";
+      // A source without a logo here (say, from a newer build sharing the database) shows the question mark.
+      function getSourceIconKey(source) {
+        return Object.hasOwn(SOURCE_LABELS, source) ? source : "other";
       }
 
       function getStatusLabel(status) {
@@ -816,10 +801,13 @@ const SCRIPT = String.raw`
         title.className = "recent-title";
         title.textContent = item.key;
         titleRow.appendChild(title);
-        const sourceBadge = document.createElement("span");
-        sourceBadge.className = "source-badge " + item.source;
-        sourceBadge.textContent = getSourceBadgeLabel(item.source);
-        titleRow.appendChild(sourceBadge);
+        const sourceKey = getSourceIconKey(item.source);
+        const sourceIcon = document.createElement("span");
+        sourceIcon.className = "source-icon " + sourceKey;
+        sourceIcon.title = SOURCE_LABELS[sourceKey];
+        sourceIcon.setAttribute("role", "img");
+        sourceIcon.setAttribute("aria-label", SOURCE_LABELS[sourceKey]);
+        titleRow.appendChild(sourceIcon);
         const statusBadge = document.createElement("span");
         statusBadge.className = getStatusBadgeClass(item);
         statusBadge.textContent = getStatusBadgeLabel(item);
@@ -2024,6 +2012,8 @@ function RecordPage({ summary, lang }: { summary: RecordSummary; lang: Lang }) {
   const panelClass = "panel recording";
   const m = MESSAGES[lang];
   const labelStyle = `:root { --label-expand: ${JSON.stringify(m.expand)}; --label-collapse: ${JSON.stringify(m.collapse)}; }`;
+  const sourceStyle = Object.entries(SOURCE_ICONS).map(([source, { icon }]) => `.source-icon.${source} { background-image: url("${icon}"); }`).join("\n");
+  const sourceLabels = Object.fromEntries(Object.entries(SOURCE_ICONS).map(([source, { label }]) => [source, source === "browser" ? m.sourceBrowser : source === "other" ? m.sourceOther : label]));
   return (
     <html lang={htmlLang(lang)}>
       <head>
@@ -2031,7 +2021,7 @@ function RecordPage({ summary, lang }: { summary: RecordSummary; lang: Lang }) {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>nanollm record</title>
         <link rel="icon" type="image/svg+xml" href={LOGO_DATA_URI} />
-        <style dangerouslySetInnerHTML={{ __html: STYLE + labelStyle }} />
+        <style dangerouslySetInnerHTML={{ __html: STYLE + labelStyle + sourceStyle }} />
       </head>
       <body>
     <main class="page">
@@ -2077,7 +2067,8 @@ function RecordPage({ summary, lang }: { summary: RecordSummary; lang: Lang }) {
           dangerouslySetInnerHTML={{
             __html: SCRIPT
               .replace("__INITIAL_SUMMARY__", serializeForScript(summary))
-              .replace("__MESSAGES__", serializeForScript(m)),
+              .replace("__MESSAGES__", serializeForScript(m))
+              .replace("__SOURCE_LABELS__", serializeForScript(sourceLabels)),
           }}
         />
       </body>

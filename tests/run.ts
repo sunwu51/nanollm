@@ -6362,6 +6362,36 @@ await runAsync("turso auto migration copies sqlite data only once per migration 
   }
 });
 
+await runAsync("record source comes from the client's user agent", async () => {
+  await startRecording({ maxSize: 50 });
+  const cases: Array<[string | undefined, string]> = [
+    ["claude-cli/2.1.300 (external, cli)", "claudecode"],
+    ["codex_cli_rs/0.130.0 (Windows 10.0.26100; x86_64) WindowsTerminal", "codex"],
+    ["opencode/1.14.2", "opencode"],
+    ["Kilo-Code/5.2.0", "kilocode"],
+    ["pi/1.0.3 (win32; node/v22.19.0; x64)", "pi"],
+    ["pi", "pi"],
+    ["pip/24.0", "other"],
+    ["Cline/3.40.1", "cline"],
+    ["QwenCode/0.9.0 (darwin; arm64)", "qwencode"],
+    ["Charm-Crush/0.20.0 (https://charm.land/crush)", "crush"],
+    ["Zed/0.215.3 (macos; aarch64)", "zed"],
+    ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", "browser"],
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/19.0 Safari/605.1.15", "browser"],
+    ["Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0", "browser"],
+    ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) SomeApp/1.0 Chrome/138.0.0.0 Electron/37.2.0 Safari/537.36", "other"],
+    ["Mozilla/5.0 (compatible; VSCodeExtension/1.0; +https://cline.bot)", "other"],
+    ["OpenAI/Python 2.3.0", "other"],
+    [undefined, "other"],
+  ];
+  for (const [index, [userAgent]] of cases.entries()) {
+    beginRecordedRequest({ requestId: `source-${index}`, path: "/v1/chat/completions", headers: userAgent ? { "User-Agent": userAgent } : {}, body: { model: "alpha" }, stream: false });
+  }
+  const sources = new Map((await getRecordSummary()).recentKeys.map((entry) => [entry.requestId, entry.source]));
+  for (const [index, [userAgent, expected]] of cases.entries()) assert.equal(sources.get(`source-${index}`), expected, String(userAgent));
+  await stopRecording();
+});
+
 await runAsync("record store resets on start and supports full request id lookup", async () => {
   await startRecording();
   const requestId = "abcdef12-3456-7890-abcd-ef1234567890";
@@ -7098,27 +7128,23 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /recent-title/);
   assert.match(html, /recent-model-row/);
   assert.match(html, /recent-model/);
-  assert.match(html, /source-badge/);
-  assert.match(html, /source-badge\.claudecode/);
-  assert.match(html, /source-badge\.codex/);
-  assert.match(html, /source-badge\.opencode/);
-  assert.match(html, /source-badge\.other/);
+  assert.match(html, /\.source-icon \{/);
+  for (const source of ["claudecode", "codex", "opencode", "pi", "cline", "kilocode", "qwencode", "crush", "zed", "browser", "other"]) {
+    assert.match(html, new RegExp(`\\.source-icon\\.${source} \\{ background-image: url\\("data:image/(svg\\+xml|png;base64),`));
+  }
   assert.match(html, /status-badge/);
   assert.match(html, /width: 260px/);
   assert.match(html, /color: #2f5cb8/);
-  assert.match(html, /color: #1f1f1f/);
-  assert.match(html, /getSourceBadgeLabel/);
+  assert.match(html, /getSourceIconKey/);
   assert.match(html, /getStatusLabel/);
-  assert.match(html, /return "CC"/);
-  assert.match(html, /return "Codex"/);
-  assert.match(html, /return "OpenCode"/);
-  assert.match(html, /return "Other"/);
+  assert.match(html, /const SOURCE_LABELS = \{"claudecode":"Claude Code","codex":"Codex",.*"browser":"浏览器","other":"其他客户端"\}/);
   assert.match(html, /return T.statusSuccess/);
   assert.match(html, /return T.statusFailure/);
   assert.match(html, /return T.statusInProgress/);
   assert.match(html, /titleRow\.className = "recent-title-row"/);
   assert.match(html, /title\.className = "recent-title"/);
-  assert.match(html, /sourceBadge\.className = "source-badge " \+ item\.source/);
+  assert.match(html, /sourceIcon\.className = "source-icon " \+ sourceKey/);
+  assert.match(html, /sourceIcon\.setAttribute\("aria-label", SOURCE_LABELS\[sourceKey\]\)/);
   assert.match(html, /statusBadge\.className = getStatusBadgeClass\(item\)/);
   assert.match(html, /actualModel\.textContent = "-> " \+ \(item\.actualModel \|\| "-"\)/);
   assert.match(html, /meta\.textContent = item\.path \+ " · " \+ formatRecentTime\(item\.createdAt\)/);
