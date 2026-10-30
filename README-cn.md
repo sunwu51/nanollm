@@ -51,22 +51,20 @@
 
 ## 快速开始
 
-**1. 创建最简配置。** 新建 `config.yaml`，只需要写端口，供应商和模型都不用提前配置：
+**1. 启动。**
+
+```bash
+npx nanollm@latest
+```
+
+默认使用当前目录下的 `config.yaml`；也可以通过 `--config /path/to/config.yaml` 或环境变量 `CONFIG_PATH` 指定其他路径。文件不存在时，nanollm 会自动创建一份只写端口的最简配置：端口为 3000，若已被占用则顺延到下一个空闲端口（启动日志会打印实际端口）。供应商和模型都不用提前配置：
 
 ```yaml
 server:
   port: 3000
 ```
 
-**2. 启动。**
-
-```bash
-npx nanollm@latest --config /path/to/config.yaml
-```
-
-如果当前目录就有 `config.yaml`，也可以直接运行 `npx nanollm`；配置文件路径也可以通过环境变量 `CONFIG_PATH` 指定。npm 发布包不会包含配置文件，需要自己创建。
-
-**3. 在管理页中配置。** 打开 `http://localhost:3000/admin`，添加供应商、模型和 fallback 分组等。点击“保存并应用”后配置立即生效，并且**会自动回写到 `config.yaml`**，不需要手动编辑文件（当然手动改文件也会被自动加载）。如果要把服务暴露到本机以外，请先配置 [Bearer Key 认证](#bearer-key-认证)。
+**2. 在管理页中配置。** 打开 `http://localhost:3000/admin`，添加供应商、模型和 fallback 分组等。点击“保存并应用”后配置立即生效，并且**会自动回写到 `config.yaml`**，不需要手动编辑文件（当然手动改文件也会被自动加载）。如果要把服务暴露到本机以外，请先配置 [Bearer Key 认证](#bearer-key-认证)。
 
 **4. 调用。** 配置好的模型即可通过下面的接口使用：
 

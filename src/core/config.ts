@@ -3,6 +3,7 @@ import { parse as parseYAML } from "yaml";
 import type { StreamFormat } from "../converters/streams.js";
 import { compileRecordRule } from "./record-rule.js";
 
+export const DEFAULT_PORT = 3000;
 export const DEFAULT_RECORD_MAX_SIZE = 10;
 export const DEFAULT_TTFB_TIMEOUT = 5000;
 export const DEFAULT_OPENAI_IMAGE_TTFB_TIMEOUT = 600000;
@@ -348,7 +349,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
   const tokens = normalizeTokens(document.tokens, new Set([...Object.keys(fallback), ...models.map((model) => model.name)]), authToken);
 
   return {
-    port: Number(process.env.PORT) || options?.port || (document.server?.port ?? 3000),
+    port: Number(process.env.PORT) || options?.port || (document.server?.port ?? DEFAULT_PORT),
     ...(defaultTTFBTimeout !== undefined ? { ttfb_timeout: defaultTTFBTimeout } : {}),
     ...(authToken ? { auth: { token: authToken } } : {}),
     models,

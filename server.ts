@@ -1,6 +1,5 @@
 import "dotenv/config";
 import { JobModelCatalog } from "./src/jobs/job-model-catalog.js";
-import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { Hono } from "hono";
@@ -14,8 +13,9 @@ import { getRequestAuthToken, webAuth } from "./src/core/web-auth.js";
 import { getAccessibleModelNames, isScopedToken, listAccessibleModels, resolveInternalModelName, resolveModelAccess } from "./src/core/auth.js";
 import { localize, resolveLang, runWithLang } from "./src/core/i18n.js";
 import { withWebUIAuth } from "./src/pages/login-page.js";
-import { parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
-import { ConfigManager, writeFileAtomic } from "./src/core/config-manager.js";
+import { DEFAULT_PORT, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
+import { ConfigManager, ensureConfigFile, writeFileAtomic } from "./src/core/config-manager.js";
+import { findAvailablePort } from "./src/core/port.js";
 import { shouldSkipRecord } from "./src/core/record-rule.js";
 import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy/proxy.js";
 import { forwardRequest, forwardStreamRequest, passthroughAlphaSearchRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, type OpenAIImageOperation } from "./src/proxy/proxy.js";
@@ -102,14 +102,7 @@ function resolveConfigPath(argv: string[]): string {
     return resolve(process.cwd(), process.env.CONFIG_PATH);
   }
 
-  const cwdConfigPath = resolve(process.cwd(), "config.yaml");
-  if (existsSync(cwdConfigPath)) {
-    return cwdConfigPath;
-  }
-
-  throw new Error(
-    "Missing config file. Pass --config /path/to/config.yaml, set CONFIG_PATH, or place config.yaml in the current directory.",
-  );
+  return resolve(process.cwd(), "config.yaml");
 }
 
 type StorageMode = "memory" | "sqlite";
@@ -135,6 +128,11 @@ function resolveStorageMode(argv: string[]): StorageMode {
 
 const startupArgs = process.argv.slice(2);
 const configPath = resolveConfigPath(startupArgs);
+// PORT overrides the file's port, so only probe for a free one when it isn't set.
+const createdPort = await ensureConfigFile(configPath, async () => process.env.PORT ? DEFAULT_PORT : findAvailablePort(DEFAULT_PORT));
+if (createdPort !== undefined) {
+  console.log(`[CONFIG INIT] created ${configPath} with port ${createdPort}; configure providers and models in /admin`);
+}
 configureSubscriptionStorage(configPath);
 configureClaudeSubscriptionStorage(configPath);
 const storageMode = resolveStorageMode(startupArgs);
