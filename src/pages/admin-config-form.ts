@@ -10,6 +10,7 @@ type AdminModelDraft = {
   api_key: string;
   model: string;
   proxy?: string;
+  disabled?: boolean;
   body_expression?: string;
   response_expression?: string;
   extras?: Record<string, unknown>;
@@ -20,10 +21,12 @@ type AdminProviderDraft = {
   base_url: string;
   api_key: string;
   proxy?: string;
+  disabled?: boolean;
 };
 type AdminFallbackDraft = {
   name: string;
   members: string[];
+  disabled?: boolean;
 };
 export type AdminConfigForm = {
   rootExtras?: Record<string, unknown>;
@@ -53,6 +56,10 @@ function toPositiveIntegerOrUndefined(value: unknown, fieldName: string): number
     throw new Error(`'${fieldName}' must be a positive integer`);
   }
   return normalized;
+}
+
+function toBooleanFlag(value: unknown): boolean {
+  return value === true || (typeof value === "string" && value.trim().toLowerCase() === "true");
 }
 
 function toPlainObject(value: unknown): Record<string, unknown> {
@@ -88,6 +95,7 @@ export function buildAdminConfigForm(rawText: string): AdminConfigForm {
             base_url: toInputString(providerObject.base_url),
             api_key: toInputString(providerObject.api_key),
             proxy: toInputString(providerObject.proxy),
+            disabled: toBooleanFlag(providerObject.disabled),
           };
         })
       : [],
@@ -96,7 +104,7 @@ export function buildAdminConfigForm(rawText: string): AdminConfigForm {
           const modelObject = toPlainObject(entry);
           const {
             name, provider, custom_provider, base_url, api_key, model, proxy,
-            body_expression, bodyExpression, response_expression, responseExpression,
+            body_expression, bodyExpression, response_expression, responseExpression, disabled,
             ...extras
           } = modelObject;
           return {
@@ -108,6 +116,7 @@ export function buildAdminConfigForm(rawText: string): AdminConfigForm {
             api_key: toInputString(api_key),
             model: toInputString(model),
             proxy: toInputString(proxy),
+            disabled: toBooleanFlag(disabled),
             body_expression: toInputString(body_expression ?? bodyExpression),
             response_expression: toInputString(response_expression ?? responseExpression),
             extras,
@@ -116,10 +125,15 @@ export function buildAdminConfigForm(rawText: string): AdminConfigForm {
       : [],
     fallbackGroups:
       fallback && typeof fallback === "object" && !Array.isArray(fallback)
-        ? Object.entries(fallback as Record<string, unknown>).map(([name, members]) => ({
-            name,
-            members: Array.isArray(members) ? members.map((member) => toInputString(member)).filter(Boolean) : [],
-          }))
+        ? Object.entries(fallback as Record<string, unknown>).map(([name, entry]) => {
+            const entryObject = entry && typeof entry === "object" && !Array.isArray(entry) ? (entry as Record<string, unknown>) : undefined;
+            const members = entryObject ? entryObject.members : entry;
+            return {
+              name,
+              members: Array.isArray(members) ? members.map((member) => toInputString(member)).filter(Boolean) : [],
+              disabled: toBooleanFlag(entryObject?.disabled),
+            };
+          })
         : [],
   };
 }
@@ -137,7 +151,7 @@ export function buildAdminConfigFormFromEffectiveConfig(config: ServerConfig): A
       max_size: toInputString(config.record.max_size),
       skip_when: config.record.skip_when ?? "",
     },
-    providers: config.providers.map((provider) => ({ ...provider, proxy: provider.proxy ?? "" })),
+    providers: config.providers.map((provider) => ({ ...provider, proxy: provider.proxy ?? "", disabled: !!provider.disabled })),
     models: config.models.map((model) => ({
       name: model.name,
       connection_mode: model.custom_provider ? "custom" : "direct",
@@ -147,11 +161,12 @@ export function buildAdminConfigFormFromEffectiveConfig(config: ServerConfig): A
       api_key: model.api_key,
       model: model.model,
       proxy: model.proxy ?? "",
+      disabled: !!model.disabled,
       body_expression: model.bodyExpression ?? "",
       response_expression: model.responseExpression ?? "",
       extras: {},
     })),
-    fallbackGroups: Object.entries(config.fallback).map(([name, members]) => ({ name, members })),
+    fallbackGroups: Object.entries(config.fallback).map(([name, members]) => ({ name, members, disabled: config.disabled_fallback.includes(name) })),
   };
 }
 
@@ -172,6 +187,7 @@ export function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { pr
           provider: entry.provider ?? "",
           ...(entry.provider === "openai-subscription" || entry.provider === "claude-subscription" ? {} : { base_url: entry.base_url ?? "", api_key: entry.api_key ?? "" }),
           ...(proxy ? { proxy } : {}),
+          ...(toBooleanFlag(entry.disabled) ? { disabled: true } : {}),
         };
       })
     : [];
@@ -179,7 +195,7 @@ export function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { pr
   const models = Array.isArray(form.models)
     ? form.models.map((entry) => {
         const customProvider = entry.connection_mode === "custom" ? (entry.custom_provider ?? "").trim() : "";
-        const { body_expression, bodyExpression: legacyBody, response_expression, responseExpression: legacyResponse, proxy: extraProxy, ...extras } = toPlainObject(entry.extras);
+        const { body_expression, bodyExpression: legacyBody, response_expression, responseExpression: legacyResponse, proxy: extraProxy, disabled: _extraDisabled, ...extras } = toPlainObject(entry.extras);
         const proxy = toInputString(entry.proxy || extraProxy).trim();
         const bodyExpression = toInputString(entry.body_expression || body_expression || legacyBody).trim();
         const responseExpression = toInputString(entry.response_expression || response_expression || legacyResponse).trim();
@@ -193,6 +209,7 @@ export function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { pr
           ...(proxy ? { proxy } : {}),
           ...(bodyExpression ? { body_expression: bodyExpression } : {}),
           ...(responseExpression ? { response_expression: responseExpression } : {}),
+          ...(toBooleanFlag(entry.disabled) ? { disabled: true } : {}),
         };
       })
     : [];
@@ -202,7 +219,7 @@ export function buildYamlTextFromAdminForm(form: AdminConfigForm, options?: { pr
       .filter((group) => group && typeof group.name === "string" && group.name.trim())
       .map((group) => {
         const members = (Array.isArray(group.members) ? group.members : []).map((member) => String(member).trim()).filter(Boolean);
-        return [group.name.trim(), members];
+        return [group.name.trim(), toBooleanFlag(group.disabled) ? { members, disabled: true } : members];
       }),
   );
 

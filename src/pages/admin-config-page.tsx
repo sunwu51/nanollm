@@ -174,6 +174,10 @@ const zh = {
   noFallbackGroups: "还没有 fallback 分组，点击“添加分组”后可以为分组选择模型列表。",
   unnamedGroupN: "未命名分组 {n}",
   deleteGroup: "删除分组",
+  disableItem: "停用",
+  enableItem: "启用",
+  disabledBadge: "已停用",
+  disabledProviderNote: "该供应商已停用，引用它的模型不会处理请求。",
   groupNameClash: "与 {others} 重名，请修改分组名",
   groupNamePlaceholder: "例如 gpt-5.4",
   duplicateMembers: "当前分组存在重复模型名：{names}。保存时会被拦截。",
@@ -383,6 +387,10 @@ const MESSAGES: Record<Lang, typeof zh> = {
     noFallbackGroups: "No fallback groups yet. Click “Add group”, then choose its models.",
     unnamedGroupN: "Unnamed group {n}",
     deleteGroup: "Delete group",
+    disableItem: "Disable",
+    enableItem: "Enable",
+    disabledBadge: "Disabled",
+    disabledProviderNote: "This provider is disabled; models that reference it do not serve requests.",
     groupNameClash: "Same name as {others}; rename the group",
     groupNamePlaceholder: "e.g. gpt-5.4",
     duplicateMembers: "This group lists the same model more than once: {names}. Saving will be blocked.",
@@ -829,6 +837,10 @@ const STYLE = /* css */ String.raw`
       .card.compact {
         gap: 10px;
       }
+      .card.is-disabled .card-title h3,
+      .card.is-disabled .card-summary {
+        opacity: 0.6;
+      }
       .card-head {
         display: flex;
         justify-content: space-between;
@@ -1066,7 +1078,7 @@ const SCRIPT = /* js */ String.raw`
       const MODEL_PROVIDERS = ["openai-chat", "openai-responses", "anthropic", "openai-image"];
       const SUBSCRIPTION_PROVIDERS = ["openai-subscription", "claude-subscription"];
       const PROVIDERS = [...MODEL_PROVIDERS, ...SUBSCRIPTION_PROVIDERS];
-      const RESERVED_MODEL_EXTRA_KEYS = new Set(["name", "provider", "custom_provider", "base_url", "api_key", "model", "proxy", "body_expression", "response_expression", "bodyExpression", "responseExpression"]);
+      const RESERVED_MODEL_EXTRA_KEYS = new Set(["name", "provider", "custom_provider", "base_url", "api_key", "model", "proxy", "disabled", "body_expression", "response_expression", "bodyExpression", "responseExpression"]);
       let saving = false;
       let dirty = false;
       let localIdCounter = 0;
@@ -1585,7 +1597,7 @@ const SCRIPT = /* js */ String.raw`
         const nameConflicts = getNameConflicts();
         formState.providers.forEach((provider) => {
           const card = document.createElement("section");
-          card.className = "card" + (provider._expanded ? "" : " compact");
+          card.className = "card" + (provider._expanded ? "" : " compact") + (provider.disabled ? " is-disabled" : "");
 
           const head = document.createElement("div");
           head.className = "card-head";
@@ -1606,6 +1618,7 @@ const SCRIPT = /* js */ String.raw`
           const h3 = document.createElement("h3");
           h3.textContent = (provider.name || "").trim() || T.unnamedProvider;
           title.appendChild(h3);
+          appendDisabledBadge(title, provider);
           toggleTop.appendChild(chevron);
           toggleTop.appendChild(title);
           toggle.appendChild(toggleTop);
@@ -1761,6 +1774,7 @@ const SCRIPT = /* js */ String.raw`
             } else if (!(provider.base_url || "").trim()) { window.alert(T.baseUrlFirst); return; }
             openFetchModelsDialog(provider);
           }));
+          actions.appendChild(createDisableToggle(provider));
           actions.appendChild(createActionButton(T.deleteProvider, "danger", () => {
             formState.providers = formState.providers.filter((item) => item._id !== provider._id);
             markDirty(true);
@@ -1913,6 +1927,22 @@ const SCRIPT = /* js */ String.raw`
         });
         dialog.showModal();
         input.focus();
+      }
+
+      function createDisableToggle(item) {
+        return createActionButton(item.disabled ? T.enableItem : T.disableItem, "secondary", () => {
+          item.disabled = !item.disabled;
+          markDirty(true);
+          renderAll();
+        });
+      }
+
+      function appendDisabledBadge(title, item) {
+        if (!item.disabled) return;
+        const badge = document.createElement("div");
+        badge.className = "pill warning";
+        badge.textContent = T.disabledBadge;
+        title.appendChild(badge);
       }
 
       function createActionButton(label, className, onClick) {
@@ -2551,7 +2581,7 @@ const SCRIPT = /* js */ String.raw`
           const nameSources = duplicateNames.get(normalizeModelRef(model.name));
           const nameConflict = nameSources ? tr(T.nameClash, { others: describeOtherSources(nameSources, model) }) : "";
           const card = document.createElement("section");
-          card.className = "card" + (model._expanded ? "" : " compact") + (nameConflict ? " conflict" : "");
+          card.className = "card" + (model._expanded ? "" : " compact") + (nameConflict ? " conflict" : "") + (model.disabled ? " is-disabled" : "");
 
           const head = document.createElement("div");
           head.className = "card-head";
@@ -2596,6 +2626,7 @@ const SCRIPT = /* js */ String.raw`
             badge.textContent = expressionKeys.join(" · ");
             title.appendChild(badge);
           }
+          appendDisabledBadge(title, model);
           toggleTop.appendChild(title);
           toggle.appendChild(toggleTop);
 
@@ -2617,6 +2648,7 @@ const SCRIPT = /* js */ String.raw`
             }
             actions.appendChild(testButton);
           }
+          actions.appendChild(createDisableToggle(model));
           actions.appendChild(
             createActionButton(T.duplicate, "secondary", () => {
               const id = nextId("model");
@@ -2774,7 +2806,7 @@ const SCRIPT = /* js */ String.raw`
 
         formState.fallbackGroups.forEach((group, index) => {
           const card = document.createElement("section");
-          card.className = "card" + (group._expanded ? "" : " compact");
+          card.className = "card" + (group._expanded ? "" : " compact") + (group.disabled ? " is-disabled" : "");
           const duplicateMembers = getDuplicateMembers(group);
 
           const head = document.createElement("div");
@@ -2796,6 +2828,7 @@ const SCRIPT = /* js */ String.raw`
           const h3 = document.createElement("h3");
           h3.textContent = group.name?.trim() || tr(T.unnamedGroupN, { n: index + 1 });
           title.appendChild(h3);
+          appendDisabledBadge(title, group);
           toggleTop.appendChild(chevron);
           toggleTop.appendChild(title);
           toggle.appendChild(toggleTop);
@@ -2806,6 +2839,7 @@ const SCRIPT = /* js */ String.raw`
           head.appendChild(toggle);
           const headActions = document.createElement("div");
           headActions.className = "card-actions";
+          headActions.appendChild(createDisableToggle(group));
           headActions.appendChild(
             createActionButton(T.deleteGroup, "danger", () => {
               formState.fallbackGroups = formState.fallbackGroups.filter((item) => item._id !== group._id);

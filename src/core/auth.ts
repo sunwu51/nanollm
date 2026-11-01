@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { getPublicModelNames, resolveModelForRequest, type ServerConfig, type TokenConfig } from "./config.js";
+import { getPublicModelNames, isPublicNameDisabled, resolveModelForRequest, type ServerConfig, type TokenConfig } from "./config.js";
 
 export function extractBearerToken(headerValue: string | null | undefined): string | undefined {
   if (!headerValue) return undefined;
@@ -117,11 +117,12 @@ export function canAccessModel(config: ServerConfig, name: string, candidateToke
 
 /** The names a token can request, each with the public model or group name it routes to. */
 export function listAccessibleModels(config: ServerConfig, candidateToken: string | undefined): Array<{ name: string; target: string }> {
-  if (matchesToken(config.auth?.token, candidateToken)) return getPublicModelNames(config).map((name) => ({ name, target: name }));
+  const enabled = (name: string) => !isPublicNameDisabled(config, name);
+  if (matchesToken(config.auth?.token, candidateToken)) return getPublicModelNames(config).filter(enabled).map((name) => ({ name, target: name }));
   const token = findClientToken(config, candidateToken);
-  const listed = (token?.models ?? []).map(({ alias, target }) => ({ name: alias, target }));
+  const listed = (token?.models ?? []).filter(({ target }) => enabled(target)).map(({ alias, target }) => ({ name: alias, target }));
   const names = new Set(listed.map((entry) => entry.name));
-  const open = getPublicModelNames(config).filter((name) => !names.has(name) && isOpenName(config, name)).map((name) => ({ name, target: name }));
+  const open = getPublicModelNames(config).filter((name) => !names.has(name) && enabled(name) && isOpenName(config, name)).map((name) => ({ name, target: name }));
   return [...listed, ...open];
 }
 

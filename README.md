@@ -199,6 +199,8 @@ gpt-5.4
 
 `gpt-5.4` is a fallback group. When it is requested, the members are tried in ascending order of `max(0, failures in the last 5 minutes - 1)`; members with the same score keep their configured order. Values written as `${ENV_NAME}` are replaced with the environment variable of the same name when the config is loaded.
 
+**Pausing without deleting.** Set `disabled: true` on a provider, a model or a fallback group to stop serving it while keeping its config. A model under a disabled provider is disabled too. Disabled members are skipped in fallback groups, a group whose members are all disabled answers `503`, and disabled entries are hidden from `/v1/models`. A disabled group uses the object form, `fallback: { name: { members: [a, b], disabled: true } }`. Admin model tests still reach disabled models, so you can check one before re-enabling it. The admin page has an enable/disable button on each card.
+
 ## Configuration guide
 
 ### Shared providers
