@@ -169,6 +169,19 @@ const zh = {
   addProviderFirst: "请先添加供应商。",
   upstreamModelPlaceholder: "上游真实模型名",
   modelProxyHelper: "可选。该模型调用上游时使用的 HTTP proxy，优先级最高；留空则依次回退到供应商 proxy、HTTPS_PROXY/HTTP_PROXY（NO_PROXY 中的主机直连）。",
+  testExpression: "测试表达式",
+  expressionTestNote: "在浏览器中使用当前未保存的表达式和示例 JSON 进行测试，不发送到服务器，也不会自动保存配置。",
+  expressionBrowserNote: "此转换在前端浏览器 Web Worker 中模拟运行，并非真实的 Node.js 环境，实际运行结果可能有所不同。",
+  expressionTimeout: "表达式运行超时（1 秒）",
+  expressionWorkerError: "浏览器无法运行表达式测试",
+  expressionSizeError: "测试输入或输出超过 1 MiB 限制",
+  expressionOriginal: "原始 JSON",
+  expressionHeaders: "响应头 JSON（可选）",
+  expressionOutput: "转换结果",
+  expressionRun: "运行",
+  expressionRunning: "正在运行…",
+  expressionSuccess: "运行成功",
+  expressionJsonError: "请输入有效的 JSON",
   bodyExpressionHelper: "可选。JS 表达式，变量 body 为最终上游请求体，需同步返回新的 body；留空表示不改写。",
   responseExpressionHelper: "可选。JS 表达式，变量 response 为上游 JSON/SSE 响应、headers 为只读的上游响应头，需返回新的 response；留空表示不改写。",
   noFallbackGroups: "还没有 fallback 分组，点击“添加分组”后可以为分组选择模型列表。",
@@ -382,6 +395,19 @@ const MESSAGES: Record<Lang, typeof zh> = {
     addProviderFirst: "Add a provider first.",
     upstreamModelPlaceholder: "Upstream model name",
     modelProxyHelper: "Optional. HTTP proxy for this model's upstream calls, with the highest priority; if empty, falls back to the provider proxy, then HTTPS_PROXY/HTTP_PROXY (hosts in NO_PROXY connect directly).",
+    testExpression: "Test expression",
+    expressionTestNote: "Tests the current unsaved expression against sample JSON in your browser. Nothing is sent to the server and the config is not saved.",
+    expressionBrowserNote: "This transformation is simulated in a frontend browser Web Worker, not the real Node.js environment. Actual runtime results may differ.",
+    expressionTimeout: "Expression timed out (1 second)",
+    expressionWorkerError: "The browser could not run the expression test",
+    expressionSizeError: "Test input or output exceeds the 1 MiB limit",
+    expressionOriginal: "Original JSON",
+    expressionHeaders: "Response headers JSON (optional)",
+    expressionOutput: "Transformed JSON",
+    expressionRun: "Run",
+    expressionRunning: "Running…",
+    expressionSuccess: "Expression completed",
+    expressionJsonError: "Enter valid JSON",
     bodyExpressionHelper: "Optional. A JS expression: body is the final upstream request body, and it must synchronously return the new body. Leave empty to keep it unchanged.",
     responseExpressionHelper: "Optional. A JS expression: response is the upstream JSON/SSE response and headers the read-only upstream response headers. It must return the new response. Leave empty to keep it unchanged.",
     noFallbackGroups: "No fallback groups yet. Click “Add group”, then choose its models.",
@@ -1423,6 +1449,7 @@ const SCRIPT = /* js */ String.raw`
         textarea.value = model[key] || "";
         textarea.placeholder = options.placeholder;
         textarea.setAttribute("data-expression-key", key);
+        textarea.setAttribute("data-focus-id", "expression-" + model._id + "-" + key);
         textarea.addEventListener("keydown", (event) => {
           if (event.key !== "Tab" || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
           event.preventDefault();
@@ -1439,7 +1466,162 @@ const SCRIPT = /* js */ String.raw`
         field.appendChild(label);
         field.appendChild(textarea);
         field.appendChild(helper);
+        field.appendChild(createActionButton(T.testExpression, "secondary", () => openExpressionTestDialog(model, key)));
         container.appendChild(field);
+      }
+
+      // Runs only inside a disposable browser worker. This is a preview, not a security sandbox.
+      function expressionTestWorker() {
+        self.onmessage = (event) => {
+          try {
+            const { kind, expression, input, headers } = event.data;
+            const responseMode = kind === "response_expression";
+            const headerRecord = {};
+            if (responseMode && headers !== undefined) {
+              if (!headers || typeof headers !== "object" || Array.isArray(headers)) throw new Error("Headers must be a JSON object with string values");
+              const normalized = new Headers();
+              for (const [name, value] of Object.entries(headers)) {
+                if (typeof value !== "string") throw new Error("Headers must be a JSON object with string values");
+                normalized.set(name, value);
+              }
+              for (const [name, value] of normalized) Object.defineProperty(headerRecord, name, { value, enumerable: true });
+            }
+            Object.freeze(headerRecord);
+            const result = expression.trim()
+              ? new Function(responseMode ? "response" : "body", "headers", "return (" + expression + "\n);")(input, headerRecord)
+              : input;
+            if (result === undefined) throw new Error("Expression returned undefined");
+            if (result && typeof result.then === "function") throw new Error("Expression must return synchronously");
+            const output = JSON.stringify(result, null, 2);
+            if (output === undefined) throw new Error("Expression result is not JSON serializable");
+            if (new TextEncoder().encode(output).length > 1024 * 1024) {
+              self.postMessage({ sizeError: true });
+              return;
+            }
+            self.postMessage({ output });
+          } catch (error) {
+            self.postMessage({ error: String(error?.message || error).slice(0, 4000) });
+          }
+        };
+      }
+
+      function openExpressionTestDialog(model, key) {
+        const isResponse = key === "response_expression";
+        const dialog = document.createElement("dialog");
+        dialog.className = "model-test-dialog";
+        const body = document.createElement("div");
+        body.className = "model-test-body";
+        const heading = document.createElement("h3");
+        heading.textContent = T.testExpression + " · " + key;
+        const note = document.createElement("div");
+        note.className = "helper";
+        note.textContent = T.expressionTestNote + (isResponse ? " " + T.responseExpressionHelper : "");
+        body.append(heading, note);
+
+        function addInput(labelText, value) {
+          const field = document.createElement("label");
+          field.className = "field";
+          const label = document.createElement("span");
+          label.textContent = labelText;
+          const input = document.createElement("textarea");
+          input.className = "expression-input";
+          input.spellcheck = false;
+          input.value = value;
+          field.append(label, input);
+          body.appendChild(field);
+          return input;
+        }
+        const expression = addInput(key, model[key] || "");
+        expression.addEventListener("input", () => {
+          model[key] = expression.value;
+          const field = document.querySelector('[data-focus-id="expression-' + model._id + '-' + key + '"]');
+          if (field) field.value = expression.value;
+          markDirty(true);
+        });
+        const input = addInput(T.expressionOriginal, isResponse
+          ? '{\n  "model": "example",\n  "choices": []\n}'
+          : '{\n  "model": "example",\n  "messages": [{ "role": "user", "content": "Hello" }]\n}');
+        const headers = isResponse ? addInput(T.expressionHeaders, "{}") : null;
+        const status = document.createElement("div");
+        status.className = "status";
+        status.setAttribute("role", "status");
+        const outputLabel = document.createElement("div");
+        outputLabel.textContent = T.expressionOutput;
+        outputLabel.hidden = true;
+        const output = document.createElement("pre");
+        output.className = "model-test-raw";
+        output.hidden = true;
+        body.append(status, outputLabel, output);
+        const actions = document.createElement("div");
+        actions.className = "model-test-actions";
+        let worker = null;
+        let workerUrl = null;
+        let timer = null;
+        function stopWorker() {
+          if (timer !== null) clearTimeout(timer);
+          if (worker) worker.terminate();
+          if (workerUrl) URL.revokeObjectURL(workerUrl);
+          timer = null;
+          worker = null;
+          workerUrl = null;
+          run.disabled = false;
+        }
+        const run = createActionButton(T.expressionRun, "", () => {
+          output.hidden = true;
+          outputLabel.hidden = true;
+          let sample, sampleHeaders;
+          try {
+            sample = JSON.parse(input.value);
+            sampleHeaders = headers ? JSON.parse(headers.value.trim() || "{}") : undefined;
+          } catch (error) {
+            status.className = "status error";
+            status.textContent = T.expressionJsonError + ": " + error.message;
+            return;
+          }
+          run.disabled = true;
+          status.className = "status warn";
+          status.textContent = T.expressionRunning;
+          function fail(message) {
+            stopWorker();
+            status.className = "status error";
+            status.textContent = message;
+          }
+          try {
+            if (new TextEncoder().encode(JSON.stringify({ expression: expression.value, input: sample, headers: sampleHeaders })).length > 1024 * 1024) throw new Error(T.expressionSizeError);
+            workerUrl = URL.createObjectURL(new Blob(["(" + expressionTestWorker.toString() + ")()"], { type: "text/javascript" }));
+            worker = new Worker(workerUrl);
+            worker.onmessage = (event) => {
+              const payload = event.data;
+              if (payload.error || payload.sizeError) { fail(payload.error || T.expressionSizeError); return; }
+              stopWorker();
+              output.textContent = payload.output;
+              output.hidden = false;
+              outputLabel.hidden = false;
+              status.className = "status success";
+              status.textContent = T.expressionSuccess;
+            };
+            worker.onerror = (event) => {
+              event.preventDefault();
+              fail(event.message || T.expressionWorkerError);
+            };
+            worker.onmessageerror = () => fail(T.expressionWorkerError);
+            timer = setTimeout(() => fail(T.expressionTimeout), 1000);
+            worker.postMessage({ kind: key, expression: expression.value, input: sample, headers: sampleHeaders });
+          } catch (error) {
+            fail(error.message || String(error));
+          }
+        });
+        actions.append(createActionButton(T.close, "ghost", () => dialog.close()), run);
+        body.appendChild(actions);
+        const browserNote = document.createElement("div");
+        browserNote.className = "helper";
+        browserNote.textContent = T.expressionBrowserNote;
+        body.appendChild(browserNote);
+        dialog.appendChild(body);
+        document.body.appendChild(dialog);
+        dialog.addEventListener("close", () => { stopWorker(); dialog.remove(); }, { once: true });
+        dialog.showModal();
+        input.focus();
       }
 
       function attachCardDrag(card, head, kind, getList, item) {
