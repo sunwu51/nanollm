@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, renameSync, watchFile, unwatchFile, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, watchFile, unwatchFile, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import {
   materializeConfig,
   parseConfigDocument,
@@ -38,6 +39,23 @@ export function writeFileAtomic(path: string, text: string) {
   const tempPath = `${path}.${randomUUID()}.tmp`;
   writeFileSync(tempPath, text, "utf-8");
   renameSync(tempPath, path);
+}
+
+/** Written to a config path that doesn't exist yet, so nanollm starts without a hand-made config. */
+export function defaultConfigText(port: number): string {
+  return `server:\n  port: ${port}\n`;
+}
+
+/**
+ * Creates a missing config file (and its directory) holding only the port from `choosePort`.
+ * Returns that port, or undefined when the file already exists.
+ */
+export async function ensureConfigFile(path: string, choosePort: () => Promise<number>): Promise<number | undefined> {
+  if (existsSync(path)) return undefined;
+  const port = await choosePort();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, defaultConfigText(port), { encoding: "utf-8", flag: "wx" });
+  return port;
 }
 
 function hashText(text: string): string {

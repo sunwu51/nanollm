@@ -177,7 +177,7 @@ test("the config manager migrates config.yaml when it loads", (t) => {
 
 test("the admin form keeps the tokens list and writes fallback groups as lists", () => {
   const form = buildAdminConfigForm(ADMIN + MODELS + TOKENS);
-  assert.deepEqual(form.fallbackGroups, [{ name: "plain", members: ["m1", "m2"] }]);
+  assert.deepEqual(form.fallbackGroups, [{ name: "plain", members: ["m1", "m2"], disabled: false }]);
   const yamlText = buildYamlTextFromAdminForm(form);
   assert.match(yamlText, /plain:\n    - m1\n    - m2/);
   assert.deepEqual(parse(yamlText).tokens, parse(TOKENS).tokens);

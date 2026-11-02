@@ -34,7 +34,8 @@ export function migrateLegacyAuthTokens(rawText: string): string | undefined {
   const fallback = document.get("fallback");
   if (isMap(fallback)) {
     for (const pair of fallback.items) {
-      if (!isMap(pair.value)) continue;
+      // The current object form (`{ members, disabled }`) is not the legacy one.
+      if (!isMap(pair.value) || pair.value.has("members")) continue;
       const groupName = isScalar(pair.key) ? pair.key.value : pair.key;
       collect(pair.value.get("auth_token"), groupName);
       const members = pair.value.get("models");

@@ -1,6 +1,5 @@
 import "dotenv/config";
 import { JobModelCatalog } from "./src/jobs/job-model-catalog.js";
-import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { Hono } from "hono";
@@ -14,8 +13,9 @@ import { getRequestAuthToken, webAuth } from "./src/core/web-auth.js";
 import { getAccessibleModelNames, isScopedToken, listAccessibleModels, resolveInternalModelName, resolveModelAccess } from "./src/core/auth.js";
 import { localize, resolveLang, runWithLang } from "./src/core/i18n.js";
 import { withWebUIAuth } from "./src/pages/login-page.js";
-import { parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
-import { ConfigManager, writeFileAtomic } from "./src/core/config-manager.js";
+import { DEFAULT_PORT, getEnabledFallbackMembers, isFallbackGroupDisabled, isModelDisabled, isPublicNameDisabled, parseConfigText, resolveFallbackModels, resolveModel, resolveModelForRequest } from "./src/core/config.js";
+import { ConfigManager, ensureConfigFile, writeFileAtomic } from "./src/core/config-manager.js";
+import { findAvailablePort } from "./src/core/port.js";
 import { shouldSkipRecord } from "./src/core/record-rule.js";
 import { applyClaudeSubscriptionHeaders, getUpstreamURL } from "./src/proxy/proxy.js";
 import { forwardRequest, forwardStreamRequest, passthroughAlphaSearchRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, type OpenAIImageOperation } from "./src/proxy/proxy.js";
@@ -102,14 +102,7 @@ function resolveConfigPath(argv: string[]): string {
     return resolve(process.cwd(), process.env.CONFIG_PATH);
   }
 
-  const cwdConfigPath = resolve(process.cwd(), "config.yaml");
-  if (existsSync(cwdConfigPath)) {
-    return cwdConfigPath;
-  }
-
-  throw new Error(
-    "Missing config file. Pass --config /path/to/config.yaml, set CONFIG_PATH, or place config.yaml in the current directory.",
-  );
+  return resolve(process.cwd(), "config.yaml");
 }
 
 type StorageMode = "memory" | "sqlite";
@@ -135,6 +128,11 @@ function resolveStorageMode(argv: string[]): StorageMode {
 
 const startupArgs = process.argv.slice(2);
 const configPath = resolveConfigPath(startupArgs);
+// PORT overrides the file's port, so only probe for a free one when it isn't set.
+const createdPort = await ensureConfigFile(configPath, async () => process.env.PORT ? DEFAULT_PORT : findAvailablePort(DEFAULT_PORT));
+if (createdPort !== undefined) {
+  console.log(`[CONFIG INIT] created ${configPath} with port ${createdPort}; configure providers and models in /admin`);
+}
 configureSubscriptionStorage(configPath);
 configureClaudeSubscriptionStorage(configPath);
 const storageMode = resolveStorageMode(startupArgs);
@@ -340,12 +338,15 @@ function orange(message: string): string {
 
 // In-process calls (jobs, replay, model test) skip the per-token model check; see routeModelRequest.
 const internalRequests = new WeakSet<Request>();
+// Admin model tests may call a model that is paused, so they can verify it before it is re-enabled.
+const disabledAllowedRequests = new WeakSet<Request>();
 
 /** A request to the app's own routes. It carries the admin token (if any) to pass the auth middleware. */
-function internalRequest(config: ServerConfig, path: string, init: RequestInit & { headers: Headers }): Request {
+function internalRequest(config: ServerConfig, path: string, init: RequestInit & { headers: Headers }, allowDisabled = false): Request {
   if (config.auth?.token) init.headers.set("authorization", `Bearer ${config.auth.token}`);
   const request = new Request(`http://127.0.0.1:${config.port}${path}`, init);
   internalRequests.add(request);
+  if (allowDisabled) disabledAllowedRequests.add(request);
   return request;
 }
 
@@ -376,6 +377,20 @@ function routeModelRequest(c: Context, config: ServerConfig, modelName: string):
   return response;
 }
 
+/** A 503 when the routed model or group is paused (disabled itself, or through its provider); undefined otherwise. */
+function rejectDisabledModel(c: Context, config: ServerConfig, routedName: string, modelName: string): Response | undefined {
+  if (disabledAllowedRequests.has(c.req.raw) || !isPublicNameDisabled(config, routedName)) return undefined;
+  const errorBody = { error: `Model '${modelName}' is disabled` };
+  const response = c.json(errorBody, 503);
+  if (getRequestId()) {
+    setRecordedRequestError({ message: errorBody.error });
+    setRecordedClientResponseMeta({ status: response.status, headers: response.headers });
+    setRecordedClientResponseBody({ body: errorBody });
+    finalizeRecordedRequest({});
+  }
+  return response;
+}
+
 function getCandidateModels(config: ServerConfig, primaryModel: string): ModelConfig[] {
   const pinned = jobRequestModels.get(getRequestId() ?? "");
   if (pinned?.name === primaryModel) return [pinned];
@@ -384,7 +399,7 @@ function getCandidateModels(config: ServerConfig, primaryModel: string): ModelCo
   if (isFallbackGroup) {
     return sortFallbackGroupMembers(resolveFallbackModels(config, primaryModel), (name) => fallbackFailureTracker.getFailureCount(name, now))
       .map((name) => resolveModel(config, name))
-      .filter((model): model is ModelConfig => Boolean(model));
+      .filter((model): model is ModelConfig => model !== undefined && !isModelDisabled(config, model));
   }
 
   const match = resolveModelForRequest(config, primaryModel);
@@ -565,7 +580,7 @@ async function testConfiguredModel(name: string, message: string, config: Server
     method: "POST",
     headers,
     body: JSON.stringify(body),
-  })));
+  }, true)));
   const raw = await response.text();
   const durationMs = Date.now() - started;
   const isStream = (response.headers.get("content-type") ?? "").includes("text/event-stream");
@@ -601,9 +616,9 @@ async function buildStatusPayload(config: ServerConfig, c?: Context) {
       name: modelName,
       series: await statusStore.getModelSeries(modelName, now),
     }))),
-    fallbackGroups: Object.entries(config.fallback).map(([name, members]) => ({
+    fallbackGroups: Object.keys(config.fallback).filter((name) => !isFallbackGroupDisabled(config, name)).map((name) => ({
       name,
-      members: sortFallbackGroupMembers(members, (memberName) => fallbackFailureTracker.getFailureCount(memberName, now)),
+      members: sortFallbackGroupMembers(getEnabledFallbackMembers(config, name), (memberName) => fallbackFailureTracker.getFailureCount(memberName, now)),
     })),
     usage: await buildUsagePayload(c, config, { basePath: "/status", now }),
   };
@@ -738,6 +753,8 @@ function createRoute(incomingFormat: StreamFormat) {
 
     const routedName = routeModelRequest(c, config, modelName);
     if (routedName instanceof Response) return routedName;
+    const disabledResponse = rejectDisabledModel(c, config, routedName, modelName);
+    if (disabledResponse) return disabledResponse;
 
     const candidateModels = getCandidateModels(config, routedName);
     if (candidateModels.length === 0) {
@@ -880,6 +897,8 @@ function createAlphaSearchRoute() {
     if (!modelName) return c.json({ error: "Missing 'model' in request body" }, 400);
     const routedName = routeModelRequest(c, config, modelName);
     if (routedName instanceof Response) return routedName;
+    const disabledResponse = rejectDisabledModel(c, config, routedName, modelName);
+    if (disabledResponse) return disabledResponse;
     const candidateModels = getCandidateModels(config, routedName);
     if (candidateModels.length === 0) return c.json({ error: `Model '${modelName}' not found in config`, available: getAccessibleModelNames(config, getRequestAuthToken(c, config.auth?.token)) }, 404);
     const requestId = getRequestId();
@@ -939,6 +958,8 @@ function createImageRoute(imageOperation: OpenAIImageOperation) {
 
     const routedName = routeModelRequest(c, config, modelName);
     if (routedName instanceof Response) return routedName;
+    const disabledResponse = rejectDisabledModel(c, config, routedName, modelName);
+    if (disabledResponse) return disabledResponse;
 
     const candidateModels = getCandidateModels(config, routedName);
     if (candidateModels.length === 0) {
@@ -1252,7 +1273,7 @@ app.get("/", (c) => {
     models: listAccessibleModels(config, getRequestAuthToken(c, config.auth?.token)).map(({ name, target }) => ({
       name,
       provider: config.fallback[target] ? "fallback-group" : resolveModel(config, target)?.provider,
-      model: config.fallback[target] ? config.fallback[target] : resolveModel(config, target)?.model,
+      model: config.fallback[target] ? getEnabledFallbackMembers(config, target) : resolveModel(config, target)?.model,
     })),
     endpoints: {
       health: "GET /health",

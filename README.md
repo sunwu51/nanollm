@@ -51,22 +51,20 @@ nanollm is a `litellm`-like proxy for LLM APIs. It stays small and runs locally,
 
 ## Quick start
 
-**1. Create a minimal config.** Create `config.yaml` with just a port. No providers or models are needed up front:
+**1. Start it.**
+
+```bash
+npx nanollm@latest
+```
+
+nanollm uses `config.yaml` in the current directory. To use another file, pass `--config /path/to/config.yaml` or set the `CONFIG_PATH` environment variable. If the file does not exist, nanollm creates a minimal one with just a port: 3000, or the next free port if 3000 is taken (the startup log shows which). No providers or models are needed up front:
 
 ```yaml
 server:
   port: 3000
 ```
 
-**2. Start it.**
-
-```bash
-npx nanollm@latest --config /path/to/config.yaml
-```
-
-If there is a `config.yaml` in the current directory you can simply run `npx nanollm`; the path can also be set with the `CONFIG_PATH` environment variable. The npm package does not ship a config file, so you need to create your own.
-
-**3. Configure in the admin page.** Open `http://localhost:3000/admin` and add providers, models, fallback groups and so on. Clicking "Save and apply" takes effect immediately and **writes the result back to `config.yaml`**, so you never have to edit the file by hand (hand edits are still picked up automatically). Before exposing the service beyond your machine, set up [Bearer key authentication](#bearer-key-authentication).
+**2. Configure in the admin page.** Open `http://localhost:3000/admin` and add providers, models, fallback groups and so on. Clicking "Save and apply" takes effect immediately and **writes the result back to `config.yaml`**, so you never have to edit the file by hand (hand edits are still picked up automatically). Before exposing the service beyond your machine, set up [Bearer key authentication](#bearer-key-authentication).
 
 **4. Call it.** Once models are configured they are available through these endpoints:
 
@@ -200,6 +198,8 @@ gpt-5.4
 ```
 
 `gpt-5.4` is a fallback group. When it is requested, the members are tried in ascending order of `max(0, failures in the last 5 minutes - 1)`; members with the same score keep their configured order. Values written as `${ENV_NAME}` are replaced with the environment variable of the same name when the config is loaded.
+
+**Pausing without deleting.** Set `disabled: true` on a provider, a model or a fallback group to stop serving it while keeping its config. A model under a disabled provider is disabled too. Disabled members are skipped in fallback groups, a group whose members are all disabled answers `503`, and disabled entries are hidden from `/v1/models`. A disabled group uses the object form, `fallback: { name: { members: [a, b], disabled: true } }`. Admin model tests still reach disabled models, so you can check one before re-enabling it. The admin page has an enable/disable button on each card.
 
 ## Configuration guide
 

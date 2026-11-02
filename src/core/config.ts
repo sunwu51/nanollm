@@ -3,6 +3,7 @@ import { parse as parseYAML } from "yaml";
 import type { StreamFormat } from "../converters/streams.js";
 import { compileRecordRule } from "./record-rule.js";
 
+export const DEFAULT_PORT = 3000;
 export const DEFAULT_RECORD_MAX_SIZE = 10;
 export const DEFAULT_TTFB_TIMEOUT = 5000;
 export const DEFAULT_OPENAI_IMAGE_TTFB_TIMEOUT = 600000;
@@ -29,6 +30,8 @@ export interface ModelConfig {
   response_expression?: string;
   ignore_invalid_history?: boolean;
   reasoning_profile?: ReasoningProfile;
+  /** Paused: requests skip this model, but the config is kept. */
+  disabled?: boolean;
 }
 
 /** How replayed thinking is adapted to the upstream (see proxy/reasoning-history). */
@@ -48,7 +51,12 @@ export interface CustomProviderConfig {
   base_url: string;
   api_key: string;
   proxy?: string;
+  /** Paused: every model that references this provider is treated as disabled. */
+  disabled?: boolean;
 }
+
+/** A `fallback` entry: the plain member list, or an object that can also pause the group. */
+export type FallbackDocumentEntry = string[] | { members: string[]; disabled?: boolean };
 
 export interface ServerConfig {
   port: number;
@@ -59,6 +67,8 @@ export interface ServerConfig {
   models: ModelConfig[];
   providers: CustomProviderConfig[];
   fallback: Record<string, string[]>;
+  /** Names of fallback groups paused with `disabled: true`. */
+  disabled_fallback: string[];
   tokens: TokenConfig[];
   record: {
     max_size: number;
@@ -91,7 +101,7 @@ export interface ParsedConfigDocument {
   record?: { max_size?: number; skip_when?: string };
   models?: Array<Partial<ModelConfig> & Pick<ModelConfig, "name" | "model">>;
   providers?: CustomProviderConfig[];
-  fallback?: Record<string, string[]>;
+  fallback?: Record<string, FallbackDocumentEntry>;
   tokens?: TokenDocument[];
 }
 
@@ -246,6 +256,8 @@ function normalizeModelConfig(model: ModelConfig, defaultTTFBTimeout?: number): 
   };
   delete normalized.body_expression;
   delete normalized.response_expression;
+  if (normalizeBoolean(model.disabled, `models.${model.name || "<unknown>"}.disabled`, false)) normalized.disabled = true;
+  else delete normalized.disabled;
   return normalized;
 }
 
@@ -290,6 +302,8 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
       proxy,
     };
     if (!proxy) delete normalized.proxy;
+    if (normalizeBoolean(provider.disabled, `providers.${name || "<unknown>"}.disabled`, false)) normalized.disabled = true;
+    else delete normalized.disabled;
     return normalized;
   });
   const providerNames = new Set<string>();
@@ -333,7 +347,7 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
       : { ...sourceModel, api_key: resolveEnvVars(String(sourceModel.api_key || "")) };
     return normalizeModelConfig(expanded as ModelConfig, defaultTTFBTimeout);
   });
-  const fallback = document.fallback ?? {};
+  const { fallback, disabledFallback } = normalizeFallbackDocument(document.fallback);
 
   for (const m of models) {
     if (!m.name) throw new Error("Model config missing 'name'");
@@ -348,12 +362,13 @@ export function materializeConfig(document: ParsedConfigDocument, options?: Mate
   const tokens = normalizeTokens(document.tokens, new Set([...Object.keys(fallback), ...models.map((model) => model.name)]), authToken);
 
   return {
-    port: Number(process.env.PORT) || options?.port || (document.server?.port ?? 3000),
+    port: Number(process.env.PORT) || options?.port || (document.server?.port ?? DEFAULT_PORT),
     ...(defaultTTFBTimeout !== undefined ? { ttfb_timeout: defaultTTFBTimeout } : {}),
     ...(authToken ? { auth: { token: authToken } } : {}),
     models,
     providers,
     fallback,
+    disabled_fallback: disabledFallback,
     tokens,
     record: {
       max_size: recordMaxSize,
@@ -399,9 +414,54 @@ export function resolveModelForRequest(config: ServerConfig, name: string): Reso
   };
 }
 
+/** Whether the model, or the provider it references, is paused. */
+export function isModelDisabled(config: ServerConfig, model: ModelConfig): boolean {
+  if (model.disabled) return true;
+  if (!model.custom_provider) return false;
+  return config.providers.some((provider) => provider.name === model.custom_provider && provider.disabled);
+}
+
+/** The members of a group that can serve: paused members are left out. */
+export function getEnabledFallbackMembers(config: ServerConfig, name: string): string[] {
+  return (config.fallback[name] ?? []).filter((member) => {
+    const model = resolveModel(config, member);
+    return model !== undefined && !isModelDisabled(config, model);
+  });
+}
+
+/** Whether the group is paused, or has no member left that can serve. */
+export function isFallbackGroupDisabled(config: ServerConfig, name: string): boolean {
+  if (config.disabled_fallback.includes(name)) return true;
+  if (!(name in config.fallback)) return false;
+  return getEnabledFallbackMembers(config, name).length === 0;
+}
+
+/** Whether a public name resolves to something that is paused (a group, or the model it routes to). */
+export function isPublicNameDisabled(config: ServerConfig, name: string): boolean {
+  if (name in config.fallback) return isFallbackGroupDisabled(config, name);
+  const match = resolveModelForRequest(config, name);
+  return match ? isModelDisabled(config, match.model) : false;
+}
+
 export function resolveFallbackModels(config: ServerConfig, name: string): string[] {
   if (name in config.fallback) return config.fallback[name];
   return [name];
+}
+
+function normalizeFallbackDocument(source: Record<string, FallbackDocumentEntry> | undefined): { fallback: Record<string, string[]>; disabledFallback: string[] } {
+  const fallback: Record<string, string[]> = {};
+  const disabledFallback: string[] = [];
+  for (const [name, entry] of Object.entries(source ?? {})) {
+    if (Array.isArray(entry)) {
+      fallback[name] = entry;
+    } else if (entry && typeof entry === "object") {
+      fallback[name] = entry.members;
+      if (normalizeBoolean(entry.disabled, `fallback.${name}.disabled`, false)) disabledFallback.push(name);
+    } else {
+      throw new Error(`Fallback group '${name}' must be a non-empty model array`);
+    }
+  }
+  return { fallback, disabledFallback };
 }
 
 function validateFallback(models: ModelConfig[], fallback: Record<string, string[]>) {
