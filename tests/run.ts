@@ -26,6 +26,8 @@ import {
 import { decodeReasoningCarrier, encodeReasoningCarrier, encodeRedactedReasoningCarrier, UnsupportedContentError } from "../src/converters/shared.js";
 import { ANTHROPIC_JSON_OBJECT_INSTRUCTION, denormalizeToAnthropicRequest, denormalizeToOpenAIChatRequest, denormalizeToOpenAIResponsesRequest, normalizeAnthropicRequest, normalizeOpenAIChatRequest, normalizeOpenAIResponsesRequest } from "../src/converters/requests.js";
 import { CLAUDE_CODE_SYSTEM_IDENTITY, relocateNonClaudeSystemPrompt } from "../src/subscriptions/claude-system-prompt.js";
+import { addClaudeBillingBlock } from "../src/subscriptions/claude-billing.js";
+import { createHash } from "node:crypto";
 import { addClaudeSubscriptionUserId, applyClaudeSubscriptionSessionIdentity, CLAUDE_SUBSCRIPTION_DEFAULT_MAX_TOKENS, sanitizeClaudeSubscriptionBody } from "../src/subscriptions/claude-subscription-body.js";
 import { buildAuthCookieValue, extractBearerToken, extractRequestToken, isAuthorizedToken, readAuthCookie } from "../src/core/auth.js";
 import { getRequestAuthToken, webAuth } from "../src/core/web-auth.js";
@@ -5182,6 +5184,22 @@ run("claude subscription leaves Claude system prompts and prompt-less requests u
     const body = { system, messages };
     assert.equal(relocateNonClaudeSystemPrompt(body), body);
   }
+});
+
+run("claude billing fingerprint samples UTF-16 positions 4, 7 and 20 of the first user message", () => {
+  const fingerprint = (sample: string) => createHash("sha256").update(`59cf53e54c78${sample}2.1.300`).digest("hex").slice(0, 3);
+  for (const [text, sample] of [
+    ["abcdefghijklmnopqrstuvwxyz", "ehu"],
+    ["请帮我看一下这个bug，然后告诉我哪里出了问题", "一个了"],
+    ["hi", "000"],
+    // A sampled half of a surrogate pair is hashed as U+FFFD, like JavaScript's UTF-8 encoding.
+    ["abcd😀fg", "�g0"],
+  ]) {
+    const result = addClaudeBillingBlock({ messages: [{ role: "user", content: [{ type: "text", text }] }] }, "claude-cli/2.1.300 (external, cli)") as any;
+    assert.equal(result.system[0].text, `x-anthropic-billing-header: cc_version=2.1.300.${fingerprint(sample)}; cc_entrypoint=cli;`, text);
+  }
+  const existing = { system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=1.2.3.abc; cc_entrypoint=cli;" }], messages: [{ role: "user", content: "请帮我看一下" }] };
+  assert.equal(addClaudeBillingBlock(existing, "claude-cli/2.1.300 (external, cli)"), existing);
 });
 
 run("claude subscription temperature default excludes Opus 5.5 and preserves explicit values", () => {

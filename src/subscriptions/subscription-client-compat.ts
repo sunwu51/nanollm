@@ -10,7 +10,7 @@ export function buildCodexCliUserAgent(version: string): string {
 }
 export const CODEX_CLI_USER_AGENT = buildCodexCliUserAgent(CODEX_CLI_VERSION);
 
-export const CLAUDE_CODE_VERSION = "2.1.289";
+export const CLAUDE_CODE_VERSION = "2.1.322";
 export const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
 export const CLAUDE_CODE_BETA = "claude-code-20250219";
 export const CLAUDE_CLI_USER_AGENT = `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`;

@@ -26,8 +26,9 @@ function billingVersion(userAgent: string | undefined): string {
 }
 
 function billingText(messages: unknown[], version: string): string {
-  const bytes = Buffer.from(firstUserText(messages), "utf8");
-  const chars = Buffer.from([4, 7, 20].map((index) => bytes[index] ?? 0x30));
+  // Claude Code samples JavaScript string positions (UTF-16 code units), not UTF-8 bytes.
+  const text = firstUserText(messages);
+  const chars = [4, 7, 20].map((index) => text[index] ?? "0").join("");
   const fingerprint = createHash("sha256").update(FINGERPRINT_SALT).update(chars).update(version).digest("hex").slice(0, 3);
   return `${BILLING_PREFIX} cc_version=${version}.${fingerprint}; cc_entrypoint=cli;`;
 }

@@ -173,7 +173,7 @@ test("claude subscription headers merge betas and default Claude Code identity",
   applyClaudeSubscriptionHeaders(headers);
   assert.equal(headers["anthropic-beta"], "interleaved-thinking-2025-05-14,claude-code-20250219,oauth-2025-04-20");
   assert.equal(headers["x-app"], "cli");
-  assert.equal(headers["user-agent"], "claude-cli/2.1.289 (external, cli)", "a non-Claude User-Agent is replaced");
+  assert.equal(headers["user-agent"], "claude-cli/2.1.322 (external, cli)", "a non-Claude User-Agent is replaced");
   assert.equal(headers["User-Agent"], undefined, "only the lowercase name is sent");
 
   const fromClaudeCode: Record<string, string> = { "anthropic-beta": "oauth-2025-04-20,claude-code-20250219", "x-app": "cli", "User-Agent": "claude-cli/9.9.9 (external, cli)" };
@@ -185,7 +185,7 @@ test("claude subscription headers merge betas and default Claude Code identity",
 
 test("claude subscription sends one lowercase user-agent when the client's arrives under both names", () => {
   // Mirrors getForwardHeaders: the forwarded client header is lowercase, the route adds the same value as User-Agent.
-  const claudeCode = "claude-cli/2.1.289 (external, cli)";
+  const claudeCode = "claude-cli/2.1.322 (external, cli)";
   const headers = mergeHeaders({ "user-agent": claudeCode }, { "User-Agent": claudeCode });
   applyClaudeSubscriptionHeaders(headers);
   assert.deepEqual(Object.keys(headers).filter(name => name.toLowerCase() === "user-agent"), ["user-agent"]);
@@ -203,7 +203,7 @@ test("claude subscription keeps only a Claude client's User-Agent and defaults a
     const headers: Record<string, string> = { "user-agent": userAgent };
     applyClaudeSubscriptionHeaders(headers);
     assert.deepEqual(Object.keys(headers).filter(name => name.toLowerCase() === "user-agent"), ["user-agent"]);
-    assert.equal(headers["user-agent"], "claude-cli/2.1.289 (external, cli)", JSON.stringify(userAgent));
+    assert.equal(headers["user-agent"], "claude-cli/2.1.322 (external, cli)", JSON.stringify(userAgent));
     assert.equal(headers["x-app"], "cli");
   }
 });
