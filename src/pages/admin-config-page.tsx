@@ -61,6 +61,19 @@ const zh = {
   resetting: "重置中…",
   resetFailed: "窗口重置失败",
   resetRequested: "5 小时窗口已请求重置，请重新查询用量确认结果。",
+  claudeResets: "额度重置",
+  claudeResetUnavailable: "未返回重置次数信息",
+  claudeResetRemaining: "剩余 {n} 次",
+  claudeResetFull: "完整重置",
+  claudeResetFable: "Fable 重置",
+  claudeResetExpires: "到期：{time}",
+  claudeResetUse: "使用重置",
+  claudeResetWait: "当前不可使用（可能未达限制、处于冷却中，或尚未轮到此重置券）",
+  claudeResetConfirm: "确定使用「{label}」吗？这会消耗 1 次重置。重置范围：{windows}",
+  claudeResetDone: "额度已重置",
+  claudeResetAlreadyUsed: "此操作已处理",
+  claudeResetDeclined: "未执行重置：{result}",
+  claudeResetRetry: "结果未确认，重试同一次操作",
   statusUnknown: "状态未知",
   savingWaitToSignIn: "正在保存配置，请保存完成后再登录。",
   unsavedBeforeSignIn: "页面有未保存的修改，请先保存配置，再登录。登录将使用已保存的供应商代理。",
@@ -287,6 +300,19 @@ const MESSAGES: Record<Lang, typeof zh> = {
     resetting: "Resetting…",
     resetFailed: "Window reset failed",
     resetRequested: "Requested a reset of the 5-hour window. Check usage again to confirm.",
+    claudeResets: "Limit resets",
+    claudeResetUnavailable: "Reset credit information was not returned",
+    claudeResetRemaining: "{n} remaining",
+    claudeResetFull: "Full reset",
+    claudeResetFable: "Fable reset",
+    claudeResetExpires: "Expires: {time}",
+    claudeResetUse: "Use reset",
+    claudeResetWait: "Unavailable now (limit, cooldown, or grant order requirements)",
+    claudeResetConfirm: "Use ‘{label}’? This consumes 1 reset. Resets: {windows}",
+    claudeResetDone: "Usage limits reset",
+    claudeResetAlreadyUsed: "This operation was already processed",
+    claudeResetDeclined: "Reset was not performed: {result}",
+    claudeResetRetry: "Result unconfirmed; retry the same operation",
     statusUnknown: "Status unknown",
     savingWaitToSignIn: "Saving the config. Sign in after it finishes.",
     unsavedBeforeSignIn: "The page has unsaved changes. Save the config before signing in; sign-in uses the saved provider proxy.",
@@ -1832,7 +1858,7 @@ const SCRIPT = /* js */ String.raw`
                 const text = await response.text();
                 let payload; try { payload = JSON.parse(text); } catch { payload = { error: text.slice(0, 240) }; }
                 if (!response.ok) throw new Error(payload.error || T.usageQueryFailed);
-                if (isClaude) { showClaudeUsageDialog(payload); return; }
+                if (isClaude) { showClaudeUsageDialog(payload, provider.name); return; }
                 const dialog = document.createElement("dialog");
                 const panel = document.createElement("div");
                 panel.style.minWidth = "420px";
@@ -2018,7 +2044,7 @@ const SCRIPT = /* js */ String.raw`
         try { return JSON.parse(text); } catch { return { error: String(text || "").slice(0, 240) }; }
       }
 
-      function showClaudeUsageDialog(payload) {
+      function showClaudeUsageDialog(payload, providerName) {
         const dialog = document.createElement("dialog");
         const panel = document.createElement("div");
         panel.style.minWidth = "420px";
@@ -2054,6 +2080,67 @@ const SCRIPT = /* js */ String.raw`
             : T.extraUsageOff;
           panel.appendChild(row);
         }
+        const resetsHeading = document.createElement("h4"); resetsHeading.textContent = T.claudeResets;
+        panel.appendChild(resetsHeading);
+        const resetBlock = payload.cedar_ember;
+        const grants = Array.isArray(resetBlock?.grants) ? resetBlock.grants.filter((grant) => grant && Number.isInteger(grant.resets_left) && grant.resets_left > 0 && !grant.paused && (!grant.ends_at || Date.parse(grant.ends_at) > Date.now())) : [];
+        const pendingReset = payload.pending_reset;
+        if (pendingReset) {
+          const existing = grants.find((grant) => grant.id === pendingReset.grantId);
+          if (existing) existing.pending = true;
+          else grants.unshift({ id: pendingReset.grantId, resets_left: 0, clears: [], pending: true });
+        }
+        if (grants.length === 0) {
+          const empty = document.createElement("p"); empty.className = "meta";
+          empty.textContent = resetBlock && Array.isArray(resetBlock.grants) ? tr(T.claudeResetRemaining, { n: 0 }) : T.claudeResetUnavailable;
+          panel.appendChild(empty);
+        }
+        grants.forEach((grant) => {
+          const row = document.createElement("div"); row.style.marginBottom = "16px";
+          const clears = Array.isArray(grant.clears) ? grant.clears : [];
+          const label = clears.includes("seven_day") ? T.claudeResetFull : clears.includes("seven_day_overage_included") ? T.claudeResetFable : grant.label || T.claudeResets;
+          const title = document.createElement("p"); title.textContent = label + " · " + tr(T.claudeResetRemaining, { n: grant.resets_left });
+          const detail = document.createElement("p"); detail.className = "meta";
+          const expiry = grant.ends_at ? new Date(grant.ends_at) : null;
+          const windows = clears.map((key) => labels[key] || (key === "seven_day_overage_included" ? T.claudeResetFable : key.replace(/_/g, " "))).join(", ");
+          detail.textContent = windows + (expiry && !Number.isNaN(expiry.getTime()) ? " · " + tr(T.claudeResetExpires, { time: expiry.toLocaleString(T.locale) }) : "");
+          const button = document.createElement("button"); button.type = "button"; button.className = "secondary";
+          button.textContent = grant.pending ? T.claudeResetRetry : T.claudeResetUse;
+          button.disabled = !grant.pending && (grant.redeemable !== true || Boolean(pendingReset));
+          if (button.disabled) button.title = T.claudeResetWait;
+          const feedback = document.createElement("p"); feedback.className = "meta";
+          if (button.disabled) feedback.textContent = T.claudeResetWait;
+          // Keep the confirmation ID across errors and reopened dialogs, including page reloads.
+          const operationKey = "nanollm-claude-reset:" + providerName + ":" + grant.id;
+          button.addEventListener("click", async () => {
+            let requestId = grant.pending ? pendingReset.requestId : localStorage.getItem(operationKey);
+            if (!requestId) {
+              if (!window.confirm(tr(T.claudeResetConfirm, { label, windows }))) return;
+              requestId = crypto.randomUUID();
+              localStorage.setItem(operationKey, requestId);
+            }
+            button.disabled = true; button.textContent = T.resetting;
+            let confirmed = false;
+            try {
+              const response = await fetch("/admin/providers/" + encodeURIComponent(providerName) + "/usage/reset", {
+                method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ grant_id: grant.id, request_id: requestId }),
+              });
+              const result = readJsonResponse(await response.text());
+              if (!response.ok) throw new Error(result.error || T.resetFailed);
+              confirmed = true;
+              localStorage.removeItem(operationKey);
+              feedback.textContent = result.result === "reset" ? T.claudeResetDone : result.result === "already_used" ? T.claudeResetAlreadyUsed : tr(T.claudeResetDeclined, { result: result.result });
+              const refresh = await fetch("/admin/providers/" + encodeURIComponent(providerName) + "/usage", { cache: "no-store" });
+              const updated = readJsonResponse(await refresh.text());
+              if (!refresh.ok) throw new Error(updated.error || T.usageQueryFailed);
+              window.alert(feedback.textContent); dialog.close(); showClaudeUsageDialog(updated, providerName);
+            } catch (error) {
+              feedback.textContent = error instanceof Error ? error.message : String(error);
+              button.disabled = confirmed; button.textContent = confirmed ? T.claudeResetUse : T.claudeResetRetry;
+            }
+          });
+          row.append(title, detail, button, feedback); panel.appendChild(row);
+        });
         const close = document.createElement("button"); close.type = "button"; close.textContent = T.close; close.addEventListener("click", () => dialog.close());
         panel.appendChild(close); dialog.appendChild(panel); document.body.appendChild(dialog);
         dialog.addEventListener("close", () => dialog.remove(), { once: true });

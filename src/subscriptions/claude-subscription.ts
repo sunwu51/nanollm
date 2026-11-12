@@ -5,7 +5,7 @@ import { ProxyAgent, fetch as undiciFetch } from "undici";
 import type { CustomProviderConfig } from "../core/config.js";
 import { localize } from "../core/i18n.js";
 import { oauthPost } from "./oauth-transport.js";
-import { CLAUDE_CODE_USER_AGENT, CLAUDE_OAUTH_BETA } from "./subscription-client-compat.js";
+import { CLAUDE_CLI_USER_AGENT, CLAUDE_CODE_USER_AGENT, CLAUDE_OAUTH_BETA } from "./subscription-client-compat.js";
 import { extractUpstreamModelIds } from "../proxy/upstream-models.js";
 
 export { CLAUDE_CLI_USER_AGENT, CLAUDE_CODE_BETA, CLAUDE_OAUTH_BETA } from "./subscription-client-compat.js";
@@ -19,7 +19,7 @@ const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const MANUAL_REDIRECT_URL = "https://platform.claude.com/oauth/code/callback";
 const API_BASE_URL = "https://api.anthropic.com";
 const PROFILE_URL = `${API_BASE_URL}/api/oauth/profile`;
-const USAGE_URL = `${API_BASE_URL}/api/oauth/usage`;
+const USAGE_URL = `${API_BASE_URL}/api/oauth/usage?cedar_ember=1`;
 export const CLAUDE_MESSAGES_URL = `${API_BASE_URL}/v1/messages?beta=true`;
 // The token endpoint rate-limits unfamiliar clients; a plain Node user agent is accepted.
 const TOKEN_USER_AGENT = "node";
@@ -125,7 +125,7 @@ function oauthApiHeaders(accessToken: string): Record<string, string> {
 async function fetchProfile(accessToken: string, proxy?: string): Promise<any | undefined> {
   const dispatcher = proxy ? new ProxyAgent(proxy) : undefined;
   try {
-    const response = await undiciFetch(PROFILE_URL, { dispatcher, headers: oauthApiHeaders(accessToken), signal: AbortSignal.timeout(15_000) });
+    const response = await undiciFetch(PROFILE_URL, { dispatcher, headers: oauthApiHeaders(accessToken), redirect: "error", signal: AbortSignal.timeout(15_000) });
     if (!response.ok) { await response.body?.cancel(); return undefined; }
     return await response.json();
   } catch {
@@ -337,11 +337,25 @@ export async function fetchClaudeSubscriptionModels(name: string, proxyUrl?: str
   return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
 }
 
+function usageHeaders(accessToken: string) {
+  return { ...oauthApiHeaders(accessToken), "User-Agent": CLAUDE_CLI_USER_AGENT, "x-app": "cli" };
+}
+
+export function isClaudeResetGrantUsable(block: any, grant: any, now = Date.now()): boolean {
+  const validDate = (value: unknown, before: boolean) => value == null || (typeof value === "string" && Number.isFinite(Date.parse(value)) && (before ? now < Date.parse(value) : now >= Date.parse(value)));
+  return block?.eligible === true && grant?.id === block.next_grant_id &&
+    typeof grant?.id === "string" && /^[a-z0-9_-]{1,40}$/.test(grant.id) &&
+    Number.isInteger(grant.resets_left) && grant.resets_left > 0 && grant.usable_now === true && grant.paused !== true &&
+    Array.isArray(grant.clears) && grant.clears.length > 0 && Array.isArray(grant.blocking) && grant.blocking.length === 0 &&
+    (grant.use_requires_limit === false || block.at_limit === true) &&
+    validDate(grant.starts_at, false) && validDate(grant.ends_at, true) && validDate(block.cooldown_until, false);
+}
+
 export async function fetchClaudeSubscriptionUsage(name: string, proxyUrl?: string) {
   let credential = await ensureClaudeSubscriptionCredential(name);
   const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
   try {
-    const request = () => undiciFetch(USAGE_URL, { dispatcher, headers: oauthApiHeaders(credential.accessToken), cache: "no-store", signal: AbortSignal.timeout(15_000) });
+    const request = () => undiciFetch(USAGE_URL, { dispatcher, headers: usageHeaders(credential.accessToken), redirect: "error", cache: "no-store", signal: AbortSignal.timeout(15_000) });
     let response = await request();
     if (response.status === 401 && credential.refreshToken) {
       await response.body?.cancel();
@@ -353,8 +367,94 @@ export async function fetchClaudeSubscriptionUsage(name: string, proxyUrl?: stri
     let payload: any;
     try { payload = JSON.parse(text); } catch { throw new Error("Claude usage response is not valid JSON"); }
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("Claude usage response has an unknown format");
+    if (payload.cedar_ember && Array.isArray(payload.cedar_ember.grants)) {
+      payload.cedar_ember.grants = payload.cedar_ember.grants.map((grant: any) => ({ ...grant, redeemable: isClaudeResetGrantUsable(payload.cedar_ember, grant) }));
+    }
+    if (credential.organizationUuid && /^[0-9a-f-]{36}$/i.test(credential.organizationUuid)) {
+      const journal = readClaudeResetJournal(credential.organizationUuid);
+      if (journal.pending) payload.pending_reset = journal.operations[journal.pending];
+    }
     return { ...payload, subscription_type: credential.subscriptionType ?? null, rate_limit_tier: credential.rateLimitTier ?? null, email: credential.email ?? null };
   } finally {
+    await dispatcher?.close();
+  }
+}
+
+const claudeResetLocks = new Set<string>();
+interface ClaudeResetOperation { requestId: string; grantId: string; result?: Record<string, unknown> }
+interface ClaudeResetJournal { operations: Record<string, ClaudeResetOperation>; pending?: string }
+
+function readClaudeResetJournal(organization: string): ClaudeResetJournal {
+  try {
+    const journal = JSON.parse(readFileSync(join(providerDir(), `${organization.toLowerCase()}.reset.json`), "utf8"));
+    if (!journal || typeof journal.operations !== "object" || Array.isArray(journal.operations) || !journal.operations) throw new Error("Invalid reset journal");
+    return journal;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { operations: Object.create(null) };
+    throw new Error("Cannot read previous Claude reset operations");
+  }
+}
+
+/** Persist before claiming: an unread response may already have consumed the grant. */
+export async function resetClaudeSubscriptionUsage(name: string, grantId: unknown, requestId: unknown, proxyUrl?: string) {
+  if (typeof grantId !== "string" || !/^[a-z0-9_-]{1,40}$/.test(grantId) || typeof requestId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) {
+    throw new Error("Invalid Claude reset grant or request ID");
+  }
+  const credential = await ensureClaudeSubscriptionCredential(name);
+  // Resolve the organization from the authenticated profile rather than client input.
+  const profile = await fetchProfile(credential.accessToken, proxyUrl);
+  const organization = typeof profile?.organization?.uuid === "string" ? profile.organization.uuid.toLowerCase() : "";
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(organization)) throw new Error("Claude organization unavailable");
+  if (claudeResetLocks.has(organization)) throw new Error("Another Claude reset is in progress");
+  claudeResetLocks.add(organization);
+  let dispatcher: ProxyAgent | undefined;
+  try {
+    const path = join(providerDir(), `${organization.toLowerCase()}.reset.json`);
+    const journal = readClaudeResetJournal(organization);
+    const previous = Object.hasOwn(journal.operations, requestId) ? journal.operations[requestId] : undefined;
+    if (previous) {
+      if (previous.grantId !== grantId) throw new Error("Claude reset request ID was already used for another grant");
+      if (previous.result) return previous.result;
+    } else {
+      if (journal.pending) throw new Error("Previous Claude reset is unconfirmed. Retry the original operation before using another reset.");
+      const usage = await fetchClaudeSubscriptionUsage(name, proxyUrl);
+      const grant = usage.cedar_ember?.grants?.find((item: any) => item.id === grantId);
+      if (!isClaudeResetGrantUsable(usage.cedar_ember, grant)) throw new Error("This Claude reset is not available right now. Refresh usage first.");
+    }
+    const operation: ClaudeResetOperation = { requestId, grantId };
+    const persist = () => {
+      const tmp = `${path}.${process.pid}.tmp`;
+      Object.defineProperty(journal.operations, requestId, { value: operation, enumerable: true, configurable: true, writable: true });
+      journal.pending = operation.result ? undefined : requestId;
+      writeFileSync(tmp, JSON.stringify(journal), { encoding: "utf8", mode: 0o600 });
+      renameSync(tmp, path);
+    };
+    persist();
+    dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
+    // Never refresh/retry this POST with a new operation ID.
+    const response = await undiciFetch(`${API_BASE_URL}/api/organizations/${organization}/reset_rate_limits`, {
+      method: "POST", dispatcher, headers: usageHeaders(credential.accessToken), redirect: "error",
+      body: JSON.stringify({ program: "cedar_ember", grant_id: grantId, request_id: requestId }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      if (response.status === 401 || response.status === 403) {
+        operation.result = { result: "ineligible", reason: "authorization_rejected" };
+        persist();
+        return operation.result;
+      }
+      throw new Error(`Claude reset response unconfirmed (${response.status}). Retry the same operation.`);
+    }
+    const result: any = await response.json();
+    if (!["reset", "already_used", "not_limited", "cooldown", "ineligible", "unavailable"].includes(result?.result) || ["stamp_indeterminate", "reset_unconfirmed"].includes(result?.reason)) {
+      throw new Error("Claude reset result unconfirmed. Retry the same operation.");
+    }
+    operation.result = { result: result.result, reason: result.reason, cleared: result.cleared, cooldown_until: result.cooldown_until };
+    persist();
+    return operation.result;
+  } finally {
+    claudeResetLocks.delete(organization);
     await dispatcher?.close();
   }
 }

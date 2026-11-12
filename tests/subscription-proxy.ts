@@ -13,6 +13,83 @@ import { applyClaudeSubscriptionHeaders, getUpstreamURL, mergeHeaders } from "..
 import { applyClaudeSubscriptionSessionIdentity } from "../src/subscriptions/claude-subscription-body.js";
 import { runWithRequestId, setClientIp, setClientRequestHeaders } from "../src/core/request-context.js";
 import { bootstrapSubscriptionProviders, configureSubscriptionStorage, startDeviceLogin, pollDeviceLogin, ensureSubscriptionCredential, getCachedSubscriptionCredential } from "../src/subscriptions/openai-subscription.js";
+import { fetchClaudeSubscriptionUsage, isClaudeResetGrantUsable, resetClaudeSubscriptionUsage } from "../src/subscriptions/claude-subscription.js";
+import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
+import { Script } from "node:vm";
+
+test("Claude reset eligibility follows the upstream next grant and all usage conditions", () => {
+  const now = Date.parse("2026-11-13T00:00:00Z");
+  const grant = { id: "full-reset", resets_left: 2, usable_now: true, clears: ["five_hour", "seven_day"], blocking: [], ends_at: "2026-12-01T00:00:00Z" };
+  const block = { eligible: true, next_grant_id: grant.id, at_limit: true };
+  assert.equal(isClaudeResetGrantUsable(block, grant, now), true);
+  for (const patch of [{ resets_left: 0 }, { resets_left: 1.5 }, { paused: true }, { usable_now: false }, { ends_at: "2026-11-12T00:00:00Z" }, { starts_at: "2026-11-14T00:00:00Z" }, { ends_at: "invalid" }, { blocking: ["weekly"] }]) {
+    assert.equal(isClaudeResetGrantUsable(block, { ...grant, ...patch }, now), false);
+  }
+  assert.equal(isClaudeResetGrantUsable({ ...block, next_grant_id: "fable-reset" }, grant, now), false);
+  assert.equal(isClaudeResetGrantUsable({ ...block, at_limit: false }, grant, now), false);
+  assert.equal(isClaudeResetGrantUsable({ ...block, at_limit: false }, { ...grant, use_requires_limit: false }, now), true);
+  assert.equal(isClaudeResetGrantUsable({ ...block, cooldown_until: "2026-11-14T00:00:00Z" }, grant, now), false);
+});
+
+test("Claude usage and resets share a request; claims replay after uncertain responses without spending twice", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "nanollm-claude-reset-"));
+  const storage = join(dir, "claude-subscription");
+  mkdirSync(storage);
+  const name = "claude-reset-protocol-test";
+  const org = "11111111-2222-4333-8444-555555555555";
+  writeFileSync(join(storage, "11111111-1111-4111-8111-111111111111.json"), JSON.stringify({ providerName: name, accessToken: "test-access", refreshToken: "", expiresAt: Date.now() + 3600000, organizationUuid: org }));
+  const previousDispatcher = getGlobalDispatcher();
+  const mock = new MockAgent(); mock.disableNetConnect();
+  const pool = mock.get("https://api.anthropic.com");
+  let claims: any[] = [];
+  const grant = { id: "full-reset", resets_left: 2, usable_now: true, clears: ["five_hour", "seven_day"], blocking: [] };
+  const upstream = { five_hour: { utilization: 100 }, seven_day: { utilization: 32 }, cedar_ember: { eligible: true, at_limit: true, next_grant_id: grant.id, grants: [grant] } };
+  pool.intercept({ path: "/api/oauth/usage?cedar_ember=1", method: "GET", headers: { authorization: "Bearer test-access", "x-app": "cli", "user-agent": /^claude-cli\// } }).reply(200, upstream).persist();
+  pool.intercept({ path: "/api/oauth/profile", method: "GET" }).reply(200, { organization: { uuid: org } }).persist();
+  pool.intercept({ path: `/api/organizations/${org}/reset_rate_limits`, method: "POST" }).reply((options) => {
+    claims.push(JSON.parse(String(options.body)));
+    // An unexpected response leaves a durable pending claim even if the POST succeeded upstream.
+    return { statusCode: 200, data: claims.length === 1 ? { result: "unexpected" } : { result: "already_used", cleared: ["five_hour", "seven_day"] } };
+  }).persist();
+  setGlobalDispatcher(mock);
+  configureClaudeSubscriptionStorage(join(dir, "config.yaml"));
+  try {
+    const usage = await fetchClaudeSubscriptionUsage(name);
+    assert.equal(usage.five_hour.utilization, 100);
+    assert.equal(usage.cedar_ember.grants[0].resets_left, 2);
+    assert.equal(usage.cedar_ember.grants[0].redeemable, true);
+    assert.equal(claims.length, 0);
+    await assert.rejects(resetClaudeSubscriptionUsage(name, "other-grant", "wrong-grant"), /not available/);
+    await assert.rejects(resetClaudeSubscriptionUsage(name, grant.id, "operation-1"), /unconfirmed/);
+    const pendingUsage = await fetchClaudeSubscriptionUsage(name);
+    assert.equal(pendingUsage.pending_reset.requestId, "operation-1");
+    assert.equal(JSON.parse(readFileSync(join(storage, `${org}.reset.json`), "utf8")).pending, "operation-1");
+    await assert.rejects(resetClaudeSubscriptionUsage(name, grant.id, "operation-2"), /unconfirmed/);
+    assert.equal(claims.length, 1);
+    const replay = await resetClaudeSubscriptionUsage(name, grant.id, "operation-1");
+    assert.equal(replay.result, "already_used");
+    assert.deepEqual(claims[0], { program: "cedar_ember", grant_id: grant.id, request_id: "operation-1" });
+    assert.deepEqual(claims[1], claims[0]);
+    await resetClaudeSubscriptionUsage(name, grant.id, "operation-2");
+    assert.equal(claims.length, 3);
+    await resetClaudeSubscriptionUsage(name, grant.id, "operation-1");
+    assert.equal(claims.length, 3, "even an older completed operation must replay from disk");
+    assert.equal((await fetchClaudeSubscriptionUsage(name)).pending_reset, undefined);
+  } finally {
+    bootstrapClaudeSubscriptionProviders([]);
+    setGlobalDispatcher(previousDispatcher);
+    await mock.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("admin usage dialog scripts parse in both languages", () => {
+  for (const lang of ["zh", "en"] as const) {
+    const html = renderAdminConfigPage({}, lang);
+    for (const match of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) new Script(match[1]);
+    assert.ok(html.includes("cedar_ember"));
+  }
+});
 
 test("Claude device ID migrates legacy credentials and survives a fresh process", () => {
   const dir = mkdtempSync(join(tmpdir(), "nanollm-claude-device-"));

@@ -79,7 +79,7 @@ import { extractErrorCauses, formatErrorWithCauses } from "./src/core/error-deta
 import { CODEX_RELEASES_URL, getLatestCodexVersion } from "./src/subscriptions/codex-version.js";
 import { resolveEnvProxy } from "./src/core/env-proxy.js";
 import { bootstrapSubscriptionProviders, configureSubscriptionStorage, fetchSubscriptionModels, fetchSubscriptionUsage, getCachedSubscriptionCredential, pollDeviceLogin, resetSubscriptionUsage, startDeviceLogin } from "./src/subscriptions/openai-subscription.js";
-import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, fetchClaudeSubscriptionModels, fetchClaudeSubscriptionUsage, getCachedClaudeSubscriptionCredential, startClaudeLogin } from "./src/subscriptions/claude-subscription.js";
+import { bootstrapClaudeSubscriptionProviders, completeClaudeLogin, configureClaudeSubscriptionStorage, fetchClaudeSubscriptionModels, fetchClaudeSubscriptionUsage, getCachedClaudeSubscriptionCredential, resetClaudeSubscriptionUsage, startClaudeLogin } from "./src/subscriptions/claude-subscription.js";
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -1396,6 +1396,10 @@ app.post("/admin/providers/:name/usage/reset", async (c) => {
   try {
     const name = c.req.param("name");
     const provider = configManager.getActiveSnapshot().effectiveConfig.providers.find((item) => item.name === name);
+    if (provider?.provider === "claude-subscription") {
+      const body = await c.req.json();
+      return c.json(await resetClaudeSubscriptionUsage(name, body.grant_id, body.request_id, provider.proxy));
+    }
     if (!provider || provider.provider !== "openai-subscription") return c.json({ error: "OpenAI subscription provider not found" }, 404);
     return c.json(await resetSubscriptionUsage(name, provider.proxy));
   } catch (error) {
