@@ -17,7 +17,7 @@ import { fetchClaudeSubscriptionUsage, isClaudeResetGrantUsable, resetClaudeSubs
 import { renderAdminConfigPage } from "../src/pages/admin-config-page.js";
 import { Script } from "node:vm";
 
-test("Claude reset eligibility follows the upstream next grant and all usage conditions", () => {
+test("Claude manual resets allow each usable grant regardless of the suggested next grant", () => {
   const now = Date.parse("2026-11-13T00:00:00Z");
   const grant = { id: "full-reset", resets_left: 2, usable_now: true, clears: ["five_hour", "seven_day"], blocking: [], ends_at: "2026-12-01T00:00:00Z" };
   const block = { eligible: true, next_grant_id: grant.id, at_limit: true };
@@ -25,7 +25,8 @@ test("Claude reset eligibility follows the upstream next grant and all usage con
   for (const patch of [{ resets_left: 0 }, { resets_left: 1.5 }, { paused: true }, { usable_now: false }, { ends_at: "2026-11-12T00:00:00Z" }, { starts_at: "2026-11-14T00:00:00Z" }, { ends_at: "invalid" }, { blocking: ["weekly"] }]) {
     assert.equal(isClaudeResetGrantUsable(block, { ...grant, ...patch }, now), false);
   }
-  assert.equal(isClaudeResetGrantUsable({ ...block, next_grant_id: "fable-reset" }, grant, now), false);
+  assert.equal(isClaudeResetGrantUsable({ ...block, next_grant_id: "fable-reset" }, grant, now), true);
+  assert.equal(isClaudeResetGrantUsable(block, { ...grant, id: "fable-reset", clears: ["five_hour", "seven_day_overage_included"] }, now), true);
   assert.equal(isClaudeResetGrantUsable({ ...block, at_limit: false }, grant, now), false);
   assert.equal(isClaudeResetGrantUsable({ ...block, at_limit: false }, { ...grant, use_requires_limit: false }, now), true);
   assert.equal(isClaudeResetGrantUsable({ ...block, cooldown_until: "2026-11-14T00:00:00Z" }, grant, now), false);
@@ -43,7 +44,7 @@ test("Claude usage and resets share a request; claims replay after uncertain res
   const pool = mock.get("https://api.anthropic.com");
   let claims: any[] = [];
   const grant = { id: "full-reset", resets_left: 2, usable_now: true, clears: ["five_hour", "seven_day"], blocking: [] };
-  const upstream = { five_hour: { utilization: 100 }, seven_day: { utilization: 32 }, cedar_ember: { eligible: true, at_limit: true, next_grant_id: grant.id, grants: [grant] } };
+  const upstream = { five_hour: { utilization: 100 }, seven_day: { utilization: 32 }, cedar_ember: { eligible: true, at_limit: true, next_grant_id: "fable-reset", grants: [grant, { ...grant, id: "fable-reset", clears: ["five_hour", "seven_day_overage_included"] }] } };
   pool.intercept({ path: "/api/oauth/usage?cedar_ember=1", method: "GET", headers: { authorization: "Bearer test-access", "x-app": "cli", "user-agent": /^claude-cli\// } }).reply(200, upstream).persist();
   pool.intercept({ path: "/api/oauth/profile", method: "GET" }).reply(200, { organization: { uuid: org } }).persist();
   pool.intercept({ path: `/api/organizations/${org}/reset_rate_limits`, method: "POST" }).reply((options) => {
@@ -58,6 +59,7 @@ test("Claude usage and resets share a request; claims replay after uncertain res
     assert.equal(usage.five_hour.utilization, 100);
     assert.equal(usage.cedar_ember.grants[0].resets_left, 2);
     assert.equal(usage.cedar_ember.grants[0].redeemable, true);
+    assert.equal(usage.cedar_ember.grants[1].redeemable, true);
     assert.equal(claims.length, 0);
     await assert.rejects(resetClaudeSubscriptionUsage(name, "other-grant", "wrong-grant"), /not available/);
     await assert.rejects(resetClaudeSubscriptionUsage(name, grant.id, "operation-1"), /unconfirmed/);

@@ -343,7 +343,8 @@ function usageHeaders(accessToken: string) {
 
 export function isClaudeResetGrantUsable(block: any, grant: any, now = Date.now()): boolean {
   const validDate = (value: unknown, before: boolean) => value == null || (typeof value === "string" && Number.isFinite(Date.parse(value)) && (before ? now < Date.parse(value) : now >= Date.parse(value)));
-  return block?.eligible === true && grant?.id === block.next_grant_id &&
+  // Manual redemption names the selected grant; next_grant_id is not a restriction on that choice.
+  return block?.eligible === true &&
     typeof grant?.id === "string" && /^[a-z0-9_-]{1,40}$/.test(grant.id) &&
     Number.isInteger(grant.resets_left) && grant.resets_left > 0 && grant.usable_now === true && grant.paused !== true &&
     Array.isArray(grant.clears) && grant.clears.length > 0 && Array.isArray(grant.blocking) && grant.blocking.length === 0 &&
