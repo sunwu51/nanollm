@@ -8,7 +8,7 @@ const html = renderAdminConfigPage({}, "en");
 const workerSource = /function expressionTestWorker\(\) \{[\s\S]*?(?=\n      function openExpressionTestDialog)/.exec(html)![0];
 
 // Exercise the exact browser worker source using a worker_threads message adapter.
-function preview(expression: string, input: unknown = {}, kind = "body_expression", headers?: unknown): Promise<{ output?: string; error?: string; sizeError?: boolean }> {
+function preview(expression: string, input: unknown = {}, kind = "body_expression", headers?: unknown, path?: string): Promise<{ output?: string; error?: string; sizeError?: boolean; skip?: boolean }> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(`
       const { parentPort } = require("node:worker_threads");
@@ -24,7 +24,7 @@ function preview(expression: string, input: unknown = {}, kind = "body_expressio
     const timer = setTimeout(() => finish({ error: "Expression timed out" }), 1000);
     worker.once("message", finish);
     worker.once("error", error => { clearTimeout(timer); void worker.terminate(); reject(error); });
-    worker.postMessage({ expression, input, kind, headers });
+    worker.postMessage({ expression, input, kind, headers, path });
   });
 }
 
@@ -41,6 +41,27 @@ test("response preview exposes normalized read-only headers", async () => {
   for (const headers of [null, [], { foo: 1 }]) {
     assert.match((await preview("response", {}, "response_expression", headers)).error!, /Headers must be/);
   }
+});
+
+test("skip_when preview exposes request headers, model and path like the server rule", async () => {
+  const skip = (expression: string, headers?: unknown, path = "/v1/chat/completions") =>
+    preview(expression, { model: "alpha" }, "skip_when", headers, path);
+  assert.equal((await skip("headers['authorization']?.endsWith('ansang')", { Authorization: "Bearer sk-ansang" })).skip, true);
+  assert.equal((await skip("headers.Authorization === 'Bearer k'", { authorization: "Bearer k" })).skip, true);
+  assert.equal((await skip("'X-Api-Key' in headers", { "x-api-key": "k" })).skip, true);
+  assert.equal((await skip("model === 'alpha' && path === '/v1/messages'", {}, "/v1/messages")).skip, true);
+  assert.equal((await skip("headers['authorization']?.endsWith('ansang')", {})).skip, false);
+  assert.equal((await skip("")).skip, false);
+  assert.match((await skip("header['authorization']")).error!, /header is not defined/);
+  assert.equal((await skip("Object.isFrozen(body) && Object.isFrozen(headers)")).skip, true);
+  assert.match((await skip("Promise.resolve(true)")).error!, /must return synchronously/);
+  assert.match((await skip("true", { foo: 1 })).error!, /Headers must be/);
+});
+
+test("skip_when dialog offers request headers and path inputs", () => {
+  assert.match(html, /isSkip\s+\? addInput\(T\.expressionRequestHeaders/);
+  assert.match(html, /addInput\(T\.expressionPath, "\/v1\/chat\/completions", true\)/);
+  assert.match(html, /payload\.skip \? T\.skipWhenMatched : T\.skipWhenNotMatched/);
 });
 
 test("browser preview reports invalid expressions and non-JSON results", async () => {

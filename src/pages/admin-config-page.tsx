@@ -191,6 +191,11 @@ const zh = {
   expressionOriginal: "原始 JSON",
   expressionHeaders: "响应头 JSON（可选）",
   expressionOutput: "转换结果",
+  expressionRequestBody: "请求体 JSON",
+  expressionRequestHeaders: "请求头 JSON（可选）",
+  expressionPath: "请求路径",
+  skipWhenMatched: "返回真值：该请求不会写入采样记录",
+  skipWhenNotMatched: "返回假值：该请求会照常写入采样记录",
   expressionRun: "运行",
   expressionRunning: "正在运行…",
   expressionSuccess: "运行成功",
@@ -430,6 +435,11 @@ const MESSAGES: Record<Lang, typeof zh> = {
     expressionOriginal: "Original JSON",
     expressionHeaders: "Response headers JSON (optional)",
     expressionOutput: "Transformed JSON",
+    expressionRequestBody: "Request body JSON",
+    expressionRequestHeaders: "Request headers JSON (optional)",
+    expressionPath: "Request path",
+    skipWhenMatched: "Truthy: this request would not be recorded",
+    skipWhenNotMatched: "Falsy: this request would be recorded",
     expressionRun: "Run",
     expressionRunning: "Running…",
     expressionSuccess: "Expression completed",
@@ -1500,10 +1510,11 @@ const SCRIPT = /* js */ String.raw`
       function expressionTestWorker() {
         self.onmessage = (event) => {
           try {
-            const { kind, expression, input, headers } = event.data;
+            const { kind, expression, input, headers, path } = event.data;
             const responseMode = kind === "response_expression";
+            const skipMode = kind === "skip_when";
             const headerRecord = {};
-            if (responseMode && headers !== undefined) {
+            if ((responseMode || skipMode) && headers !== undefined) {
               if (!headers || typeof headers !== "object" || Array.isArray(headers)) throw new Error("Headers must be a JSON object with string values");
               const normalized = new Headers();
               for (const [name, value] of Object.entries(headers)) {
@@ -1513,6 +1524,21 @@ const SCRIPT = /* js */ String.raw`
               for (const [name, value] of normalized) Object.defineProperty(headerRecord, name, { value, enumerable: true });
             }
             Object.freeze(headerRecord);
+            if (skipMode) {
+              // Mirrors shouldSkipRecord: case-insensitive headers, frozen shallow body, model from body.model.
+              const body = input && typeof input === "object" && !Array.isArray(input) ? Object.freeze({ ...input }) : input;
+              const requestHeaders = new Proxy(headerRecord, {
+                get: (object, name) => (typeof name === "string" ? object[name.toLowerCase()] : Reflect.get(object, name)),
+                has: (object, name) => (typeof name === "string" ? name.toLowerCase() in object : Reflect.has(object, name)),
+              });
+              const model = typeof body?.model === "string" ? body.model : undefined;
+              const matched = expression.trim()
+                ? new Function("body", "headers", "model", "path", "return (" + expression + "\n);")(body, requestHeaders, model, path)
+                : false;
+              if (matched && typeof matched.then === "function") throw new Error("Expression must return synchronously");
+              self.postMessage({ skip: !!matched });
+              return;
+            }
             const result = expression.trim()
               ? new Function(responseMode ? "response" : "body", "headers", "return (" + expression + "\n);")(input, headerRecord)
               : input;
@@ -1533,6 +1559,7 @@ const SCRIPT = /* js */ String.raw`
 
       function openExpressionTestDialog(model, key) {
         const isResponse = key === "response_expression";
+        const isSkip = key === "skip_when";
         const dialog = document.createElement("dialog");
         dialog.className = "model-test-dialog";
         const body = document.createElement("div");
@@ -1541,16 +1568,16 @@ const SCRIPT = /* js */ String.raw`
         heading.textContent = T.testExpression + " · " + key;
         const note = document.createElement("div");
         note.className = "helper";
-        note.textContent = T.expressionTestNote + (isResponse ? " " + T.responseExpressionHelper : "");
+        note.textContent = T.expressionTestNote + (isResponse ? " " + T.responseExpressionHelper : isSkip ? " " + T.skipWhenHelper : "");
         body.append(heading, note);
 
-        function addInput(labelText, value) {
+        function addInput(labelText, value, singleLine) {
           const field = document.createElement("label");
           field.className = "field";
           const label = document.createElement("span");
           label.textContent = labelText;
-          const input = document.createElement("textarea");
-          input.className = "expression-input";
+          const input = document.createElement(singleLine ? "input" : "textarea");
+          if (!singleLine) input.className = "expression-input";
           input.spellcheck = false;
           input.value = value;
           field.append(label, input);
@@ -1564,10 +1591,15 @@ const SCRIPT = /* js */ String.raw`
           if (field) field.value = expression.value;
           markDirty(true);
         });
-        const input = addInput(T.expressionOriginal, isResponse
+        const input = addInput(isSkip ? T.expressionRequestBody : T.expressionOriginal, isResponse
           ? '{\n  "model": "example",\n  "choices": []\n}'
           : '{\n  "model": "example",\n  "messages": [{ "role": "user", "content": "Hello" }]\n}');
-        const headers = isResponse ? addInput(T.expressionHeaders, "{}") : null;
+        const headers = isResponse
+          ? addInput(T.expressionHeaders, "{}")
+          : isSkip
+            ? addInput(T.expressionRequestHeaders, '{\n  "authorization": "Bearer sk-example"\n}')
+            : null;
+        const pathInput = isSkip ? addInput(T.expressionPath, "/v1/chat/completions", true) : null;
         const status = document.createElement("div");
         status.className = "status";
         status.setAttribute("role", "status");
@@ -1620,6 +1652,11 @@ const SCRIPT = /* js */ String.raw`
               const payload = event.data;
               if (payload.error || payload.sizeError) { fail(payload.error || T.expressionSizeError); return; }
               stopWorker();
+              if (isSkip) {
+                status.className = "status success";
+                status.textContent = payload.skip ? T.skipWhenMatched : T.skipWhenNotMatched;
+                return;
+              }
               output.textContent = payload.output;
               output.hidden = false;
               outputLabel.hidden = false;
@@ -1632,7 +1669,7 @@ const SCRIPT = /* js */ String.raw`
             };
             worker.onmessageerror = () => fail(T.expressionWorkerError);
             timer = setTimeout(() => fail(T.expressionTimeout), 1000);
-            worker.postMessage({ kind: key, expression: expression.value, input: sample, headers: sampleHeaders });
+            worker.postMessage({ kind: key, expression: expression.value, input: sample, headers: sampleHeaders, path: pathInput ? pathInput.value : undefined });
           } catch (error) {
             fail(error.message || String(error));
           }
