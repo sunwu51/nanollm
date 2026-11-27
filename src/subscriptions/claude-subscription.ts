@@ -1,3 +1,4 @@
+import { createTokenRefreshScheduler } from "./token-refresh.js";
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -47,7 +48,7 @@ export interface ClaudeSubscriptionCredential {
 
 interface LoginSession { provider: string; proxy?: string; state: string; codeVerifier: string; expiresAt: number }
 
-const timers = new Map<string, NodeJS.Timeout>();
+const { schedule, retain, refreshed } = createTokenRefreshScheduler("CLAUDE SUBSCRIPTION", refresh);
 const cache = new Map<string, ClaudeSubscriptionCredential>();
 const credentialPaths = new Map<string, string>();
 const refreshing = new Map<string, Promise<ClaudeSubscriptionCredential>>();
@@ -90,13 +91,6 @@ function save(name: string, value: ClaudeSubscriptionCredential) {
   cache.set(name, persisted);
 }
 
-function schedule(name: string, value: ClaudeSubscriptionCredential) {
-  const old = timers.get(name); if (old) clearTimeout(old);
-  const delay = Math.max(30_000, value.expiresAt - Date.now() - REFRESH_BUFFER_MS);
-  timers.set(name, setTimeout(() => {
-    void refresh(name).catch((e) => console.error(`[CLAUDE SUBSCRIPTION] refresh failed for ${name}:`, e));
-  }, delay));
-}
 
 function base64url(buffer: Buffer) { return buffer.toString("base64url"); }
 
@@ -259,7 +253,7 @@ async function refresh(name: string): Promise<ClaudeSubscriptionCredential> {
     let value = credentialFromToken(token, current);
     if (!value.subscriptionType) value = applyProfile(value, await fetchProfile(value.accessToken, provider.proxy));
     save(name, value);
-    schedule(name, value);
+    if (subscriptionProviders.has(name)) refreshed(name, current, value, Boolean(token.refresh_token));
     return value;
   })();
   refreshing.set(name, task);
@@ -268,7 +262,7 @@ async function refresh(name: string): Promise<ClaudeSubscriptionCredential> {
 
 export async function ensureClaudeSubscriptionCredential(name: string) {
   const value = load(name);
-  if (value && value.expiresAt > Date.now() + REFRESH_BUFFER_MS) { schedule(name, value); return value; }
+  if (value && value.expiresAt > Date.now() + REFRESH_BUFFER_MS) return value;
   if (value?.refreshToken) return refresh(name);
   throw new Error(`Claude subscription provider '${name}' is not authenticated. Sign in from the admin page.`);
 }
@@ -462,15 +456,12 @@ export async function resetClaudeSubscriptionUsage(name: string, grantId: unknow
 
 export function bootstrapClaudeSubscriptionProviders(providers: CustomProviderConfig[]) {
   subscriptionProviders = new Map(providers.filter((provider) => provider.provider === "claude-subscription").map((provider) => [provider.name, { ...provider }]));
-  for (const [name, timer] of timers) {
-    if (!subscriptionProviders.has(name)) { clearTimeout(timer); timers.delete(name); }
-  }
+  retain(subscriptionProviders);
   for (const name of subscriptionProviders.keys()) {
     const value = load(name);
     if (!value) { console.warn(`[CLAUDE SUBSCRIPTION] ${name}: no credential file; sign in from the admin page`); continue; }
     // Backfill legacy credential files once; keep the identity across restarts.
     getOrCreateClaudeSubscriptionDeviceId(name);
-    if (value.expiresAt > Date.now() + REFRESH_BUFFER_MS) { schedule(name, value); continue; }
-    if (value.refreshToken) void refresh(name).catch((e) => console.error(`[CLAUDE SUBSCRIPTION] refresh failed for ${name}:`, e));
+    schedule(name, value);
   }
 }

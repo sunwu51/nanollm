@@ -1,3 +1,4 @@
+import { createTokenRefreshScheduler } from "./token-refresh.js";
 import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -15,7 +16,8 @@ const DEVICE_VERIFICATION_URI = "https://auth.openai.com/codex/device";
 const DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback";
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
 export const SUBSCRIPTION_URL = "https://chatgpt.com/backend-api/codex";
-const timers = new Map<string, NodeJS.Timeout>();
+const { schedule, retain, refreshed } = createTokenRefreshScheduler("OPENAI SUBSCRIPTION", refresh);
+const refreshing = new Map<string, Promise<SubscriptionCredential>>();
 const cache = new Map<string, SubscriptionCredential>();
 const deviceSessions = new Map<string, { provider: string; proxy?: string; deviceAuthId: string; userCode: string; expiresAt: number; interval: number }>();
 let subscriptionProviders = new Map<string, CustomProviderConfig>();
@@ -105,11 +107,6 @@ function save(name: string, value: SubscriptionCredential) {
   writeFileSync(tmp, `${JSON.stringify(persisted, null, 2)}\n`, "utf8"); renameSync(tmp, path);
   credentialPaths.set(name, path); cache.set(name, persisted);
 }
-function schedule(name: string, value: SubscriptionCredential) {
-  const old = timers.get(name); if (old) clearTimeout(old);
-  const delay = Math.max(30_000, value.expiresAt - Date.now() - 5 * 60_000);
-  timers.set(name, setTimeout(() => { void refresh(name).catch((e) => console.error(`[OPENAI SUBSCRIPTION] refresh failed for ${name}:`, e)); }, delay));
-}
 async function tokenRequest(body: URLSearchParams, proxy?: string) {
   const response = await oauthPost(TOKEN_URL, body, undefined, proxy);
   const text = response.body;
@@ -154,16 +151,24 @@ export async function pollDeviceLogin(sessionId: string): Promise<{ status: "pen
   return { status: "authenticated" };
 }
 async function refresh(name: string): Promise<SubscriptionCredential> {
-  const provider = subscriptionProviders.get(name);
-  if (!provider) throw new Error(`OpenAI subscription provider '${name}' is not configured`);
-  const current = load(name); if (!current?.refreshToken) throw new Error(`No refresh token for subscription provider '${name}'`);
-  const token = await tokenRequest(new URLSearchParams({ grant_type: "refresh_token", refresh_token: current.refreshToken, client_id: CLIENT_ID }), provider.proxy);
-  const value = normalizeCredential({ ...current, ...token, accessToken: token.access_token, refreshToken: token.refresh_token || current.refreshToken, idToken: token.id_token || current.idToken, expiresAt: Date.now() + Number(token.expires_in || 3600) * 1000, obtainedAt: Date.now() });
-  save(name, value); schedule(name, value); return value;
+  const pending = refreshing.get(name);
+  if (pending) return pending;
+  const task = (async () => {
+    const provider = subscriptionProviders.get(name);
+    if (!provider) throw new Error(`OpenAI subscription provider '${name}' is not configured`);
+    const current = load(name); if (!current?.refreshToken) throw new Error(`No refresh token for subscription provider '${name}'`);
+    const token = await tokenRequest(new URLSearchParams({ grant_type: "refresh_token", refresh_token: current.refreshToken, client_id: CLIENT_ID }), provider.proxy);
+    const value = normalizeCredential({ ...current, ...token, accessToken: token.access_token, refreshToken: token.refresh_token || current.refreshToken, idToken: token.id_token || current.idToken, expiresAt: Date.now() + Number(token.expires_in || 3600) * 1000, obtainedAt: Date.now() });
+    save(name, value);
+    if (subscriptionProviders.has(name)) refreshed(name, current, value, Boolean(token.refresh_token));
+    return value;
+  })();
+  refreshing.set(name, task);
+  try { return await task; } finally { refreshing.delete(name); }
 }
 export async function ensureSubscriptionCredential(name: string) {
   const value = load(name);
-  if (value && value.expiresAt > Date.now() + 60_000) { schedule(name, value); return value; }
+  if (value && value.expiresAt > Date.now() + 60_000) return value;
   if (value?.refreshToken) return refresh(name);
   throw new Error(`OpenAI subscription provider '${name}' is not authenticated. Start device login from the admin page.`);
 }
@@ -309,13 +314,10 @@ export async function resetSubscriptionUsage(name: string, proxyUrl?: string) {
 }
 export function bootstrapSubscriptionProviders(providers: CustomProviderConfig[]) {
   subscriptionProviders = new Map(providers.filter((provider) => provider.provider === "openai-subscription").map((provider) => [provider.name, { ...provider }]));
-  for (const [name, timer] of timers) {
-    if (!subscriptionProviders.has(name)) { clearTimeout(timer); timers.delete(name); }
-  }
+  retain(subscriptionProviders);
   for (const name of subscriptionProviders.keys()) {
     const value = load(name);
     if (!value) { console.warn(`[OPENAI SUBSCRIPTION] ${name}: no credential file; authenticate when the model is first used`); continue; }
-    if (value.expiresAt > Date.now() + 60_000) { schedule(name, value); continue; }
-    if (value.refreshToken) void refresh(name).catch((e) => console.error(`[OPENAI SUBSCRIPTION] refresh failed for ${name}:`, e));
+    schedule(name, value);
   }
 }
